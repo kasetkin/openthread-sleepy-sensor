@@ -1,12 +1,4 @@
 #
-# Partition Table
-#
-CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
-# end of Partition Table
-
-#
 # mbedTLS
 #
 CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
