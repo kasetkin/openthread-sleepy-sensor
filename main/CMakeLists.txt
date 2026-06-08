@@ -1,0 +1,12 @@
+set(srcs 
+  main.cpp 
+  common_utils.cpp 
+  errortask.cpp
+)
+
+idf_component_register(SRCS ${srcs}
+                       INCLUDE_DIRS "."
+                       REQUIRES sht3x nvs_flash esp_timer esp_driver_gpio esp_adc
+                       WHOLE_ARCHIVE)
+set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD 26)
+set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD_REQUIRED ON)
