@@ -1193,6 +1193,33 @@ CONFIG_EFUSE_MAX_BLK_LEN=256
 # end of eFuse Bit Manager
 
 #
+# ESP-TLS
+#
+# default:
+CONFIG_ESP_TLS_USING_MBEDTLS=y
+# default:
+# CONFIG_ESP_TLS_CUSTOM_STACK is not set
+# default:
+# CONFIG_ESP_TLS_USE_SECURE_ELEMENT is not set
+# default:
+CONFIG_ESP_TLS_USE_DS_PERIPHERAL=y
+# default:
+# CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS is not set
+# default:
+# CONFIG_ESP_TLS_SERVER_SESSION_TICKETS is not set
+# default:
+# CONFIG_ESP_TLS_SERVER_CERT_SELECT_HOOK is not set
+# default:
+# CONFIG_ESP_TLS_SERVER_MIN_AUTH_MODE_OPTIONAL is not set
+# default:
+# CONFIG_ESP_TLS_PSK_VERIFICATION is not set
+# default:
+# CONFIG_ESP_TLS_INSECURE is not set
+# default:
+CONFIG_ESP_TLS_DYN_BUF_STRATEGY_SUPPORTED=y
+# end of ESP-TLS
+
+#
 # Wireless Coexistence
 #
 # default:
@@ -2822,7 +2849,7 @@ CONFIG_MBEDTLS_AES_HW_SMALL_DATA_LEN_OPTIM=y
 # default:
 # CONFIG_MBEDTLS_ATCA_HW_ECDSA_VERIFY is not set
 # default:
-# CONFIG_MBEDTLS_HARDWARE_RSA_DS_PERIPHERAL is not set
+CONFIG_MBEDTLS_HARDWARE_RSA_DS_PERIPHERAL=y
 # end of Hardware Acceleration
 
 #
@@ -3191,6 +3218,22 @@ CONFIG_SPI_FLASH_ENABLE_ENCRYPTED_READ_WRITE=y
 # end of SPI Flash driver
 
 #
+# TCP Transport
+#
+
+#
+# Websocket
+#
+# default:
+CONFIG_WS_TRANSPORT=y
+# default:
+CONFIG_WS_BUFFER_SIZE=1024
+# default:
+# CONFIG_WS_DYNAMIC_BUFFER is not set
+# end of Websocket
+# end of TCP Transport
+
+#
 # Virtual file system
 #
 # default:
@@ -3220,6 +3263,33 @@ CONFIG_VFS_SEMIHOSTFS_MAX_MOUNT_POINTS=1
 # default:
 CONFIG_VFS_INITIALIZE_DEV_NULL=y
 # end of Virtual file system
+
+#
+# ESP-MQTT Configurations
+#
+# default:
+CONFIG_MQTT_PROTOCOL_311=y
+# default:
+# CONFIG_MQTT_PROTOCOL_5 is not set
+# default:
+CONFIG_MQTT_TRANSPORT_SSL=y
+# default:
+CONFIG_MQTT_TRANSPORT_WEBSOCKET=y
+# default:
+CONFIG_MQTT_TRANSPORT_WEBSOCKET_SECURE=y
+# default:
+# CONFIG_MQTT_MSG_ID_INCREMENTAL is not set
+# default:
+# CONFIG_MQTT_SKIP_PUBLISH_IF_DISCONNECTED is not set
+# default:
+# CONFIG_MQTT_REPORT_DELETED_MESSAGES is not set
+# default:
+# CONFIG_MQTT_USE_CUSTOM_CONFIG is not set
+# default:
+# CONFIG_MQTT_TASK_CORE_SELECTION_ENABLED is not set
+# default:
+# CONFIG_MQTT_CUSTOM_OUTBOX is not set
+# end of ESP-MQTT Configurations
 # end of Component config
 
 # default:
