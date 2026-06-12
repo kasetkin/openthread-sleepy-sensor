@@ -4,7 +4,8 @@
     "board/esp32c6-builtin.cfg"
   ],
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32c6"
+    "IDF_TARGET": "esp32c6",
+    "ESP_ROM_ELF_DIR": "/opt/esp/tools/esp-rom-elfs/20241011"
   },
   "idf.flashType": "UART",
   "idf.port": "/dev/ttyACM0"
