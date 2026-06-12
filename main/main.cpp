@@ -24,7 +24,7 @@
 #include "openthread/netdata.h"
 #include "openthread/thread.h"
 
-static constexpr uint32_t CONFIG_OPENTHREAD_NETWORK_POLLPERIOD_TIME_MS = 3000;
+static constexpr uint32_t CONFIG_OPENTHREAD_NETWORK_POLLPERIOD_TIME_MS = 70000;
 
 static const char *TAG = "main-body";
 constexpr uint32_t DEFAULT_TASK_STACK_SIZE = 16384;

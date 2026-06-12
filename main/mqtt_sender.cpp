@@ -6,9 +6,12 @@
 #include <string>
 
 #include "esp_log.h"
+#include "esp_openthread.h"
+#include "esp_openthread_lock.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "mqtt_client.h"
+#include "openthread/link.h"
 
 static const char *TAG = "mqtt-sender";
 
@@ -32,6 +35,17 @@ struct MqttCtx {
     std::atomic<int>   expected_acks{0};
     std::atomic<int>   received_acks{0};
 };
+
+// Poll periods: fast during the MQTT window so TCP ACKs arrive promptly;
+// slow the rest of the time to maximise sleep.
+static constexpr uint32_t POLL_FAST_MS = 500;
+static constexpr uint32_t POLL_SLOW_MS = 70000;
+
+static void set_poll_period(uint32_t ms) {
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otLinkSetPollPeriod(esp_openthread_get_instance(), ms);
+    esp_openthread_lock_release();
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -145,6 +159,8 @@ static void mqtt_publish_task(void *arg) {
         return;
     }
 
+    set_poll_period(POLL_FAST_MS);  // need fast polls so TCP ACKs arrive promptly
+
     esp_mqtt_client_handle_t client = start_client(uri.c_str(), ctx);
     EventBits_t bits = xEventGroupWaitBits(ctx.eg, BIT_CONNECTED | BIT_ERROR,
                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
@@ -186,6 +202,7 @@ static void mqtt_publish_task(void *arg) {
     esp_mqtt_client_stop(client);
     esp_mqtt_client_destroy(client);
     vEventGroupDelete(ctx.eg);
+    set_poll_period(POLL_SLOW_MS);  // back to slow poll until next sensor cycle
     s_task_running.store(false);
     vTaskDelete(nullptr);
 }
