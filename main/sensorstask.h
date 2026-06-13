@@ -45,7 +45,7 @@ public:
     void configureReadyEvent(SensorsReadyEvent readyEvent);
 
 private:
-    static constexpr uint32_t SENSORS_PERIOD_MS = 60 * 1000;
+    static constexpr uint32_t SENSORS_PERIOD_MS = 10 * 1000;
 
     /// ENVIRONMENT sensor, SHT31 via I2C bus
     static constexpr uint8_t SHT3X_ADDR = SHT3X_I2C_ADDR_GND; // 0x44

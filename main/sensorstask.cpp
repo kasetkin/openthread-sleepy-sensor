@@ -154,7 +154,8 @@ void SensorsTask::executeTask()
 
         if (m_readyEvent)
             m_readyEvent(v);
-            
+        
+        // correctLightSleep();
         vTaskDelay(pdMS_TO_TICKS(SENSORS_PERIOD_MS));
     }
 }

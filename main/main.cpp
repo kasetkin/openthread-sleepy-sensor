@@ -18,6 +18,8 @@
 #include "esp_vfs_eventfd.h"
 #include "esp_private/esp_clk.h"
 #include "nvs_flash.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "openthread/dataset.h"
 #include "openthread/ip6.h"
 #include "openthread/link.h"
@@ -172,15 +174,14 @@ extern "C" void app_main(void)
 
     enableRf(true);
     enableExtAntenna(false);
-    if (const esp_err_t timerErr = registerWakeupTimer(static_cast<uint32_t>(100'000)); timerErr != ESP_OK)
-        ESP_LOGE(TAG, "registerWakeupTimer failed: %d", timerErr);
 
     // ── parse secrets ─────────────────────────────────────────────────────────
     const std::string_view yaml = secrets_yaml();
     ESP_LOGI("main", "secrets.yaml embedded size: %d bytes", static_cast<int>(yaml.size()));
     ESP_LOGI("main", "secrets.yaml first 40 chars: %.40s", yaml.data());
     const std::string ot_tlv    = yaml_get_string(yaml, "ot_tlv");
-    const std::string ha_ipv4   = yaml_get_string(yaml, "ha_ipv4");
+    const std::string device_name = yaml_get_string(yaml, "device_name"); 
+    const std::string mqtt_broker_ipv4   = yaml_get_string(yaml, "mqtt_broker_ipv4");
     const std::string mqtt_port_str = yaml_get_string(yaml, "mqtt_port");
     const std::string mqtt_user = yaml_get_string(yaml, "mqtt_username");
     const std::string mqtt_pass = yaml_get_string(yaml, "mqtt_password");
@@ -197,7 +198,7 @@ extern "C" void app_main(void)
     // ── initialise MQTT sender ─────────────────────────────────────────────────
     static constexpr std::string_view DEVICE_ID = "esp32c6_sensor_1";
     mqtt_sender_init(MqttConfig{
-        .ha_ipv4   = ha_ipv4,
+        .ha_ipv4   = mqtt_broker_ipv4,
         .port      = mqtt_port,
         .username  = mqtt_user,
         .password  = mqtt_pass,
@@ -227,12 +228,6 @@ extern "C" void app_main(void)
         mqtt_send_sensor_data(*values.envTemperature, *values.envHumidity);
     });
 
-    xTaskCreate([](void *) static
-    {
-        sensorTask->executeTask();
-        vTaskDelete(nullptr);
-    }, "sensors_task", DEFAULT_TASK_STACK_SIZE, nullptr, 6, nullptr);
-
     // ── OpenThread ────────────────────────────────────────────────────────────
     esp_openthread_radio_config_t radio_config {};
     radio_config.radio_mode = RADIO_MODE_NATIVE;
@@ -261,5 +256,27 @@ extern "C" void app_main(void)
 
     configure_ot_network(ot_tlv);
 
+    xTaskCreate([](void *) static
+    {
+        sensorTask->executeTask();
+        vTaskDelete(nullptr);
+    }, "sensors_task", DEFAULT_TASK_STACK_SIZE, nullptr, 6, nullptr);
+
     startErrorTask(ErrorTask::ErrorCode::ecOK);
+
+
+    constexpr uint64_t lightSleepTime = 50 * 1000000; // 15 sec
+    constexpr uint32_t workTime = 10000; // 5 secs
+    const esp_err_t timerRes = registerWakeupTimer(lightSleepTime);
+    if (timerRes != ESP_OK) {
+        ESP_LOGE(TAG, "can not register wakeup timer");
+        return;
+    }
+
+    while (true) {
+        correctLightSleep();
+        enableUserLED(true);
+        vTaskDelay(pdMS_TO_TICKS(workTime));
+        enableUserLED(false);
+    }
 }

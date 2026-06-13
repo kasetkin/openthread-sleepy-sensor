@@ -11,7 +11,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-esp_err_t registerWakeupTimer(const uint32_t wakeupMicrosec)
+esp_err_t registerWakeupTimer(const uint64_t wakeupMicrosec)
 {
     static const char *TIMERTAG = "timer_wakeup";
 
