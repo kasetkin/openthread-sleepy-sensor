@@ -23,3 +23,12 @@ void mqtt_sender_set_nat64_prefix(const uint8_t *prefix_bytes);
 // Trigger a connect → publish discovery + state → disconnect cycle.
 // Safe to call from any task; non-blocking (the MQTT event loop does the work).
 void mqtt_send_sensor_data(float temperature, float humidity);
+
+// True while a publish cycle started by mqtt_send_sensor_data() is still in flight.
+// Lets a caller tell "a publish is happening" apart from "nothing was sent this cycle".
+bool mqtt_is_busy();
+
+// Block until the in-flight publish cycle (if any) has finished, or timeout_ms elapses.
+// Returns true if the sender is idle (cycle completed, or none was running), false on timeout.
+// Call this before light-sleeping so sleep does not suspend the MQTT task/radio mid-publish.
+bool mqtt_wait_for_idle(uint32_t timeout_ms);

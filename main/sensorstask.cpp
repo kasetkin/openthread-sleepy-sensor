@@ -10,6 +10,7 @@
 #include <esp_sleep.h>
 
 #include "common_utils.h"
+#include "mqtt_sender.h"
 
 std::string SensorsValues::toTelemetryRoundedString(const float value)
 {
@@ -72,6 +73,11 @@ std::string SensorsValues::toLogString() const
 void SensorsTask::configureReadyEvent(SensorsReadyEvent readyEvent)
 {
     m_readyEvent = std::move(readyEvent);
+}
+
+void SensorsTask::configureAttachGate(AttachGate attachGate)
+{
+    m_attachGate = std::move(attachGate);
 }
 
 esp_err_t SensorsTask::initI2C() 
@@ -138,24 +144,57 @@ esp_err_t SensorsTask::readEnvironment(float &temperature, float &humidity)
 void SensorsTask::executeTask()
 {
     static const char * TAG = "sensors-task";
+
+    // Cap on how long to stay awake for a publish before sleeping anyway.
+    static constexpr uint32_t PUBLISH_TIMEOUT_MS = 15 * 1000;
+    static constexpr uint32_t LED_BLINK_MS       = 50;
+
+    // This task is the sole driver of the sleep cadence: arm the wakeup timer once, then
+    // read → publish → wait-for-idle → light-sleep on every iteration.
+    if (const esp_err_t timerRes = registerWakeupTimer(static_cast<uint64_t>(SENSORS_PERIOD_MS) * 1000);
+        timerRes != ESP_OK)
+        ESP_LOGE(TAG, "can not register wakeup timer: %d — sleep interval undefined", timerRes);
+
     while (true) {
 
-        SensorsValues v{};
-
-        float tempVal, humidVal;
-        if (const esp_err_t readError = sht3x_measure(&m_sht3dev, &tempVal, &humidVal);
-            readError == ESP_OK) {
-            v.envTemperature = tempVal;
-            v.envHumidity = humidVal;
-            ESP_LOGI(TAG, "SHT3x Sensor: %.2f °C, %.2f %%", tempVal, humidVal);
+        // Don't read/publish until attached as CHILD. This is a blocking wait (not light sleep) so
+        // OpenThread can finish MLE attachment / re-attach after a lost parent; light-sleeping while
+        // detached would freeze the radio and stall attachment. If the network is absent the gate
+        // times out and we fall through to one sleep period and retry next wake.
+        if (m_attachGate && !m_attachGate(ATTACH_TIMEOUT_MS)) {
+            ESP_LOGW(TAG, "OT not attached within %u ms, retrying next cycle", ATTACH_TIMEOUT_MS);
         } else {
-            ESP_LOGE(TAG, "sensor read error: %d", readError);
-        }        
+            SensorsValues v{};
 
-        if (m_readyEvent)
-            m_readyEvent(v);
-        
-        // correctLightSleep();
-        vTaskDelay(pdMS_TO_TICKS(SENSORS_PERIOD_MS));
+            float tempVal, humidVal;
+            if (const esp_err_t readError = sht3x_measure(&m_sht3dev, &tempVal, &humidVal);
+                readError == ESP_OK) {
+                v.envTemperature = tempVal;
+                v.envHumidity = humidVal;
+                ESP_LOGI(TAG, "SHT3x Sensor: %.2f °C, %.2f %%", tempVal, humidVal);
+            } else {
+                ESP_LOGE(TAG, "sensor read error: %d", readError);
+            }
+
+            if (m_readyEvent)
+                m_readyEvent(v);  // triggers an async MQTT publish when attached as CHILD
+
+            // Only wait/blink if a publish was actually started (skipped when not yet attached).
+            // Waiting before sleeping stops light sleep from freezing the MQTT task/radio mid-flight:
+            // a completed publish gets a brief LED heartbeat; a timeout means MQTT stalled, so we
+            // skip the blink and sleep anyway rather than stay awake burning battery.
+            if (mqtt_is_busy()) {
+                if (mqtt_wait_for_idle(PUBLISH_TIMEOUT_MS))
+                    blinkUserLED(LED_BLINK_MS);
+                else
+                    ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
+            }
+        }
+
+        ESP_LOGI(TAG, "sensor values ready, go to sleep");
+        if (isUsbConsoleConnected())
+            vTaskDelay(pdMS_TO_TICKS(SENSORS_PERIOD_MS));
+        else
+            correctLightSleep();  // light-sleep for SENSORS_PERIOD_MS until the next cycle
     }
 }

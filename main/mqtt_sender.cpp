@@ -19,18 +19,24 @@ static constexpr EventBits_t BIT_CONNECTED = BIT0;
 static constexpr EventBits_t BIT_ALL_ACKED = BIT1;
 static constexpr EventBits_t BIT_ERROR     = BIT2;
 
+// Separate, module-level event group used only to signal "no publish cycle in flight".
+static constexpr EventBits_t BIT_IDLE = BIT0;
+
 static MqttConfig s_cfg;
 static std::atomic<bool> s_discovery_sent{false};
 static std::atomic<bool> s_task_running{false};
+static EventGroupHandle_t s_idle_eg = nullptr;  // created in mqtt_sender_init(); starts idle
 
 // NAT64 /96 prefix used to reach the IPv4 broker.  Default: IANA well-known 64:ff9b::/96.
 // Overridden at runtime via mqtt_sender_set_nat64_prefix() once Thread network data arrives.
-static uint8_t s_nat64_prefix[12] = {
+static uint8_t s_nat64_prefix[12] =
+{
     0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
 // ── context shared between the publish task and the event handler ─────────────
-struct MqttCtx {
+struct MqttCtx
+{
     EventGroupHandle_t eg;
     std::atomic<int>   expected_acks{0};
     std::atomic<int>   received_acks{0};
@@ -41,7 +47,8 @@ struct MqttCtx {
 static constexpr uint32_t POLL_FAST_MS = 500;
 static constexpr uint32_t POLL_SLOW_MS = 70000;
 
-static void set_poll_period(uint32_t ms) {
+static void set_poll_period(uint32_t ms)
+{
     esp_openthread_lock_acquire(portMAX_DELAY);
     otLinkSetPollPeriod(esp_openthread_get_instance(), ms);
     esp_openthread_lock_release();
@@ -49,11 +56,13 @@ static void set_poll_period(uint32_t ms) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-void mqtt_sender_set_nat64_prefix(const uint8_t *p12) {
+void mqtt_sender_set_nat64_prefix(const uint8_t *p12)
+{
     memcpy(s_nat64_prefix, p12, 12);
 }
 
-static std::string make_nat64_uri(const std::string &ipv4, uint16_t port) {
+static std::string make_nat64_uri(const std::string &ipv4, uint16_t port)
+{
     unsigned a, b, c, d;
     if (sscanf(ipv4.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
         ESP_LOGE(TAG, "bad IPv4 '%s'", ipv4.c_str());
@@ -73,7 +82,8 @@ static std::string make_nat64_uri(const std::string &ipv4, uint16_t port) {
 
 static std::string discovery_payload(const char *name, const char *device_class,
                                      const char *unit, const char *value_key,
-                                     std::string_view device_id) {
+                                     std::string_view device_id)
+{
     char buf[512];
     snprintf(buf, sizeof(buf),
         "{"
@@ -95,7 +105,8 @@ static std::string discovery_payload(const char *name, const char *device_class,
 
 // ── event handler — ONLY sets event group bits, never touches the client ──────
 static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
-                                int32_t event_id, void *event_data) {
+                                int32_t event_id, void *event_data)
+{
     auto *ctx = static_cast<MqttCtx *>(handler_arg);
     switch (static_cast<esp_mqtt_event_id_t>(event_id)) {
     case MQTT_EVENT_CONNECTED:
@@ -120,7 +131,8 @@ static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
 }
 
 // ── start a fresh client; clears event bits before connecting ─────────────────
-static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx) {
+static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
+{
     esp_mqtt_client_config_t cfg = {};
     cfg.broker.address.uri       = uri;
     cfg.credentials.username     = s_cfg.username.c_str();
@@ -139,9 +151,14 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx) {
 }
 
 // ── publish task — owns the client lifecycle ──────────────────────────────────
-struct PublishParams { float temperature; float humidity; };
+struct PublishParams
+{
+	float temperature;
+	float humidity;
+};
 
-static void mqtt_publish_task(void *arg) {
+static void mqtt_publish_task(void *arg)
+{
     auto *params = static_cast<PublishParams *>(arg);
     const float temp = params->temperature;
     const float hum  = params->humidity;
@@ -155,6 +172,9 @@ static void mqtt_publish_task(void *arg) {
         ESP_LOGE(TAG, "ha_ipv4 not set or invalid, cannot connect");
         vEventGroupDelete(ctx.eg);
         s_task_running.store(false);
+        if (s_idle_eg)
+        	xEventGroupSetBits(s_idle_eg, BIT_IDLE);
+        	
         vTaskDelete(nullptr);
         return;
     }
@@ -192,7 +212,9 @@ static void mqtt_publish_task(void *arg) {
         esp_mqtt_client_publish(client, state_topic.c_str(), state, 0, 1, 0);
         ESP_LOGI(TAG, "sent %s", state);
 
-        xEventGroupWaitBits(ctx.eg, BIT_ALL_ACKED, pdFALSE, pdTRUE, pdMS_TO_TICKS(10000));
+        // QoS-1 acks over a healthy Thread link return well under a second; cap short
+        // so we stop fast-polling (and sleep) promptly instead of idling the radio.
+        xEventGroupWaitBits(ctx.eg, BIT_ALL_ACKED, pdFALSE, pdTRUE, pdMS_TO_TICKS(4000));
         s_discovery_sent.store(true);
     } else {
         ESP_LOGE(TAG, "MQTT connection failed, skipping cycle");
@@ -204,24 +226,52 @@ static void mqtt_publish_task(void *arg) {
     vEventGroupDelete(ctx.eg);
     set_poll_period(POLL_SLOW_MS);  // back to slow poll until next sensor cycle
     s_task_running.store(false);
+    if (s_idle_eg)
+    	xEventGroupSetBits(s_idle_eg, BIT_IDLE);  // wake any mqtt_wait_for_idle() caller
     vTaskDelete(nullptr);
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
 
-void mqtt_sender_init(const MqttConfig &cfg) {
+void mqtt_sender_init(const MqttConfig &cfg)
+{
     s_cfg = cfg;
+    if (!s_idle_eg) {
+        s_idle_eg = xEventGroupCreate();
+        if (s_idle_eg)
+        	xEventGroupSetBits(s_idle_eg, BIT_IDLE);  // idle until first publish
+    }
 }
 
-void mqtt_send_sensor_data(float temperature, float humidity) {
+void mqtt_send_sensor_data(float temperature, float humidity)
+{
     if (s_task_running.exchange(true)) {
         ESP_LOGW(TAG, "previous publish cycle still running, skipping");
         return;
     }
+    
+    if (s_idle_eg)
+    	xEventGroupClearBits(s_idle_eg, BIT_IDLE);  // mark busy until the task exits
+    	
     auto *params = new PublishParams{temperature, humidity};
     if (xTaskCreate(mqtt_publish_task, "mqtt_pub", 12288, params, 5, nullptr) != pdPASS) {
         ESP_LOGE(TAG, "failed to create mqtt_pub task");
         delete params;
         s_task_running.store(false);
+        if (s_idle_eg)
+        	xEventGroupSetBits(s_idle_eg, BIT_IDLE);
     }
+}
+
+bool mqtt_is_busy()
+{
+    return s_task_running.load();
+}
+
+bool mqtt_wait_for_idle(uint32_t timeout_ms)
+{
+    if (!s_idle_eg) return true;  // never initialised → nothing in flight
+    const EventBits_t bits = xEventGroupWaitBits(
+        s_idle_eg, BIT_IDLE, pdFALSE, pdTRUE, pdMS_TO_TICKS(timeout_ms));
+    return (bits & BIT_IDLE) != 0;
 }

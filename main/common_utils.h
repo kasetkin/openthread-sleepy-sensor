@@ -8,6 +8,8 @@
 void enableRf(const bool enableRf);
 void enableExtAntenna(const bool enableExtAnt);
 void enableUserLED(const bool enableLED);
+/// brief diagnostic flash: LED on for `onMs`, then off. Negligible power vs a held LED.
+void blinkUserLED(const uint32_t onMs);
 
 /// configure wakeup timer
 [[nodiscard("device won't wake on timer if unchecked")]]

@@ -57,7 +57,7 @@ void correctLightSleep()
     vTaskDelay(pdMS_TO_TICKS(AFTER_WAKEUP_SLEEP));
 }
 
-void enableRf(const bool enableRf) 
+void enableRf(const bool enableRf)
 {
     static const char *RFTAG = "gpio-RF";
     const gpio_num_t RF_ON_GPIO = GPIO_NUM_3; 
@@ -105,6 +105,13 @@ void enableUserLED(const bool enableLED)
         ESP_LOGE(LEDTAG, "gpio_set_level error for GPIO_NUM_15 and level %d, error %d", led_flag, ledEnableErr);
     else
         ESP_LOGI(LEDTAG, "gpio_set_level OK for GPIO_NUM_15 and level %d", led_flag);
+}
+
+void blinkUserLED(const uint32_t onMs)
+{
+    enableUserLED(true);
+    vTaskDelay(pdMS_TO_TICKS(onMs));
+    enableUserLED(false);
 }
 
 esp_err_t initNvsFlash()

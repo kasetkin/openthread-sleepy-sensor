@@ -44,8 +44,17 @@ public:
     using SensorsReadyEvent = std::function<void(const SensorsValues &values)>;
     void configureReadyEvent(SensorsReadyEvent readyEvent);
 
+    /// Blocks up to the given ms for Thread attachment; returns true once attached.
+    /// Injected by main so the task gates each cycle without depending on OpenThread directly.
+    using AttachGate = std::function<bool(uint32_t timeoutMs)>;
+    void configureAttachGate(AttachGate attachGate);
+
 private:
-    static constexpr uint32_t SENSORS_PERIOD_MS = 10 * 1000;
+    /// single source of truth for the wake→read→publish→sleep cadence
+    static constexpr uint32_t SENSORS_PERIOD_MS = 20 * 1000;
+
+    /// per-cycle awake budget to (re)attach before sleeping anyway; > typical attach time and SENSORS_PERIOD_MS
+    static constexpr uint32_t ATTACH_TIMEOUT_MS = 30 * 1000;
 
     /// ENVIRONMENT sensor, SHT31 via I2C bus
     static constexpr uint8_t SHT3X_ADDR = SHT3X_I2C_ADDR_GND; // 0x44
@@ -55,6 +64,7 @@ private:
     
     bool m_i2cInitialized = false;
     SensorsReadyEvent m_readyEvent;
+    AttachGate m_attachGate;
     sht3x_t m_sht3dev;
 
     [[nodiscard("I2C unavailable if init failure ignored")]]

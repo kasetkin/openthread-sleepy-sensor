@@ -20,6 +20,7 @@
 #include "nvs_flash.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/event_groups.h>
 #include "openthread/dataset.h"
 #include "openthread/ip6.h"
 #include "openthread/link.h"
@@ -33,6 +34,25 @@ constexpr uint32_t DEFAULT_TASK_STACK_SIZE = 16384;
 
 static std::shared_ptr<SensorsTask> sensorTask;
 static std::shared_ptr<ErrorTask> errorTask;
+
+// Set once the device attaches to the Thread mesh (role CHILD/ROUTER/LEADER), cleared on
+// detach. The sensor task blocks on this before each read→publish→sleep cycle so it never
+// light-sleeps — which would stall OpenThread's MLE attachment — before the OTBR has answered.
+static constexpr EventBits_t BIT_ATTACHED = BIT0;
+static EventGroupHandle_t s_ot_attached_eg = nullptr;
+
+// Blocks up to timeout_ms for the device to be attached; returns true if attached.
+// Returns immediately when already attached.
+static bool wait_for_ot_attached(uint32_t timeout_ms)
+{
+    if (!s_ot_attached_eg)
+    	return false;
+    	
+    const EventBits_t bits = xEventGroupWaitBits(
+        s_ot_attached_eg, BIT_ATTACHED, pdFALSE, pdTRUE, pdMS_TO_TICKS(timeout_ms));
+        
+    return (bits & BIT_ATTACHED) != 0;
+}
 
 void startErrorTask(ErrorTask::ErrorCode code)
 {
@@ -137,19 +157,29 @@ void process_state_change(otChangedFlags flags, void* context)
     switch (role) {
         case OT_DEVICE_ROLE_DISABLED:
             ESP_LOGI(TAG, "OT role: DISABLED");
+            if (s_ot_attached_eg)
+            	xEventGroupClearBits(s_ot_attached_eg, BIT_ATTACHED);
             break;
         case OT_DEVICE_ROLE_DETACHED:
             ESP_LOGI(TAG, "OT role: DETACHED");
+            if (s_ot_attached_eg)
+            	xEventGroupClearBits(s_ot_attached_eg, BIT_ATTACHED);
             break;
         case OT_DEVICE_ROLE_CHILD:
             ESP_LOGI(TAG, "OT role: CHILD — joined network as sleepy end device");
             log_thread_network_info();
+            if (s_ot_attached_eg)
+            	xEventGroupSetBits(s_ot_attached_eg, BIT_ATTACHED);
             break;
         case OT_DEVICE_ROLE_ROUTER:
             ESP_LOGI(TAG, "OT role: ROUTER");
+            if (s_ot_attached_eg)
+            	xEventGroupSetBits(s_ot_attached_eg, BIT_ATTACHED);
             break;
         case OT_DEVICE_ROLE_LEADER:
             ESP_LOGI(TAG, "OT role: LEADER");
+            if (s_ot_attached_eg)
+            	xEventGroupSetBits(s_ot_attached_eg, BIT_ATTACHED);
             break;
     }
 }
@@ -228,7 +258,16 @@ extern "C" void app_main(void)
         mqtt_send_sensor_data(*values.envTemperature, *values.envHumidity);
     });
 
+    // Gate each sensor cycle on Thread attachment so the task never light-sleeps before the
+    // device has reached CHILD (which would stall OpenThread's MLE attachment / re-attach).
+    sensorTask->configureAttachGate([](uint32_t ms) static
+    {
+    	return wait_for_ot_attached(ms);
+    });
+
     // ── OpenThread ────────────────────────────────────────────────────────────
+    // Created before the state-changed callback is registered so no early CHILD transition is missed.
+    s_ot_attached_eg = xEventGroupCreate();
     esp_openthread_radio_config_t radio_config {};
     radio_config.radio_mode = RADIO_MODE_NATIVE;
     esp_openthread_host_connection_config_t host_config {};
@@ -256,6 +295,9 @@ extern "C" void app_main(void)
 
     configure_ot_network(ot_tlv);
 
+    // Attachment is awaited per-cycle inside the sensor task via the gate configured above
+    // (process_state_change() sets BIT_ATTACHED on CHILD), so it also covers later re-attachment.
+
     xTaskCreate([](void *) static
     {
         sensorTask->executeTask();
@@ -264,19 +306,7 @@ extern "C" void app_main(void)
 
     startErrorTask(ErrorTask::ErrorCode::ecOK);
 
-
-    constexpr uint64_t lightSleepTime = 50 * 1000000; // 15 sec
-    constexpr uint32_t workTime = 10000; // 5 secs
-    const esp_err_t timerRes = registerWakeupTimer(lightSleepTime);
-    if (timerRes != ESP_OK) {
-        ESP_LOGE(TAG, "can not register wakeup timer");
-        return;
-    }
-
-    while (true) {
-        correctLightSleep();
-        enableUserLED(true);
-        vTaskDelay(pdMS_TO_TICKS(workTime));
-        enableUserLED(false);
-    }
+    // sensors_task is now the sole driver of the read→publish→wait→light-sleep cadence
+    // (it arms the wakeup timer and calls correctLightSleep itself). app_main has nothing
+    // left to do; returning is fine — the FreeRTOS scheduler keeps the other tasks running.
 }
