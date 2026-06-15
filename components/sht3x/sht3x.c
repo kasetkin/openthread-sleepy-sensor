@@ -57,6 +57,7 @@ const char *SHT3TAG = "sht3x";
 #define SHT3X_STOP_PERIODIC_MEAS_CMD   0x3093
 #define SHT3X_HEATER_ON_CMD            0x306D
 #define SHT3X_HEATER_OFF_CMD           0x3066
+#define SHT3X_READ_SERIAL_CMD          0x3780
 
 static const uint16_t SHT3X_MEASURE_CMD[6][3] = {
         {0x2400, 0x240b, 0x2416}, // [SINGLE_SHOT][H,M,L] without clock stretching
@@ -242,6 +243,31 @@ esp_err_t sht3x_set_heater(sht3x_t *dev, bool enable)
     CHECK_ARG(dev);
 
     return send_cmd(dev, enable ? SHT3X_HEATER_ON_CMD : SHT3X_HEATER_OFF_CMD);
+}
+
+esp_err_t sht3x_read_serial(sht3x_t *dev, uint32_t *serial)
+{
+    CHECK_ARG(dev && serial);
+
+    // 6 bytes: serial MSW + CRC, serial LSW + CRC
+    uint8_t buf[6];
+    uint16_t cmd = shuffle(SHT3X_READ_SERIAL_CMD);
+
+    I2C_DEV_TAKE_MUTEX(&dev->i2c_dev);
+    I2C_DEV_CHECK(&dev->i2c_dev, i2c_dev_read(&dev->i2c_dev, &cmd, 2, buf, sizeof(buf)));
+    I2C_DEV_GIVE_MUTEX(&dev->i2c_dev);
+
+    // genuine Sensirion parts return a valid CRC'd serial; clones usually NACK or fail here
+    if (crc8(buf, 2) != buf[2] || crc8(buf + 3, 2) != buf[5])
+    {
+        ESP_LOGE(SHT3TAG, "CRC check for serial number failed");
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    *serial = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16)
+            | ((uint32_t)buf[3] << 8)  |  (uint32_t)buf[4];
+
+    return ESP_OK;
 }
 
 esp_err_t sht3x_compute_values(sht3x_raw_data_t raw_data, float *temperature, float *humidity)

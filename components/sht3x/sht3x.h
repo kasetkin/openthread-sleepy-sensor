@@ -134,6 +134,19 @@ esp_err_t sht3x_init(sht3x_t *dev);
 esp_err_t sht3x_set_heater(sht3x_t *dev, bool enable);
 
 /**
+ * @brief Read the sensor's 32-bit serial number
+ *
+ * Genuine Sensirion SHT3x parts return a valid CRC-checked serial number;
+ * counterfeit/clone parts typically NACK the command or fail the CRC, so this
+ * doubles as an authenticity check.
+ *
+ * @param dev       Device descriptor
+ * @param serial    Output: 32-bit serial number (valid only on `ESP_OK`)
+ * @return          `ESP_OK` on success, `ESP_ERR_INVALID_CRC` on bad CRC
+ */
+esp_err_t sht3x_read_serial(sht3x_t *dev, uint32_t *serial);
+
+/**
  * @brief High level measurement function
  *
  * For convenience this function comprises all three steps to perform
