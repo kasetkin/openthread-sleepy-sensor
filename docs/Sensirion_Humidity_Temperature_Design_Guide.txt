@@ -1,0 +1,915 @@
+Design Guide for Humidity and Temperature Sensors
+A comment on how to properly design-in an SHTxx or STSxx.
+
+SHTxx are humidity and temperature sensors of highest quality with a broad range of different features. To
+take full advantage of their outstanding performance, several housing and PCB design rules need to be
+considered. This document aims to provide help during the design-in phase of your product and fosters a
+deeper understanding of the sensor’s functionality. Please note that unbeneficial housing and/or PCB designs
+may cause significant temperature and humidity deviations as well as an increased response times.
+
+Most important Design-In Recommendations
+
+Figure 1. A small dead volume allows for rapid
+adaption to changes in the environment.
+
+Figure 2. Separating a sensor compartment from
+the remaining housing minimizes the influence of
+entrapped air on the sensor.
+
+Figure 3. A large opening in the housing provides
+improved air exchange and thus enhanced access
+to the environment.
+
+Figure 4. Decoupling of the sensor from heat
+sources on the PCB minimizes the influence of
+internal heating on the sensor.
+
+Scan me to provide feedback
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+1 / 21
+
+Contents
+1
+
+Humidity Fundamentals ................................................................................................................................................................... 3
+1.1 Relative Humidity %RH .......................................................................................................................................................... 3
+1.2 Dew Point and Condensation ............................................................................................................................................. 3
+
+2
+
+Sensor Performance .......................................................................................................................................................................... 4
+2.1 Introduction to Capacitive Humidity Sensing ............................................................................................................... 4
+2.2 Identifying Measurement Needs ....................................................................................................................................... 4
+2.3 Accuracy of the Sensor vs Accuracy of the System. ................................................................................................... 4
+2.4 Measuring the right thing by measuring at the right place. ................................................................................... 4
+2.5 Response Time .......................................................................................................................................................................... 5
+2.6 Effect of Condensation........................................................................................................................................................... 5
+2.7 Creep and Drift .......................................................................................................................................................................... 5
+2.8 Contamination of the Sensor .............................................................................................................................................. 7
+
+3
+
+Thermal Considerations ................................................................................................................................................................... 8
+3.1 Self-Heating..............................................................................................................................................................................10
+3.2 Effect of Temperature on the Analog Sensor .............................................................................................................10
+3.3 Thermal Design-In Conclusion:.........................................................................................................................................11
+
+4
+
+Electrical and Signal Considerations .........................................................................................................................................12
+4.1 Analog vs. Digital ...................................................................................................................................................................12
+4.2 Electric Specifications ...........................................................................................................................................................12
+4.3 ESD Protection.........................................................................................................................................................................12
+4.4 I2C-Related Considerations ...............................................................................................................................................13
+
+5
+
+Housing and PCB-Design Integration ......................................................................................................................................14
+5.1 Effects on Response Time ...................................................................................................................................................15
+
+6
+
+Mounting and Installation .............................................................................................................................................................16
+
+7
+
+Examples ..............................................................................................................................................................................................17
+
+8
+
+Bibliography ........................................................................................................................................................................................19
+
+9
+
+Revision History .................................................................................................................................................................................20
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+2 / 21
+
+1
+
+Humidity Fundamentals
+
+1.1
+
+Relative Humidity %RH
+
+Relative humidity (%RH) is the measure of the amount of moisture in a gas (usually air) relative to the
+maximum amount that the gas could hold at that temperature. Physically speaking, it is the ratio between the
+partial pressure of water pH2O and the corresponding temperature and gas dependent saturation vapor
+pressure pH2O,0. In the following, and in the great majority of catered applications, the gas is air at
+atmospheric pressures. Relative humidity is typically expressed as a percentage, where 100 %RH means that
+the air is saturated and cannot hold any more moisture. RH is significant in different environments because it
+affects various factors such as human comfort, health, and the growth of organisms. In indoor environments,
+too low RH levels can cause dry skin, respiratory problems, and static electricity buildup. On the other hand,
+high RH levels can promote the growth of mold and bacteria, which can lead to health problems. In industrial
+and manufacturing environments, RH levels can affect the quality of products and processes. For example, in
+the production of electronic components, high humidity levels can cause corrosion and damage to the
+components. Furthermore storage of certain products such as food, drugs, and chemicals may require careful
+control of RH to ensure high quality and longevity. Therefore, measuring humidity is crucial in many different
+applications. This document should help you to design-in Sensirion’s Humidity and Temperature Sensors into
+your specific system/device and to illustrate some basic rules that need to be considered.
+As indicated, relative humidity is strongly temperature dependent because warm air can hold more moisture
+than cool air. Therefore, the relative humidity of air changes with the temperature, even when the absolute
+amount of water vapor in the air (typically called absolute humidity) remains constant.
+At constant absolute humidity, two states with different temperatures and relative humidity are related
+through equation 1:
+𝑅𝐻2 = 𝑅𝐻1 exp (𝑚 𝑇𝑛
+
+𝑇1 − 𝑇2
+)
+(𝑇𝑛 + 𝑇1 )(𝑇𝑛 + 𝑇2 )
+
+(1)
+
+𝑅𝐻1,2 : Relative humidity at state 1, 2
+𝑇1,2 : Temperature [°C] at state 1, 2
+𝑚 = 17.62
+𝑇𝑛 = 243.21 °𝐶
+As further reading we recommend having a look at the document “Introduction to Humidity” [1] on
+Sensirion.com or the “Guide to the Measurement of Humidity” from the National Physical Laboratory [2]. For
+general Handling Instructions and Specification’s please refer to the datasheet and the documentation on
+our website.
+
+1.2
+
+Dew Point and Condensation
+
+Condensation can occur on any surface, including windows, walls, and ceilings when the temperature of the
+air drops below the so-called dew point, causing the water vapor to condense into liquid droplets. In other
+words, the dew point is the temperature at which air becomes saturated with water vapor (RH=100%),
+causing condensation at any temperature lower than the dew point. This implies that in an environment of
+less than 100 %RH there can still be condensation at a surface with a temperature lower than the dewpoint.
+An example of this is when a bottle of water is taken out of the fridge and condensation forms on the
+outside. Because the bottle was in the fridge, its cold sidewalls are lower in temperature than the surrounding
+environment and can therefore be lower than the dew point.
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+3 / 21
+
+2
+
+Sensor Performance
+
+2.1
+
+Introduction to Capacitive Humidity Sensing
+
+Capacitive humidity sensors measure a change in capacitance using a thin polymer film that absorbs water
+vapor from the air. As the polymer absorbs moisture, the overall dielectric constant changes due to
+incorporation of water molecules, which in turn results in a measurable change of capacitance. Typically, this
+change in capacitance is then converted into a voltage signal proportional to the relative humidity of the
+surrounding air. Capacitive humidity sensors are highly accurate, durable, and have a fast response time,
+making them ideal for a wide range of applications in different environments. While analog sensors provide a
+continuous output signal that varies with the change in relative humidity, digital sensors provide a discrete
+output signal in the form of binary data that represents the relative humidity value. Digital sensors are
+typically easier to integrate, certifiable and are subject to less impact from the environment than analog
+sensors, but they also require additional circuitry for signal processing and calibration. Analog sensors are
+more robust and simpler to use. Therefore they might be more suitable for some applications. Especially for
+high noise applications where I2C signals are not stable anymore. Nevertheless the surrounding electronics
+can influence the analog signal more strongly (see section 4.1).
+
+2.2
+
+Identifying Measurement Needs
+
+Prior to designing-in a capacitive humidity and temperature sensor, one must identify the measurement
+needs and consider various factors. Firstly, one should assess the desired range of humidity and temperature
+levels to be measured accurately. This involves understanding the environmental conditions in which the
+sensor will be deployed and determining the minimum and maximum humidity and temperature values of
+interest. Secondly, you need to evaluate the required accuracy and precision of the measurements.
+Depending on the application, a higher level of precision may be necessary, requiring a more sensitive and
+accurate sensor (see section 2.3). Thirdly, you should consider the response time required for humidity and
+temperature measurements. And finally, know the expected chemical surroundings in order to evaluate if a
+membrane or conformal coating is needed. Please note that Sensirion’s newest generation of temperature
+and humidity Sensors are equipped with a heating element. The heating element helps to reduce creep and
+remove condensation, find the respective information in the Datasheet. The sensor’s surrounding and
+exposure to harsh conditions will define if the heater will be used frequently and thus if there is a need for an
+increased power supply.
+
+2.3
+
+Accuracy of the Sensor vs Accuracy of the System.
+
+When using a humidity and temperature sensors in a system or device, it is important to remember that the
+accuracy and performance of the sensors alone do not guarantee the accuracy and performance of the whole
+system or device. Many external factors, such as the design of the device, external and internal heat sources,
+airflow, and homogeneity of the air/gas, can affect the accuracy of the system. This guide aims at identifying
+such influences on the sensor and providing guidelines to decouple the sensor from harmful influences.
+Nevertheless, real-world applications are tremendously diverse and numerous, which entails that this guide
+only showcases some important considerations as inspiration yet remains far from complete.
+The accuracy specified by Sensirion refers to the stand-alone Sensor and therefore the design-in with all its
+different aspects will define the accuracy of the final device.
+
+2.4 Measuring the right thing by measuring at the right place.
+Representative sampling is an important consideration when designing-in a humidity sensor into a specific
+device/application. The sensor’s local microclimate RHL should be representative of the overall environmental
+conditions RHE (see Figure 5.). If the sensor is placed in a location that is not representative of the overall
+environment, the readings it provides may not be accurate. To ensure representative sampling, it is important
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+4 / 21
+
+to consider the factors that affect the humidity level in the environment, such as temperature, airflow, and
+the presence of moisture sources. Additionally, it is important to consider the size of the area being
+monitored and the number of sensors needed to provide an accurate measurement of the overall humidity
+level. For example, in a large room with varying humidity levels, multiple sensors may be needed to provide
+an accurate representation of the overall humidity level.
+
+Figure 5. The sensor measures the local conditions at the sensing element (RH L; TL). To achieve good
+measurements these local conditions need to correspond to the conditions of the environment under test
+(i.e. RHE; TE).
+
+2.5
+
+Response Time
+
+Response time is a measure of how fast the sensor reading reacts to physical changes in the environment. As
+the underlying principle for the measurement of humidity and temperature correlates to different physical
+equilibriums it also implies different response times for each parameter. For the temperature response time,
+it is the time needed for the sensor to reach thermal equilibrium with its environment. Sensirion Sensors are
+very small with little thermal mass and thus have a fast response time. The humidity response time is
+governed by the equilibrium of the relative vapor pressure of the sensor environment with the sensing
+element itself. The sensing polymer reacts to humidity changes by absorbing or desorbing water
+proportional to the relative humidity of the environment. Typically, the response time is specified as the
+sensor’s response to a step function and denoted by τ63, the time which is needed to reach 63% of the step
+value. In the real world, however, step functions seldomly occur, and the sensor typically is partially housed,
+making response time considerations slightly less relevant (see section 5.1). For more information, please find
+the document “Sensor Specification Statement and Testing Guide” [3] on sensirion.com.
+
+2.6
+
+Effect of Condensation
+
+In contrast to many types of humidity and temperature sensors, condensed water has only marginal effects
+on Sensirion Humidity and Temperature Sensors which still function within given specifications in condensing
+environments. Nevertheless, please refer to section 2.7 to see, how high humidity levels can contribute to a
+reversible creep in the sensor reading.
+
+2.7
+
+Creep and Drift
+
+Creep and Drift are terms that describe an offset reading of the actual humidity value. The main difference
+between creep and drift is the reversibility. Creep is a result of exposure to high temperatures and humidity
+values, whereas drift comes from alteration over time. 1
+
+1
+
+Please note that this explanation is simplified.
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+5 / 21
+
+To understand the origin, think of the sensing polymer as a porous structure with absorption sites for water
+molecules. It is in constant equilibrium with the surrounding environment and absorbs and desorbs water
+molecules corresponding to the relative water vapor pressure of the air. The sensing polymer is designed for
+most of these absorption sites to be equal in terms of their energy levels and kinetics. As the activation
+energy for absorption and desorption is generally very low, the sensor works effectively and fast, as
+illustrated in green in Figure 6. However, some absorption sites need a higher activation energy to be
+occupied or vacated (see Figure 6 red), which makes them both less likely to be filled when empty and
+vacated when filled.
+When the sensor is exposed to high humidity and temperature levels, the vapor pressure and energy of the
+water molecules is high enough for them to occasionally start occupying these states leading to a temporary
+offset, so called creep. Because desorption from these sites is less pronounced the effect of creep may persist
+over some time. Although the increased energy barrier generally hinders absorption to these sites, high
+temperature, high humidity, and time increase the absorption probability and therefore creep.
+Creep is reversible with time and the process can be accelerated actively. This is why Sensirion sensors come
+equipped with a heater that helps to vacate these sites by providing thermal energy to the polymer. Please
+refer to the document “Creep Mitigation” for more information [4]. In addition to the reversible drift, the
+long-term drift might also contain an irreversible component, originating from altering of the polymer
+structure. This makes up the irreversible part of the drift that cannot be mitigated with the heater.
+
+Figure 6. Schematic representation of the energy levels of two different H2O adsorption sites in the sensing
+polymer, where the green path represents absorption and desorption (forward and backward reaction) in
+common states with a low energy barrier and small energy difference between the occupied 𝐸1 and
+unoccupied 𝐸0 state. The red path represents the same absorption and desorption processes in extraordinary
+→
+sites, exhibiting a significantly higher energy barrier and a lower energy of the absorbed state. 𝐸𝑎1,2
+stands
+←
+for the activation energy needed for a water molecule to adsorb and 𝐸𝑎1,2 to desorb from the polymer.
+This might not have direct implications for the design of a specific application, but we believe that it useful to
+understand the measurement concept and therefore ease the understanding for other design problems.
+Sensirion Definition and Determination of Drift
+To meet the worst-case scenario, drift is determined in both directions Sensirion defines it as a widening of
+our specification over a certain time.
+E.g. A drift of <0.1 °C per year implies a widening of the original accuracy specification by a maximum of
+±0.1°C every year.
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+6 / 21
+
+2.8
+
+Contamination of the Sensor
+
+Contamination refers to foreign substances whose presence affects the senor’s reading. While contamination
+must be assessed on a case-by-case basis because of its individual nature, its main effect can be described.
+Generally, contamination leads to too high %RH readings in dry environments and to too low %RH readings
+in elevated humidity environments. This behavior is attributed to the difference in the dielectric permittivity
+of the polymer, water, and potential contaminants, of which water exhibits one of the highest permittivities
+(ε=80) with only very few exceptions.
+
+Figure 7. Schematic representation of the difference between a clean (left) and methanol contaminated
+sensor (right). The measurement results in the middle show how the offset is different at low and high %RH
+level.
+As illustrated in Figure 7 the offset due to contamination at low %RH results in too high readings. The
+contaminant occupies adsorption sites in the polymer that would otherwise be empty and increases the
+dielectric permittivity of the whole system. At high %RH the contaminant is in competition with the water
+molecules and occupies absorption sites that would otherwise be occupied by the water molecules. As water
+has a very high dielectric permittivity the contaminant lowers the overall dielectric permittivity regarding the
+state without contamination.
+For more detailed information on the different types of contamination and their effects, mitigation, recovery
+as well as guidelines regarding handling which are specific to contamination, please refer to the
+“Contamination Guide” from Sensirion.com
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+7 / 21
+
+3
+
+Thermal Considerations
+
+As mentioned in section 1.1 the relative humidity is strongly temperature dependent. External heat sources
+close to the sensor will cause increased temperature (and thus decreased RH) readings. In extreme cases such
+as at 90 %RH, a deviation of 1 °C will result in a deviation of the humidity signal of 5 %RH. Therefore, the
+influence of external heat sources in the proximity of the sensor needs to be kept at a minimum for accurate
+measurements. In order to know how to thermally insulate the sensor from the rest of the device it is useful
+to think about the main transport phenomena of heat. The thermal equilibrium with its surrounding is
+controlled via conduction and convection, therefore the following points should be considered to avoid
+heating:
+•
+•
+
+Heat conduction: The sensor should be thermally decoupled from all heat sources and coupled to
+the environment as much as possible.
+Heat convection/radiation: Shield the sensor from heated air and heat radiation.
+
+Heat conduction from nearby heat sources (power electronics, microprocessors, displays, etc.) is the more
+severe and most common source of temperature deviations. Mostly it occurs through the PCB and can be
+mitigated by sufficient distances and removal of unnecessary metal around the sensor (e.g. trough milling or
+etching slits as shown in Figure 8). To mitigate the risk of unwanted temperature deviations it is beneficial to
+keep metal connections on the PCB as thin as possible. A possible workaround is to use our sensor mounted
+on a flex PCB which significantly reduces the heat conduction.
+Regarding heat convection and radiation, the first solution is to keep potential heat sources as far away from
+the sensor as possible and to consider the direction of airflow through the device. The sensor should not be
+exposed to heated air from other electronic components. Therefore it is recommended to physically shield
+the sensor from its surroundings with walls which also improves the performance by minimizing dead volume
+as shown in Figure 9.
+
+Figure 8. a) Thin metal connections and sufficient distance to the heat source helps minimize heat
+conduction. b) The milled slits (white lines) around the sensor decrease the thermal conduction through the
+PCB. c) Unnecessary metal, such as thick metal connections will increase heat transfer from the heat source to
+the sensor. d) Heat sources in close proximity will heat the sensor excessively.
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+8 / 21
+
+Figure 9. a) A wall (orange) shields the sensor from the heated air. The opening on the top avoids the heating
+of the complete housing. b) The heated air gets in direct contact with the sensor which will cause increased
+temperature readings. c) Even heated air from nearby devices may influence the sensor readings
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+9 / 21
+
+3.1
+
+Self-Heating
+
+All electronic devices are prone to self-heating, which depends on the used components, the build, and the
+mode in which it is operated. For example, during charging or when operated in a high-power consumption
+mode (e.g. maximal screen brightness) self-heating is increased. Nevertheless, this issue can easily be
+overcome by smart thermal design-in, potentially coupled with an algorithmic compensation of the residual
+offset. For illustration, see Figure 10, which shows the effect of self-heating in an exemplary device with good
+(green) and bad (red) design-in.
+
+Figure 10. Schematic comparison of the effect of self-heating in a good (green) and bad (red) thermal
+design-in. The dashed lines indicate a mode change which results in a temperature increase. Please note that
+the temperature increase of the individual components is the same, the only difference comes from the
+design-in of the sensor and therefore what the sensor feels. The first temperature increase is the so-called
+basic heat up. The second dashed line represents the mode change to maximum brightness, but it could also
+be due to other components e.g. the CPU. The last dashed line shows the effect that comes from charging a
+device with an implemented humidity and temperature sensor.
+Kindly note that even with an immaculate design-in there might be a residual effect of the self-heating on
+the sensor. This small disturbance can be compensated via an algorithmic solution. Please note that
+subsequent compensation of temperature also requires a compensation of the RH signal as the RH is
+strongly temperature dependent.
+Component level self-heating can be significant for analog sensors. For considerations regarding analog
+sensor self-heating please refer to section 3.2.
+
+3.2
+
+Effect of Temperature on the Analog Sensor
+
+Analog sensors are more prone to component level self-heating, which requires some additional
+considerations. In such cases, having good thermal coupling between the sensor and the PCB as well as
+sufficient thermal mass around the sensor decreases self-heating effects. As presented in section 3, such a
+design comes with an increase in response time. The trade-off between response time and self-heating
+regarding thermal mass and thermal coupling should be considered when designing-in an analog sensor.
+Analog signals are prone to interference by nearby electronics or heat sources within the device. For
+example, through induced changes of resistance, which influences the analog signal. In the case of analog
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+10 / 21
+
+SHT sensors, the signal is a voltage output, which may be disturbed by factors such as noise, interference,
+and environmental conditions prior to digital conversion. For example, heat changes the resistivity of the
+wires through which the signal is transported and therefore affects the potential, resulting in a change of the
+apparent %RH reading. In contrast, a digital signal, once generated, is typically immune to such variations as
+it is based on discrete values, allowing for more robust and reliable transmission as well as storage of
+information. However, it's worth noting that even digital signals can be subject to errors if there are issues
+with the transmission or decoding process.
+
+3.3
+
+Thermal Design-In Conclusion:
+
+Thermal coupling to the environment is desired while thermal coupling to the rest of the device should be
+avoided. In particular, the sensor needs to be decoupled from the thermal mass of the device and shielded
+from any heated air flowing through it (see Figure 8, Figure 9 & Figure 11). As a rule of thumb, the sensor
+should be implemented as isolated as possible and as exposed to the environment as possible. In the best
+case with a flow of ambient air around the sensor. Additionally, ensure that the heat transfer away from the
+device itself is guaranteed and optimized as much as possible. Depending on the final location it is
+used/installed, e.g. wall, floor, table, the heat conduction will differ. It is important to avoid heating the
+complete system and be aware that the analog sensor signal is even more sensitive to interferences prior to
+the ADC (see section 4.1).
+
+Figure 11. The sensor may be thermally decoupled from the PCB by small PCB connections or with a flex.
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+11 / 21
+
+4
+
+Electrical and Signal Considerations
+
+4.1
+
+Analog vs. Digital
+
+Most applications today profit largely from or even demand the use of digital solutions. We therefore
+recommend the use of our newest generation SHT4x Digital Sensor and only refer to analog versions if
+specific applications must be designed analog. In those cases, it is important to consider the thermal
+considerations regarding signal transmission and self-heating explained in sections 3.1 and 3.2.
+
+4.2 Electric Specifications
+When incorporating a humidity and temperature sensor, it is necessary to check the electric specifications
+according to the sensor datasheet. Even though Sensirion’s sensors have an ultra-low power consumption a
+stable power supply is needed. Sensirion’s SHT4x sensors come equipped with an integrated heater for creep
+mitigation, decontamination, and general testing. Heater use frequency needs to be considered, as frequent
+use increases the power consumption according to the electrical specifications in the sensor datasheet.
+Battery powered applications, as for example RHT trackers, should be designed to avoid heater use in order
+to minimize power consumption.
+
+4.3 ESD Protection
+During sensor handling, the sensor shall be protected from ESD (Electrostatic Discharge) and the assembly
+process itself should incorporate ESD control measures. This includes ensuring proper grounding, using
+antistatic packaging and materials, and employing ESD-safe workstations and tools. More about ESD and
+guidelines can be found in the “Handling Instructions” [5].
+After the sensor is mounted in the device, the risk of ESD is slightly reduced, however, basic ESD protection
+measures and the following recommendations should still be applied. Make sure that the sensor cannot be
+reached by hand. As exposure of the sensor is otherwise desired, a potential workaround can be to cover the
+sensor with a wide-meshed metallic wire enclosure creating a faraday cage (as showed in Figure 12).
+
+Figure 12. An exposed sensor with no protection provided by the device housing might be covered through a
+Faraday cage e.g. a wide-meshed metallic wire enclosure (yellow).
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+12 / 21
+
+4.4 I2C-Related Considerations
+Sensirion SHTxx Sensors rely on the I2C (Inter-Integrated Circuit) communication protocol [6]. I2C is a widely
+used serial communication protocol that allows multiple devices to communicate with each other using a
+shared bus. It uses two bidirectional lines: SDA (Serial Data Line) for data transmission and SCL (Serial Clock
+Line) for clock synchronization. Find more information in the respective datasheets.
+Regarding the Design of a new device, there are some I2C-related factors to consider:
+Noise:
+To minimize noise interference of other signals, make sure to have all devices on the I2C bus properly
+grounded sharing a common ground connection. Signal integrity can also be enhanced by using high-quality
+cables and connectors, keeping the traces short and avoiding sharp bends. At high exposure to
+electromagnetic interference, it might be beneficial to shield the PCB and use shielded cables.
+Cable Length
+I2C is designed for short-distance communication within a single PCB or between devices on the same board.
+I2C cables ideally should be as short as possible. This reduces the cables’ parasitic capacitance. Long cable
+lengths can lead to signal degradation and may require signal buffering or repeaters. If long cable lengths
+are necessary, consider using I2C bus extenders or I2C isolators to maintain signal integrity and protect
+against noise. If none of the above is possible, and high noise can be expected in the system, the analog
+versions of SHT can be a suitable alternative.
+Multicomponent System
+I2C allows multiple components to share the same bus, reducing the number of communication lines
+required. This can lower the pin count on microcontrollers and other devices, potentially reducing costs and
+board space needed. This is possible as I2C uses a controller(master)-target(slave) architecture, enabling
+efficient data transfer between multiple devices on the same bus. When multiple components are on the
+same bus each device on the I2C bus must have a unique address. Sensirion SHTxx Sensors are available with
+three different I2C addresses (0x44, 0x45 and 0x46) which allows easy integration of multiple sensors on the
+same I2C bus. Having multiple devices with the same address can lead to conflicts and communication errors.
+Clock Stretching
+Some I2C devices may need additional time to process data, resulting in clock stretching. Ensure that the
+master device as well as the sensor can handle clock stretching to avoid data corruption.
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+13 / 21
+
+5
+
+Housing and PCB-Design Integration
+
+As mentioned in section 2.4 it is important to make sure that the measurements of the sensor are
+representative of the environment of interest. Furthermore, the effect on response time needs to be
+considered during the design phase.
+Design with a Possible Airflow
+If there is airflow over the sensor (see Figure 13 a), the air inside of the dead volume is exchanged constantly.
+Such a design-in is favourable in terms of response times. Even if there is no defined flow (e.g. in a living
+room) a device designed with multiple openings and possible airflow is preferred. If there is no possibility to
+realize a design with airflow directly over the sensor, the following points become more important.
+Dead Volume
+The larger the dead volume, the more air needs to be exchanged until the environmental and sensor
+conditions match each other. Large dead volumes will drastically increase the humidity response time. It is
+recommended to keep the dead volume as small as possible by compartmentalization as seen in Figure 13 b
+and c.
+Aperture Size
+The aperture is the connection between environment and sensor. A larger aperture allows for faster exchange
+of air and therefore better humidity response times. Nevertheless, for harsh conditions a trade-off between
+exposure and response times needs to be made.
+
+Figure 13. Schematic view of different design-ins. a) The defined airflow goes directly over the sensor and
+therefore the local conditions at the sensor equilibrate quickly with the environmental conditions. If there is
+no defined flow this design is not recommended as the dead volume is too big. b) The walls (orange) reduce
+the dead volume which in combination with the large aperture will lead to good response times. c) The small
+dead volume, and multiple openings enable good air exchange. d-f) These designs will have slow humidity
+response times due to the following reasons: d) The airflow misses the sensor, and the dead volume is large.
+e) The aperture size is too small with respect to the dead volume. f) The dead volume is large.
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+14 / 21
+
+5.1
+
+Effects on Response Time
+
+To get a feeling how the housing affects the response time take a look at Figure 14 from the Sensirion Github
+Article, SHT4x Smart gadget housing (GitHub - Sensirion/smartgadget-sht4x-housing: Housing for the SHT4x
+Smartgadget). The main takeaway is that a correctly designed housing does not affect the accuracy of the
+sensor. However, as soon as the sensor is mounted, meaning that it is coupled to a bigger thermal mass, the
+humidity and temperature response time is affected, even when it is only soldered to a PCB without an actual
+housing covering the sensor. It also illustrates that a big aperture has a smaller effect than the connected
+thermal mass. The humidity response time at constant temperature is very fast but lengthens with fluctuating
+temperature due to the strong coupling of RH to temperature.
+
+Temperature Step Response [%]
+
+Sensirion Humidity and Temperature SHT4x Smart Gadget
+Normalized Temperature Response time
+
+Time[h]
+
+Figure 14. Difference of a standalone sensor (black), a sensor mounted on the gadget with no housing
+(yellow), a sensor mounted on the gadget with housing (pink), and a sensor mounted on the gadget with
+housing and a hole (blue).
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+15 / 21
+
+6
+
+Mounting and Installation
+
+This section should help you select what type of packaging is best suited for your device and what decisions
+need to be taken during the design-in. The standard SHTxx are provided in an open-cavity dual flat no lead
+(DFN) package with the following optional features:
+•
+
+•
+
+Filter Membrane: The filter membrane protects the sensor opening form water and dust according
+to IP67. Due to the minimal package volume and the membrane’s high vapour permeability, the
+response time is identical to the sensor without membrane (see Figure 15).
+SF2 Filter membrane: The SF2 Filter membrane is a free-standing filter membrane that can be used to
+protect the sensor and housing opening against water, dust, soot, particles, and other contaminants.
+It seals a housing towards the environment, not only the sensor opening. The cavity inside the cap is
+designed so that the dead volume between membrane and sensor is negligible (see Figure 15);
+hence the impact on response time for humidity measurements is reduced to a minimum.
+
+Figure 15. SHT4x with the integrated filter membrane option on the left and on the right the free standing
+SF2 filter membrane.
+•
+
+Protective Cover: The protective cover is meant to protect the sensor during mounting. After
+processing and before operation the protective cover must be removed from the sensor. The cover is
+particularly recommended for processes like conformal coating of the corresponding PCB. Conformal
+coating is a protective layer applied to electronic circuitry to enhance the reliability and durability of
+a device. The protective cover is slightly larger than the sensor (see Figure 16) in order for it to safely
+be removed using the designated non-sticking flap. Kindly consider the dimensions in the respective
+datasheet to see if the protective cover option is feasible for your desired design.
+
+•
+
+Wettable Flanks: Wettable flanks facilitate easier and more reliable soldering during the assembly
+process. The increased surface area allows for better wetting of solder, resulting in stronger and
+more consistent solder joints. This can reduce the risk of solder defects, such as poor adhesion, voids,
+or incomplete wetting, which could lead to electrical connectivity issues or mechanical failures. The
+main advantage is that it facilitates easier inspection after mounting. Regarding the design-in, there
+are no additional considerations needed compared to the standard DFN package (see Figure 16).
+
+Figure 16. Left: SHT4x protective cover option. Right: SHT4xA (automotive grade) with wettable flanks.
+•
+
+Mounted on FPCB: There is the option to mount the sensor onto a Flex-PCB which minimizes thermal
+conduction from the device to the sensor and allows for easy exchange of the sensor. This can be
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+16 / 21
+
+useful for devices with an expected lifetime longer than the lifetime of the sensor which is qualified
+to be 15 years2. Sensirion offers FPCP-mounted humidity and temperature sensors for certified
+devices that incorporate a certified SHT43. This is because certified sensors might be exchanged
+more frequently. For more information, please refer to the Document Certified Smart tracking [7].
+
+7
+
+Examples
+
+Figure 17. This is the most recommended design-in if no filter membrane is required. It combines the rules
+above well. The wall (orange) helps to shield the sensor from the heated air as well as decrease dead volume.
+The large opening on the top left corner allows for good air exchange and reduces self-heating of the whole
+device. The milled slits around the sensor reduce thermal conduction through the PCB. Additionally, the
+sensor’s exposure and air exchange with the environment is guaranteed by several slits in the housing that
+simultaneously act as protection. This design-in provides fast response times as well as low influences from
+heating parts.
+
+Figure 18. This is a simpler variation of Figure 17. As there is no airflow the humidity response time is slower
+(depending on the distance of the sensor to the opening). With additional slits in the PCB, the sensor could
+be shielded from external heating if required.
+
+2
+
+THB-test, JESD22-A101 Standard
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+17 / 21
+
+Figure 19. This is a more sophisticated version of Figure 18 using a flex PCB for thermal decoupling.
+Additionally, there is a filter membrane to protect the sensor. The short distance between the sensor and the
+environment under test improves response times.
+
+Figure 20. This design shows an SHT85 inside of a tube with airflow. The thin PCB connection decouples the
+SHT85 very well from the tube and allows very fast thermal response times as well as reducing the influence
+of temperature deviations between the tube and the air.
+
+Figure 21. The SF2 filter cap may help to design tight housings. The filter membrane protects the sensor and
+the housing from dust and water. Due to the small volume between the sensor and the environment, fast
+humidity response times can be achieved.
+
+Figure 22. Exhaustive Design-In example showing several important aspects in a specific use case where the
+sensor needs to be decoupled from the rest of the device achieved by a sensor cavity (blue) with a lateral
+opening (grey). The PCB (green) has slits (white) around the SHT Sensor to reduce heat conduction. On top of
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+18 / 21
+
+the PCB, a sealing pad (pink) is mounted as a sealing material to avoid leakage of air and to mount the
+sensor cavity.3
+
+8
+
+Bibliography
+
+[1]
+
+Sensirion, "Introduction to Humidity," January 2009. [Online]. Available:
+https://sensirion.com/products/downloads/.
+
+[2]
+
+National Physical Laboratory, "https://www.npl.co.uk/special-pages/guides/a-guide-to-the-measure-ofhumidity-gpg103," 1996. [Online]. Available: https://www.npl.co.uk/special-pages/guides/a-guide-tothe-measure-of-humidity-gpg103.
+
+[3]
+
+Sensirion, "Sensors Specification Statement and Testing Guide," 19 April 2021. [Online]. Available:
+https://sensirion.com/products/downloads/.
+
+[4]
+
+Sensirion, "Creep Mitigation SHT4x," 04 2022. [Online]. Available:
+https://sensirion.com/media/documents/A88858C9/629626D4/Application_Note_Creep_Mitigation_SHT
+4x.pdf.
+
+[5]
+
+Sensirion, "Handling Instructions for Humidity Sensors," 2020. [Online]. Available: www.sensirion.com.
+
+[6]
+
+NXP Semiconductors, "User manual UM10204," vol. Rev. 6, 2014.
+
+[7]
+
+Sensirion, "Certified Smart Tracking," August 2023. [Online]. Available: www.sensirion.com.
+
+[8]
+
+IEEE, "IEEE Reference Guide," 2018. [Online]. Available: https://ieeeauthorcenter.ieee.org/wpcontent/uploads/IEEE-Reference-Guide.pdf. [Accessed 20 1 2023].
+
+[9]
+
+Sensirion, "Using the Integrated Heater of SHT4x for Heat-Assisted Polymer," [Online]. Available:
+https://admin.sensirion.com/media/documents/FEE9F039/62459F54/Application_Note_Heater_Deconta
+mination_SHT4xX.pdf.
+
+3
+
+The size specifications can help to get a feeling for your design-in, should you have different sizing does not mean it does not work.
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+19 / 21
+
+9
+
+Revision History
+
+Date
+
+Version
+
+Pages
+
+Changes
+
+June 2010
+
+1.0
+
+all
+
+Initial release
+
+May 2019
+
+1.1
+
+1
+
+Updated front page and figures
+
+March 2024
+
+2
+
+All
+
+Complete Remake
+
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+20 / 21
+
+Important Notices
+Warning, Personal Injury
+Do not use this product as safety or emergency stop devices or in any other application where failure of the product could
+result in personal injury. Do not use this product for applications other than its intended and authorized use. Before installing,
+handling, using or servicing this product, please consult the data sheet and application notes. Failure to comply with these
+instructions could result in death or serious injury.
+If the Buyer shall purchase or use SENSIRION products for any unintended or unauthorized application, Buyer shall defend,
+indemnify and hold harmless SENSIRION and its officers, employees, subsidiaries, affiliates and distributors against all claims, costs,
+damages and expenses, and reasonable attorney fees arising out of, directly or indirectly, any claim of personal injury or death
+associated with such unintended or unauthorized use, even if SENSIRION shall be allegedly negligent with respect to the design
+or the manufacture of the product.
+ESD Precautions
+The inherent design of this component causes it to be sensitive to electrostatic discharge (ESD). To prevent ESD-induced damage
+and/or degradation, take customary and statutory ESD precautions when handling this product. See application note “ESD, Latchup
+and EMC” for more information.
+Warranty
+SENSIRION warrants solely to the original purchaser of this product for a period of 12 months (one year) from the date of delivery
+that this product shall be of the quality, material and workmanship defined in SENSIRION’s published specifications of the product.
+Within such period, if proven to be defective, SENSIRION shall repair and/or replace this product, in SENSIRION’s discretion, free
+of charge to the Buyer, provided that:
+•
+notice in writing describing the defects shall be given to SENSIRION within fourteen (14) days after their appearance;
+•
+such defects shall be found, to SENSIRION’s reasonable satisfaction, to have arisen from SENSIRION’s faulty design, material,
+or workmanship;
+•
+the defective product shall be returned to SENSIRION’s factory at the Buyer’s expense; and
+•
+the warranty period for any repaired or replaced product shall be limited to the unexpired portion of the original period.
+This warranty does not apply to any equipment which has not been installed and used within the specifications recommended by
+SENSIRION for the intended and proper use of the equipment. EXCEPT FOR THE WARRANTIES EXPRESSLY SET FORTH HEREIN,
+SENSIRION MAKES NO WARRANTIES, EITHER EXPRESS OR IMPLIED, WITH RESPECT TO THE PRODUCT. ANY AND ALL
+WARRANTIES, INCLUDING WITHOUT LIMITATION, WARRANTIES OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR
+PURPOSE, ARE EXPRESSLY EXCLUDED AND DECLINED.
+SENSIRION is only liable for defects of this product arising under the conditions of operation provided for in the data sheet and
+proper use of the goods. SENSIRION explicitly disclaims all warranties, express or implied, for any period during which the goods
+are operated or stored not in accordance with the technical specifications.
+SENSIRION does not assume any liability arising out of any application or use of any product or circuit and specifically disclaims
+any and all liability, including without limitation consequential or incidental damages. All operating parameters, including without
+limitation recommended parameters, must be validated for each customer’s applications by customer’s technical experts.
+Recommended parameters can and do vary in different applications.
+SENSIRION reserves the right, without further notice, (i) to change the product specifications and/or the information in this
+document and (ii) to improve reliability, functions and design of this product.
+
+Headquarters and Subsidiaries
+Sensirion AG
+Laubisruetistr. 50
+CH-8712 Staefa ZH
+Switzerland
+
+Sensirion Inc., USA
+phone: +1 312 690 5858
+info-us@sensirion.com
+www.sensirion.com
+
+Sensirion Korea Co. Ltd.
+phone: +82 31 337 7700~3
+info-kr@sensirion.com
+www.sensirion.com/kr
+
+phone: +41 44 306 40 00
+fax:
++41 44 306 40 30
+info@sensirion.com
+www.sensirion.com
+
+Sensirion Japan Co. Ltd.
+phone: +81 45 270 4506
+info-jp@sensirion.com
+www.sensirion.com/jp
+
+Sensirion China Co. Ltd.
+phone: +86 755 8252 1501
+info-cn@sensirion.com
+www.sensirion.com/cn
+
+Sensirion Taiwan Co. Ltd
+phone: +886 2 2218-6779
+info@sensirion.com
+www.sensirion.com
+
+To find your local representative, please visit
+www.sensirion.com/distributors
+
+Copyright © 2024, by SENSIRION. CMOSens® is a trademark of Sensirion. All rights reserved
+www.sensirion.com / D1
+
+Version 2 – March 2024
+
+21 / 21
+
+
