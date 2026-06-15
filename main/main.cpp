@@ -1,11 +1,14 @@
 #include <memory>
 #include <string>
+#include <string_view>
+#include <charconv>
 #include "esp_err.h"
 #include "esp_log.h"
 
 #include "main.h"
 #include "common_utils.h"
 #include "secrets.h"
+#include "calibration.h"
 #include "sensorstask.h"
 #include "errortask.h"
 #include "mqtt_sender.h"
@@ -62,6 +65,17 @@ void startErrorTask(ErrorTask::ErrorCode code)
         errorTask->execute();
         vTaskDelete(nullptr);
     }, "error_task", DEFAULT_TASK_STACK_SIZE, nullptr, 6, nullptr);
+}
+
+// Parse a float offset from calibration.txt; returns 0.0f if the key is missing/unparseable.
+// from_chars (not stof) because C++ exceptions are disabled in this build.
+static float parse_calib_offset(std::string_view content, std::string_view key)
+{
+    const std::string s = yaml_get_string(content, key);
+    float value = 0.0f;
+    if (!s.empty())
+        std::from_chars(s.data(), s.data() + s.size(), value);  // leaves value=0 on failure
+    return value;
 }
 
 static uint8_t hex_nibble(char c)
@@ -244,6 +258,12 @@ extern "C" void app_main(void)
         startErrorTask(ErrorTask::ErrorCode::ecSensorsFail);
         return;
     }
+
+    // ── per-device calibration (calibration.txt, embedded at build time) ────────
+    const float rh_offset   = parse_calib_offset(calibration_txt(), "rh_offset");
+    const float temp_offset = parse_calib_offset(calibration_txt(), "temp_offset");
+    ESP_LOGI("main", "calibration offsets: RH %+.2f %%RH, T %+.2f C", rh_offset, temp_offset);
+    sensorTask->configureCalibration(rh_offset, temp_offset);
 
     sensorTask->configureReadyEvent([](const SensorsValues &values) static
     {

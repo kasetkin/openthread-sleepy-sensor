@@ -9,7 +9,7 @@ set(srcs
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS "."
                        PRIV_REQUIRES sht3x nvs_flash esp_timer esp_driver_gpio esp_driver_usb_serial_jtag esp_event openthread espressif__mqtt
-                       EMBED_TXTFILES ../secrets.yaml
+                       EMBED_TXTFILES ../secrets.yaml ../calibration.txt
                        WHOLE_ARCHIVE)
 #  esp_adc -- maybe for battery reading
 set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD 26)

@@ -1,0 +1,7 @@
+# Per-device sensor calibration. Added to the raw SHT3x reading before publishing.
+# Same "key: \"value\"" syntax as secrets.yaml. Embedded at build time (rebuild to change).
+# Derive rh_offset by comparing this sensor against a trusted reference:
+#   rh_offset = reference_RH - measured_RH   (e.g. 47.8 - 67.9 = -20.1)
+# Leave at "0.0" for no correction.
+rh_offset: "0.0"
+temp_offset: "0.0"

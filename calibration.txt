@@ -1,0 +1,2 @@
+rh_offset: "-20.1"
+temp_offset: "0.0"
