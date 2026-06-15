@@ -104,7 +104,7 @@ void enableUserLED(const bool enableLED)
     if (ledEnableErr != ESP_OK)
         ESP_LOGE(LEDTAG, "gpio_set_level error for GPIO_NUM_15 and level %d, error %d", led_flag, ledEnableErr);
     else
-        ESP_LOGI(LEDTAG, "gpio_set_level OK for GPIO_NUM_15 and level %d", led_flag);
+        ESP_LOGD(LEDTAG, "gpio_set_level OK for GPIO_NUM_15 and level %d", led_flag);
 }
 
 void blinkUserLED(const uint32_t onMs)
