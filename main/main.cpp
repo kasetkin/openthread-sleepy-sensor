@@ -267,15 +267,13 @@ extern "C" void app_main(void)
 
     sensorTask->configureReadyEvent([](const SensorsValues &values) static
     {
-        if (!values.envTemperature || !values.envHumidity) return;
-
         esp_openthread_lock_acquire(portMAX_DELAY);
         const otDeviceRole role = otThreadGetDeviceRole(esp_openthread_get_instance());
         esp_openthread_lock_release();
 
         if (role != OT_DEVICE_ROLE_CHILD) return;
 
-        mqtt_send_sensor_data(*values.envTemperature, *values.envHumidity);
+        mqtt_send_sensor_data(values.envTemperature, values.envHumidity);
     });
 
     // Gate each sensor cycle on Thread attachment so the task never light-sleeps before the

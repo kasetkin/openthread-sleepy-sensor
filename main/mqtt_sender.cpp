@@ -153,15 +153,17 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
 // ── publish task — owns the client lifecycle ──────────────────────────────────
 struct PublishParams
 {
-	float temperature;
-	float humidity;
+	std::optional<float> temperature;
+	std::optional<float> humidity;
 };
 
 static void mqtt_publish_task(void *arg)
 {
     auto *params = static_cast<PublishParams *>(arg);
-    const float temp = params->temperature;
-    const float hum  = params->humidity;
+    const bool hasTemp = params->temperature.has_value();
+    const bool hasHumid = params->humidity.has_value();
+    const float temp = params->temperature.value_or(0.0);
+    const float hum  = params->humidity.value_or(0.0);
     delete params;
 
     MqttCtx ctx;
@@ -196,18 +198,29 @@ static void mqtt_publish_task(void *arg)
         ctx.received_acks.store(0);
         xEventGroupClearBits(ctx.eg, BIT_ALL_ACKED);
 
-        if (need_discovery) {
-            const std::string t_topic   = "homeassistant/sensor/" + std::string(dev) + "/temperature/config";
-            const std::string t_payload = discovery_payload("Temperature", "temperature", "°C", "t", dev);
-            esp_mqtt_client_publish(client, t_topic.c_str(), t_payload.c_str(), 0, 1, 1);
+        if (need_discovery && (hasTemp || hasHumid)) {
+            if (hasTemp) {
+                const std::string t_topic   = "homeassistant/sensor/" + std::string(dev) + "/temperature/config";
+                const std::string t_payload = discovery_payload("Temperature", "temperature", "°C", "t", dev);
+                esp_mqtt_client_publish(client, t_topic.c_str(), t_payload.c_str(), 0, 1, 1);
+            }
 
-            const std::string h_topic   = "homeassistant/sensor/" + std::string(dev) + "/humidity/config";
-            const std::string h_payload = discovery_payload("Humidity", "humidity", "%", "h", dev);
-            esp_mqtt_client_publish(client, h_topic.c_str(), h_payload.c_str(), 0, 1, 1);
+            if (hasHumid) {
+                const std::string h_topic   = "homeassistant/sensor/" + std::string(dev) + "/humidity/config";
+                const std::string h_payload = discovery_payload("Humidity", "humidity", "%", "h", dev);
+                esp_mqtt_client_publish(client, h_topic.c_str(), h_payload.c_str(), 0, 1, 1);
+            }
         }
 
         char state[64];
-        snprintf(state, sizeof(state), "{\"t\":%.3g,\"h\":%.3g}", temp, hum);
+        //! \todo use std::format and std::to_chars instead of snprintf
+        if (hasTemp && hasHumid)
+            snprintf(state, sizeof(state), "{\"t\":%.3g,\"h\":%.3g}", temp, hum);
+        else if (hasTemp)
+            snprintf(state, sizeof(state), "{\"t\":%.3g}", temp);
+        else if (hasHumid)
+            snprintf(state, sizeof(state), "{\"h\":%.3g}", hum);
+
         const std::string state_topic = std::string(dev) + "/state";
         esp_mqtt_client_publish(client, state_topic.c_str(), state, 0, 1, 0);
         ESP_LOGI(TAG, "sent %s", state);
@@ -243,7 +256,7 @@ void mqtt_sender_init(const MqttConfig &cfg)
     }
 }
 
-void mqtt_send_sensor_data(float temperature, float humidity)
+void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity)
 {
     if (s_task_running.exchange(true)) {
         ESP_LOGW(TAG, "previous publish cycle still running, skipping");

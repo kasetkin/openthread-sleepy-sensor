@@ -273,7 +273,7 @@ void SensorsTask::executeTask()
                 const bool periodicDue = m_cyclesSinceHeater >= HEATER_PERIODIC_CYCLES;
                 const bool humidityDue = m_highRhCycles >= HIGH_RH_TRIGGER_CYCLES;
 
-                if (true || periodicDue || humidityDue) {
+                if (periodicDue || humidityDue) {
                     ESP_LOGI(TAG, "heater maintenance due (periodic=%d, humidity=%d)",
                              periodicDue, humidityDue);
                     // Publishing is suppressed during maintenance (heated readings are never
@@ -289,7 +289,10 @@ void SensorsTask::executeTask()
                 }
 
                 v.envTemperature = calTemp;
-                v.envHumidity = calHum;
+
+                //! \todo enable back when hardware SHT3X sensor is fixed
+                // v.envHumidity = calHum;
+
                 ESP_LOGI(TAG, "SHT3x raw %.2f C / %.2f %%RH  ->  calibrated %.2f C / %.2f %%RH",
                          rawTemp, rawHum, calTemp, calHum);
             } else {
@@ -312,7 +315,7 @@ void SensorsTask::executeTask()
         }
 
         ESP_LOGI(TAG, "sensor values ready, go to sleep");
-        vTaskDelay(pdMS_TO_TICKS(SENSORS_PERIOD_MS));
-        // correctLightSleep();  // light-sleep for SENSORS_PERIOD_MS until the next cycle
+        // vTaskDelay(pdMS_TO_TICKS(SENSORS_PERIOD_MS));
+        correctLightSleep();  // light-sleep for SENSORS_PERIOD_MS until the next cycle
     }
 }
