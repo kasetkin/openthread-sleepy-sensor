@@ -1,13 +1,17 @@
 {
-  "name": "ESP32 Sensor SD Logger",
-  "image": "espressif/idf:v6.0.1",
+  "name": "ESP32 Matter Sensor (esp-matter)",
+  // Prebuilt image bundling esp-matter + a Matter-compatible ESP-IDF (here v5.4.1,
+  // pinned release v1.5). esp-matter does NOT support IDF v6.0 (main branch uses v6.0.1).
+  // For the newest IDF v5.5.4 instead, use tag "latest_idf_v5.5.4" (tracks esp-matter main).
+  "image": "espressif/esp-matter:release-v1.5_idf_v5.4.1",
   "runArgs": [
     "--device=/dev/ttyACM0",
     "--group-add=dialout"
   ],
   "remoteEnv": {
-    "IDF_PATH": "/opt/esp/idf",
-    "IDF_TOOLS_PATH": "/opt/esp",
+    "IDF_PATH": "/opt/espressif/esp-idf",
+    "IDF_TOOLS_PATH": "/opt/espressif/tools",
+    "ESP_MATTER_PATH": "/opt/espressif/esp-matter",
     "BASH_ENV": "/usr/local/bin/idf-env.sh",
     // Keep Claude's global config (.claude.json) inside the bind-mounted
     // .claude dir so chat history / config survives a container rebuild.
@@ -28,8 +32,8 @@
         "anthropic.claude-code"
       ],
       "settings": {
-        "idf.espIdfPath": "/opt/esp/idf",
-        "idf.toolsPath": "/opt/esp"
+        "idf.espIdfPath": "/opt/espressif/esp-idf",
+        "idf.toolsPath": "/opt/espressif/tools"
       }
     }
   }

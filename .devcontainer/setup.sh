@@ -1,8 +1,10 @@
 #!/bin/bash
 set -e
 
-# Sets up PATH with all versioned ESP-IDF tool paths (cmake, toolchain, python env, etc.)
-source /opt/esp/idf/export.sh 2>/dev/null
+# esp-matter image layout: ESP-IDF and esp-matter both live under /opt/espressif.
+# Source both so PATH/env include idf.py, the toolchain, and the esp-matter tools.
+source "$IDF_PATH/export.sh" 2>/dev/null
+source "$ESP_MATTER_PATH/export.sh" 2>/dev/null
 
 # Allow git to operate in bind-mounted workspace (owned by host UID, not container UID)
 git config --global --add safe.directory '*'
@@ -15,6 +17,7 @@ cat > /usr/local/bin/idf-env.sh <<EOF
 export PATH="$PATH"
 export IDF_PYTHON_ENV_PATH="$IDF_PYTHON_ENV_PATH"
 export ESP_IDF_VERSION="$ESP_IDF_VERSION"
+export ESP_MATTER_PATH="$ESP_MATTER_PATH"
 EOF
 
 echo "source /usr/local/bin/idf-env.sh" >> ~/.bashrc
