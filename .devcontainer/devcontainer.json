@@ -12,6 +12,7 @@
     "IDF_PATH": "/opt/espressif/esp-idf",
     "IDF_TOOLS_PATH": "/opt/espressif/tools",
     "ESP_MATTER_PATH": "/opt/espressif/esp-matter",
+    "_PW_ACTUAL_ENVIRONMENT_ROOT": "/opt/espressif/esp-matter/connectedhomeip/connectedhomeip/.environment",
     "BASH_ENV": "/usr/local/bin/idf-env.sh",
     // Keep Claude's global config (.claude.json) inside the bind-mounted
     // .claude dir so chat history / config survives a container rebuild.
