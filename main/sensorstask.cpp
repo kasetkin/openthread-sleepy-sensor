@@ -11,7 +11,6 @@
 #include <esp_timer.h>
 
 #include "common_utils.h"
-#include "mqtt_sender.h"
 
 std::string SensorsValues::toTelemetryRoundedString(const float value)
 {
@@ -237,9 +236,7 @@ void SensorsTask::executeTask()
 {
     static const char * TAG = "sensors-task";
 
-    // Cap on how long to stay awake for a publish before sleeping anyway.
-    static constexpr uint32_t PUBLISH_TIMEOUT_MS = 15 * 1000;
-    static constexpr uint32_t LED_BLINK_MS       = 50;
+    static constexpr uint32_t LED_BLINK_MS = 50;
 
     // This task is the sole driver of the sleep cadence: arm the wakeup timer once, then
     // read → publish → wait-for-idle → light-sleep on every iteration.
@@ -300,22 +297,19 @@ void SensorsTask::executeTask()
             }
 
             if (m_readyEvent)
-                m_readyEvent(v);  // triggers an async MQTT publish when attached as CHILD
+                m_readyEvent(v);  // pushes the reading into the Matter attributes
 
-            // Only wait/blink if a publish was actually started (skipped when not yet attached).
-            // Waiting before sleeping stops light sleep from freezing the MQTT task/radio mid-flight:
-            // a completed publish gets a brief LED heartbeat; a timeout means MQTT stalled, so we
-            // skip the blink and sleep anyway rather than stay awake burning battery.
-            if (mqtt_is_busy()) {
-                if (mqtt_wait_for_idle(PUBLISH_TIMEOUT_MS))
-                    blinkUserLED(LED_BLINK_MS);
-                else
-                    ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
-            }
+            // Matter hands the attribute update to the stack synchronously; the ICD /
+            // subscription engine reports it in the background. Brief heartbeat blink
+            // on a fresh reading.
+            if (v.envTemperature.has_value() || v.envHumidity.has_value())
+                blinkUserLED(LED_BLINK_MS);
         }
 
         ESP_LOGI(TAG, "sensor values ready, go to sleep");
-        // vTaskDelay(pdMS_TO_TICKS(SENSORS_PERIOD_MS));
-        correctLightSleep();  // light-sleep for SENSORS_PERIOD_MS until the next cycle
+        // Plain delay: with CONFIG_PM_ENABLE + tickless idle the system auto-light-sleeps
+        // when idle, coordinated with the Matter ICD (don't force esp_light_sleep here —
+        // it would freeze the Matter/OpenThread tasks mid-poll).
+        vTaskDelay(pdMS_TO_TICKS(SENSORS_PERIOD_MS));
     }
 }

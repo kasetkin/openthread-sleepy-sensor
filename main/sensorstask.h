@@ -30,8 +30,8 @@ class SensorsTask
 public:
     ~SensorsTask();
     SensorsTask() = default;
-    SensorsTask(const SensorsTask &) = delete("SensorsTask owns I2C device handles — copying aliases hardware resources");
-    SensorsTask &operator=(const SensorsTask &) = delete("SensorsTask owns I2C device handles — copying aliases hardware resources");
+    SensorsTask(const SensorsTask &) = delete; //("SensorsTask owns I2C device handles — copying aliases hardware resources");
+    SensorsTask &operator=(const SensorsTask &) = delete; //("SensorsTask owns I2C device handles — copying aliases hardware resources");
 
     [[nodiscard("sensors unavailable if init failure ignored")]]
     esp_err_t init();

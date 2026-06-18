@@ -3,7 +3,7 @@
   // Prebuilt image bundling esp-matter + a Matter-compatible ESP-IDF (here v5.4.1,
   // pinned release v1.5). esp-matter does NOT support IDF v6.0 (main branch uses v6.0.1).
   // For the newest IDF v5.5.4 instead, use tag "latest_idf_v5.5.4" (tracks esp-matter main).
-  "image": "espressif/esp-matter:release-v1.5_idf_v5.4.1",
+  "image": "espressif/esp-matter:latest_idf_v5.5.4",
   "runArgs": [
     "--device=/dev/ttyACM0",
     "--group-add=dialout"

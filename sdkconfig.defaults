@@ -1,64 +1,58 @@
-#
-# mbedTLS
-#
-CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
-CONFIG_MBEDTLS_KEY_EXCHANGE_ECJPAKE=y
-CONFIG_MBEDTLS_ECJPAKE_C=y
-# end of mbedTLS
+# ── Matter-over-Thread config for the ESP32-C6 sensor ────────────────────────
+# Based on esp-matter's proven light/sdkconfig.defaults + sdkconfig.defaults.c6_thread.
+# FIRST-BUILD scope: reliable commissioning + reporting. ICD/LIT + automatic light
+# sleep are deferred to a follow-up power pass (they make commissioning flaky and
+# need careful tuning); this build is an always-on (rx-on) Thread MTD.
 
-#
-# OpenThread
-#
+# ── Flash / partition (single-app, no OTA — see partitions.matter.csv) ──
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.matter.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_ENABLE_OTA_REQUESTOR=y
+
+# ── BLE (NimBLE) — used only to bootstrap Thread creds during commissioning ──
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_EXT_ADV=n
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_SIZE=70
+CONFIG_USE_BLE_ONLY_FOR_COMMISSIONING=y
+
+# ── Matter over Thread (no Wi-Fi transport) ──
 CONFIG_OPENTHREAD_ENABLED=y
 CONFIG_OPENTHREAD_BORDER_ROUTER=n
 CONFIG_OPENTHREAD_MTD=y
-CONFIG_OPENTHREAD_DNS64_CLIENT=y
-CONFIG_OPENTHREAD_CLI=y
-CONFIG_OPENTHREAD_TASK_SIZE=4096
-CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
-# end of OpenThread
-
-#
-# lwIP
-#
-CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
-CONFIG_LWIP_IPV6_NUM_ADDRESSES=8
-CONFIG_LWIP_IPV4=n
-CONFIG_LWIP_ND6=n
-# end of lwIP
-
-#
-# IEEE 802.15.4
-#
+CONFIG_OPENTHREAD_SRP_CLIENT=y
+CONFIG_OPENTHREAD_DNS_CLIENT=y
+CONFIG_OPENTHREAD_CLI=n
+CONFIG_ENABLE_WIFI_STATION=n
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
 CONFIG_IEEE802154_ENABLED=y
-# end of IEEE 802.15.4
 
-#
-# light sleep
-#
-CONFIG_PM_ENABLE=y
-CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
-CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP=y
-CONFIG_IEEE802154_SLEEP_ENABLE=y
-CONFIG_FREERTOS_HZ=1000
-CONFIG_ESP_SLEEP_POWER_DOWN_FLASH=y
-CONFIG_ESP_MODEM_CLOCK_ENABLE_CHECKING=y
-# end of light sleep
+# ── lwIP for OpenThread / Matter ──
+# IDF v5.4.1's openthread component's input_fn returns void; keep esp_netif matching
+# (the option defaults on in this build and would otherwise break the OT netif compile).
+CONFIG_ESP_NETIF_RECEIVE_REPORT_ERRORS=n
+CONFIG_LWIP_IPV6_AUTOCONFIG=n
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=8
+CONFIG_LWIP_MULTICAST_PING=y
+CONFIG_LWIP_HOOK_IP6_ROUTE_DEFAULT=y
+CONFIG_LWIP_HOOK_ND6_GET_GW_DEFAULT=y
 
-#
-# Sleep Config (ESP32-C6)
-#
-CONFIG_ESP_PHY_MAC_BB_PD=y
-# end of Sleep Config
+# ── Discovery (operational + commissionable over Thread) ──
+CONFIG_USE_MINIMAL_MDNS=n
+CONFIG_ENABLE_EXTENDED_DISCOVERY=y
 
-#
-# ESP System Settings
-#
+# ── mbedTLS (Matter crypto: PASE/CASE) ──
+CONFIG_MBEDTLS_HKDF_C=y
+CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECJPAKE=y
+CONFIG_MBEDTLS_ECJPAKE_C=y
+
+# ── Matter ──
+CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=2
+CONFIG_ENABLE_CHIP_SHELL=n
+
+# ── Build size ──
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
-# end of ESP System Settings
-
-#
-# Compiler
-#
-CONFIG_COMPILER_OPTIMIZATION_PERF=y
-# end of Compiler

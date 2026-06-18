@@ -1,0 +1,18 @@
+# Matter single-app (no-OTA) partition table for ESP32-C6 / 4 MB flash.
+#
+# STAGED for the Matter migration — NOT used by the current MQTT build. It becomes
+# active only when sdkconfig.defaults.matter is applied (which points
+# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME here). Partition table offset is 0x8000.
+#
+# Layout rationale (see .claude/plans/ migration plan, Step 0):
+#   - 4 MB is tight for Matter, so this is a SINGLE factory app (no OTA slots).
+#   - `factory` = 3 MB: ample for a Matter app (~1.5 MB) + headroom.
+#   - `fctry`   = 24 KB nvs: holds the Device Attestation Certificate (DAC) /
+#                 factory data written by esp-matter's mfg_tool (test creds for DIY).
+#   - `nvs`     = 48 KB: Matter + Thread operational/config storage.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0xC000,
+phy_init,   data, phy,      0x15000,  0x1000,
+factory,    app,  factory,  0x20000,  0x300000,
+fctry,      data, nvs,      0x320000, 0x6000,

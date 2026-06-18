@@ -14,7 +14,7 @@ void blinkUserLED(const uint32_t onMs);
 /// configure wakeup timer
 [[nodiscard("device won't wake on timer if unchecked")]]
 esp_err_t registerWakeupTimer(const uint64_t wakeupMicrosec);
-esp_err_t registerWakeupTimer(int) = delete("duration must be uint32_t microseconds — negative values silently wrap to enormous sleep");
+esp_err_t registerWakeupTimer(int) = delete;//("duration must be uint32_t microseconds — negative values silently wrap to enormous sleep");
 
 /// sleep for wakeupMicrosec from above + ?10ms? using esp_light_sleep
 void correctLightSleep();
