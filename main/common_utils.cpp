@@ -1,61 +1,11 @@
 #include "common_utils.h"
 
 #include <chrono>
-#include <string_view>
 #include <esp_log.h>
-#include <esp_sleep.h>
-#include <esp_check.h>
-#include <esp_timer.h>
 #include <nvs_flash.h>
 #include <driver/gpio.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-
-esp_err_t registerWakeupTimer(const uint64_t wakeupMicrosec)
-{
-    static const char *TIMERTAG = "timer_wakeup";
-
-    ESP_RETURN_ON_ERROR(esp_sleep_enable_timer_wakeup(wakeupMicrosec), TIMERTAG, "Configure timer as wakeup source failed");
-    ESP_LOGI(TIMERTAG, "timer wakeup source is ready");
-    return ESP_OK;
-}
-
-void correctLightSleep()
-{
-    static const char *LSLEEPTAG = "light_sleep";
-
-    /// without this not all systems (RF, BLE, etc.) are ready right after wakeup
-    /// not sure why,
-    //! \todo check documentation and remove if possible 
-    static const uint32_t AFTER_WAKEUP_SLEEP = 10; //ms
-
-    ESP_LOGI(LSLEEPTAG, "cycle before light sleep");
-
-    /// with this code, everything doesn't wotk without connected logger
-    // uart_wait_tx_idle_polling(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
-
-    const int64_t t_before_us = esp_timer_get_time();
-    esp_light_sleep_start();
-    const int64_t t_after_us = esp_timer_get_time();
-    std::string_view wakeup_reason;
-
-    if (const uint32_t wakeupCauses = esp_sleep_get_wakeup_causes();
-        wakeupCauses & BIT(ESP_SLEEP_WAKEUP_TIMER))
-        wakeup_reason = "timer";
-    else if (wakeupCauses & BIT(ESP_SLEEP_WAKEUP_GPIO))
-        wakeup_reason = "pin";
-    else if (wakeupCauses & BIT(ESP_SLEEP_WAKEUP_UART))
-        wakeup_reason = "uart";
-        // vTaskDelay(1);
-    else
-        wakeup_reason = "other";
-
-    ESP_LOGI(LSLEEPTAG, "Returned from light sleep, reason: %s, t=%lld ms, slept for %lld ms",
-            wakeup_reason.data(), t_after_us / 1000, (t_after_us - t_before_us) / 1000);
-
-    ESP_LOGI(LSLEEPTAG, "cycle right after wakeup, sleep for %d msec", AFTER_WAKEUP_SLEEP);
-    vTaskDelay(pdMS_TO_TICKS(AFTER_WAKEUP_SLEEP));
-}
 
 void enableRf(const bool enableRf)
 {

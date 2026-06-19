@@ -1,5 +1,4 @@
 build/
 /sdkconfig.old
 /.claude/
-secrets.yaml
 /managed_components/

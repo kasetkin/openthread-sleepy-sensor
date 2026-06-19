@@ -17,12 +17,6 @@ struct SensorsValues
 public:
     std::optional<float> envTemperature;
     std::optional<float> envHumidity;
-    std::optional<float> barometricPressure;
-
-    std::string toTelemetryString() const;
-    std::string toLogString() const;
-    /// up to 3 decimal digits; trailing zeros and dot stripped
-    static std::string toTelemetryRoundedString(const float value);
 };
 
 class SensorsTask
@@ -44,21 +38,13 @@ public:
     using SensorsReadyEvent = std::function<void(const SensorsValues &values)>;
     void configureReadyEvent(SensorsReadyEvent readyEvent);
 
-    /// Blocks up to the given ms for Thread attachment; returns true once attached.
-    /// Injected by main so the task gates each cycle without depending on OpenThread directly.
-    using AttachGate = std::function<bool(uint32_t timeoutMs)>;
-    void configureAttachGate(AttachGate attachGate);
-
-    /// Per-device calibration offsets added to each raw reading before publishing.
+    /// Per-device calibration offsets added to each raw reading before reporting.
     /// Sourced from calibration.txt and injected by main (default 0 = no correction).
     void configureCalibration(float rhOffset, float tempOffset);
 
 private:
-    /// single source of truth for the wake→read→publish→sleep cadence
+    /// single source of truth for the wake→read→report→sleep cadence
     static constexpr uint32_t SENSORS_PERIOD_MS = 60 * 1000;
-
-    /// per-cycle awake budget to (re)attach before sleeping anyway; > typical attach time and SENSORS_PERIOD_MS
-    static constexpr uint32_t ATTACH_TIMEOUT_MS = 30 * 1000;
 
     /// --- heater maintenance / plausibility self-test (see Sensirion docs in docs/) ---
     /// periodic cadence (~24 h at SENSORS_PERIOD_MS): routine plausibility check + creep mitigation
@@ -84,7 +70,6 @@ private:
     
     bool m_i2cInitialized = false;
     SensorsReadyEvent m_readyEvent;
-    AttachGate m_attachGate;
     sht3x_t m_sht3dev;
 
     /// maintenance scheduling counters (persist across light sleep — RAM is retained)

@@ -1,15 +1,14 @@
 #pragma once
 //
-// Matter sensor endpoint interface — the Matter replacement for mqtt_sender.h.
+// Matter sensor endpoint interface.
 //
 // This header is the clean boundary between the app's C++26 code and the
 // Matter/CHIP (gnu++17) implementation in matter_sensor.cpp: it pulls in NO
 // esp-matter/chip headers, only <optional>, so `main` can include it freely.
 //
-// Unlike MQTT (connect → publish → disconnect each cycle), Matter is a
-// subscription/report model: the sensor task just pushes the latest values into
-// the cluster attributes and the Matter stack + ICD report them to subscribers
-// on their own schedule. No connect/disconnect, no wait-for-idle.
+// Matter is a subscription/report model: the sensor task just pushes the latest
+// values into the cluster attributes and the Matter stack reports them to
+// subscribers on their own schedule — no per-cycle connection to open or drain.
 
 #include <optional>
 

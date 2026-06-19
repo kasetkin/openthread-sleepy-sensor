@@ -1,83 +1,17 @@
 #include "sensorstask.h"
 
 #include <algorithm>
-#include <charconv>
-#include <ranges>
 #include <cmath>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
-#include <esp_sleep.h>
 #include <esp_timer.h>
 
 #include "common_utils.h"
 
-std::string SensorsValues::toTelemetryRoundedString(const float value)
-{
-    // buf[24]: fixed,3 for sensor ranges (±150 °C, 0–1200 hPa) never exceeds 10 chars.
-    char buf[24];
-    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value, std::chars_format::fixed, 3);
-    if (ec != std::errc{})
-        return "ERR";
-    std::string_view sv(buf, ptr);
-    if (!sv.contains('.'))
-        return std::string(sv);
-    const auto isTrailingZero = [](char c) static {
-        return c == '0';
-    };
-    const auto trailing = sv | std::views::reverse | std::views::take_while(isTrailingZero);
-    sv.remove_suffix(std::ranges::distance(trailing));
-    if (sv.ends_with('.'))
-        sv.remove_suffix(1);
-    return std::string(sv);
-}
-
-std::string SensorsValues::toTelemetryString() const
-{
-    std::string message;
-    if (envTemperature) {
-        message += std::string_view("TEMP;");
-        message += toTelemetryRoundedString(envTemperature.value());
-        message += std::string_view(";");
-    }
-    if (envHumidity) {
-        message += std::string_view("HUMID;");
-        message += toTelemetryRoundedString(envHumidity.value());
-        message += std::string_view(";");
-    }
-    if (barometricPressure) {
-        message += std::string_view("PRESS;");
-        message += toTelemetryRoundedString(barometricPressure.value());
-        message += std::string_view(";");
-    }
-    return message;
-}
-
-std::string SensorsValues::toLogString() const
-{
-    auto appendOpt = [](std::string& out, const auto& opt) static {
-        if (opt.has_value()) appendNum(out, opt.value());
-        else out += "NO_VALUE";
-    };
-    std::string result;
-    result.reserve(100);
-    result += "envTemperature: ";
-    appendOpt(result, envTemperature);
-    result += ", envHumidity: ";
-    appendOpt(result, envHumidity);
-    result += ", barometricPressure: ";
-    appendOpt(result, barometricPressure);
-    return result;
-}
-
 void SensorsTask::configureReadyEvent(SensorsReadyEvent readyEvent)
 {
     m_readyEvent = std::move(readyEvent);
-}
-
-void SensorsTask::configureAttachGate(AttachGate attachGate)
-{
-    m_attachGate = std::move(attachGate);
 }
 
 void SensorsTask::configureCalibration(float rhOffset, float tempOffset)
@@ -238,78 +172,69 @@ void SensorsTask::executeTask()
 
     static constexpr uint32_t LED_BLINK_MS = 50;
 
-    // This task is the sole driver of the sleep cadence: arm the wakeup timer once, then
-    // read → publish → wait-for-idle → light-sleep on every iteration.
-    if (const esp_err_t timerRes = registerWakeupTimer(static_cast<uint64_t>(SENSORS_PERIOD_MS) * 1000);
-        timerRes != ESP_OK)
-        ESP_LOGE(TAG, "can not register wakeup timer: %d — sleep interval undefined", timerRes);
-
+    // This task drives the read→report→sleep cadence. Matter stores the latest attribute
+    // values and its subscription engine reports them whenever the device is connected, so
+    // there is no attach gate: a reading taken before Thread is up is simply held in the
+    // cluster and reported once a controller is reachable.
     while (true) {
 
-        // Don't read/publish until attached as CHILD. This is a blocking wait (not light sleep) so
-        // OpenThread can finish MLE attachment / re-attach after a lost parent; light-sleeping while
-        // detached would freeze the radio and stall attachment. If the network is absent the gate
-        // times out and we fall through to one sleep period and retry next wake.
-        if (m_attachGate && !m_attachGate(ATTACH_TIMEOUT_MS)) {
-            ESP_LOGW(TAG, "OT not attached within %u ms, retrying next cycle", ATTACH_TIMEOUT_MS);
-        } else {
-            SensorsValues v{};
+        SensorsValues v{};
 
-            float rawTemp, rawHum;
-            if (const esp_err_t readError = sht3x_measure(&m_sht3dev, &rawTemp, &rawHum);
-                readError == ESP_OK) {
-                // calibrated values drive both the publish and the high-humidity trigger
-                float calTemp = rawTemp + m_tempOffset;
-                float calHum  = std::clamp(rawHum + m_rhOffset, 0.0f, 100.0f);
+        float rawTemp, rawHum;
+        if (const esp_err_t readError = sht3x_measure(&m_sht3dev, &rawTemp, &rawHum);
+            readError == ESP_OK) {
+            // calibrated values drive both the reported value and the high-humidity trigger
+            float calTemp = rawTemp + m_tempOffset;
+            float calHum  = std::clamp(rawHum + m_rhOffset, 0.0f, 100.0f);
 
-                // Schedule heater maintenance: periodic (~24 h) or after sustained high
-                // humidity. The humidity trigger uses calibrated RH so a biased sensor can't
-                // self-trigger endlessly.
-                m_cyclesSinceHeater++;
-                m_highRhCycles = (calHum > HIGH_RH_THRESHOLD) ? m_highRhCycles + 1 : 0;
-                const bool periodicDue = m_cyclesSinceHeater >= HEATER_PERIODIC_CYCLES;
-                const bool humidityDue = m_highRhCycles >= HIGH_RH_TRIGGER_CYCLES;
+            // Schedule heater maintenance: periodic (~24 h) or after sustained high
+            // humidity. The humidity trigger uses calibrated RH so a biased sensor can't
+            // self-trigger endlessly.
+            m_cyclesSinceHeater++;
+            m_highRhCycles = (calHum > HIGH_RH_THRESHOLD) ? m_highRhCycles + 1 : 0;
+            const bool periodicDue = m_cyclesSinceHeater >= HEATER_PERIODIC_CYCLES;
+            const bool humidityDue = m_highRhCycles >= HIGH_RH_TRIGGER_CYCLES;
 
-                if (periodicDue || humidityDue) {
-                    ESP_LOGI(TAG, "heater maintenance due (periodic=%d, humidity=%d)",
-                             periodicDue, humidityDue);
-                    // Publishing is suppressed during maintenance (heated readings are never
-                    // published); a clean post-cooldown value replaces this cycle's reading.
-                    if (float ct, ch; runHeaterMaintenance(ct, ch) == ESP_OK) {
-                        rawTemp = ct;
-                        rawHum  = ch;
-                        calTemp = rawTemp + m_tempOffset;
-                        calHum  = std::clamp(rawHum + m_rhOffset, 0.0f, 100.0f);
-                    }
-                    m_cyclesSinceHeater = 0;
-                    m_highRhCycles = 0;
+            if (periodicDue || humidityDue) {
+                ESP_LOGI(TAG, "heater maintenance due (periodic=%d, humidity=%d)",
+                         periodicDue, humidityDue);
+                // Reporting is suppressed during maintenance (heated readings are discarded);
+                // a clean post-cooldown value replaces this cycle's reading.
+                if (float ct, ch; runHeaterMaintenance(ct, ch) == ESP_OK) {
+                    rawTemp = ct;
+                    rawHum  = ch;
+                    calTemp = rawTemp + m_tempOffset;
+                    calHum  = std::clamp(rawHum + m_rhOffset, 0.0f, 100.0f);
                 }
-
-                v.envTemperature = calTemp;
-
-                //! \todo enable back when hardware SHT3X sensor is fixed
-                // v.envHumidity = calHum;
-
-                ESP_LOGI(TAG, "SHT3x raw %.2f C / %.2f %%RH  ->  calibrated %.2f C / %.2f %%RH",
-                         rawTemp, rawHum, calTemp, calHum);
-            } else {
-                ESP_LOGE(TAG, "sensor read error: %d", readError);
+                m_cyclesSinceHeater = 0;
+                m_highRhCycles = 0;
             }
 
-            if (m_readyEvent)
-                m_readyEvent(v);  // pushes the reading into the Matter attributes
+            v.envTemperature = calTemp;
+            v.envHumidity    = calHum;
 
-            // Matter hands the attribute update to the stack synchronously; the ICD /
-            // subscription engine reports it in the background. Brief heartbeat blink
-            // on a fresh reading.
-            if (v.envTemperature.has_value() || v.envHumidity.has_value())
-                blinkUserLED(LED_BLINK_MS);
+            ESP_LOGI(TAG, "SHT3x raw %.2f C / %.2f %%RH  ->  calibrated %.2f C / %.2f %%RH",
+                     rawTemp, rawHum, calTemp, calHum);
+        } else {
+            ESP_LOGE(TAG, "sensor read error: %d", readError);
         }
 
-        ESP_LOGI(TAG, "sensor values ready, go to sleep");
+        if (m_readyEvent) {
+            ESP_LOGI(TAG, "handing reading to Matter (T=%s, RH=%s)",
+                     v.envTemperature.has_value() ? "set" : "none",
+                     v.envHumidity.has_value() ? "set" : "none");
+            m_readyEvent(v);  // pushes the reading into the Matter attributes
+        }
+
+        // Matter takes the attribute update synchronously; the subscription engine reports it
+        // in the background. Brief heartbeat blink on a fresh reading.
+        if (v.envTemperature.has_value() || v.envHumidity.has_value())
+            blinkUserLED(LED_BLINK_MS);
+
+        ESP_LOGI(TAG, "sensor values reported, sleeping for %u ms", SENSORS_PERIOD_MS);
         // Plain delay: with CONFIG_PM_ENABLE + tickless idle the system auto-light-sleeps
-        // when idle, coordinated with the Matter ICD (don't force esp_light_sleep here —
-        // it would freeze the Matter/OpenThread tasks mid-poll).
+        // when idle (don't force esp_light_sleep here — it would freeze the Matter/OpenThread
+        // tasks mid-poll).
         vTaskDelay(pdMS_TO_TICKS(SENSORS_PERIOD_MS));
     }
 }

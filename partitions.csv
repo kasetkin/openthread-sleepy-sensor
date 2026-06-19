@@ -1,0 +1,27 @@
+# Matter / Thread partition table — ESP32-C6, 4 MB flash, dual-slot OTA.
+#
+# Laid out for OTA from the start so enabling OTA later never needs a repartition
+# (a repartition = full erase = the Matter fabric is wiped and the device must be
+# re-commissioned). The OTA *update flow* is future work; the slots exist now.
+#
+# Layout rationale:
+#   - App (ota_0/ota_1) partitions must be 64 KB (0x10000) aligned. The table packs the
+#     data partitions into the first 0x20000 and splits the rest of the 4 MB evenly into
+#     two 0x1F0000 (1.9375 MB) app slots — no gaps, slots end exactly at 0x400000.
+#   - A size-optimized C6 Matter sensor (MINIMAL_BUILD) is ~1.79 MB, so it fits a slot with
+#     ~150 KB headroom (~92% full). If feature growth ever exceeds a slot, switch to delta
+#     OTA (esp_delta_ota is already a dependency) rather than shrinking the second slot.
+#   - nvs   = 48 KB: Matter + Thread operational/config storage.
+#   - fctry = 32 KB: reserved for factory data / Device Attestation Cert (DAC). Unused while
+#             running on esp-matter built-in TEST credentials (fine for Home Assistant);
+#             populated by mfg_tool only if per-device certs are needed later.
+#
+# Partition table offset is 0x8000 (CONFIG_PARTITION_TABLE_OFFSET).
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0xC000,
+otadata,    data, ota,      0x15000,  0x2000,
+phy_init,   data, phy,      0x17000,  0x1000,
+fctry,      data, nvs,      0x18000,  0x8000,
+ota_0,      app,  ota_0,    0x20000,  0x1F0000,
+ota_1,      app,  ota_1,    0x210000, 0x1F0000,

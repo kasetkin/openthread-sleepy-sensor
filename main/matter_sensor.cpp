@@ -3,15 +3,17 @@
 // Measurement (0x0405) for a Thread sleepy device. Built at gnu++17 (esp-matter
 // default) in its own component, isolated from the app's C++26 code.
 //
-// Reuse note: the SHT3x read + calibration + heater logic in sensorstask.cpp is
-// unchanged; the only swap is the per-cycle sink — matter_sensor_update() replaces
-// the old mqtt_send_sensor_data().
+// The SHT3x read + calibration + heater logic lives in sensorstask.cpp; this file is
+// only the per-cycle sink — matter_sensor_update() pushes the calibrated values into the
+// cluster MeasuredValue attributes.
 
 #include "matter_sensor.h"
 
 #include <esp_log.h>
 #include <esp_matter.h>
 #include <esp_matter_endpoint.h>
+
+#include <setup_payload/OnboardingCodesUtil.h>
 
 #include <esp_openthread.h>
 
@@ -50,19 +52,48 @@ static esp_err_t on_identification(identification::callback_type_t type, uint16_
 }
 
 // Matter stack events (commissioning progress, Thread attach, fabric changes, …).
+// Logged verbosely on purpose: this trace is the primary way to follow a BLE→Thread
+// commissioning from an Android phone on the serial console during bring-up.
 static void on_matter_event(const ChipDeviceEvent *event, intptr_t arg)
 {
     switch (event->Type) {
+    case DeviceEventType::kCHIPoBLEConnectionEstablished:
+        ESP_LOGI(TAG, "BLE: commissioner connected (CHIPoBLE)");
+        break;
+    case DeviceEventType::kCHIPoBLEConnectionClosed:
+        ESP_LOGI(TAG, "BLE: commissioner disconnected (CHIPoBLE)");
+        break;
+    case DeviceEventType::kCommissioningSessionStarted:
+        ESP_LOGI(TAG, "Commissioning: PASE session started");
+        break;
+    case DeviceEventType::kCommissioningSessionStopped:
+        ESP_LOGI(TAG, "Commissioning: PASE session stopped");
+        break;
+    case DeviceEventType::kFailSafeTimerExpired:
+        ESP_LOGW(TAG, "Commissioning: fail-safe timer expired (commissioning aborted)");
+        break;
     case DeviceEventType::kCommissioningComplete:
-        ESP_LOGI(TAG, "Matter commissioning complete — running over Thread");
+        ESP_LOGI(TAG, "Commissioning complete — operating over Thread");
         break;
     case DeviceEventType::kThreadConnectivityChange:
-        ESP_LOGI(TAG, "Thread connectivity changed");
+        ESP_LOGI(TAG, "Thread connectivity changed: %s",
+                 ConnectivityMgr().IsThreadAttached() ? "attached" : "detached");
+        break;
+    case DeviceEventType::kThreadStateChange:
+        ESP_LOGI(TAG, "Thread state changed (role=%s)",
+                 ConnectivityMgr().IsThreadAttached() ? "attached" : "detached");
         break;
     case DeviceEventType::kInterfaceIpAddressChanged:
-        ESP_LOGI(TAG, "Interface IP address changed");
+        ESP_LOGI(TAG, "Interface IPv6 address changed (operational discovery should follow)");
+        break;
+    case DeviceEventType::kFabricRemoved:
+        ESP_LOGW(TAG, "Fabric removed (device decommissioned)");
+        break;
+    case DeviceEventType::kFabricCommitted:
+        ESP_LOGI(TAG, "Fabric committed (added to a controller)");
         break;
     default:
+        ESP_LOGD(TAG, "Matter event 0x%04x", static_cast<unsigned>(event->Type));
         break;
     }
 }
@@ -125,20 +156,34 @@ void matter_sensor_init()
     // Starts CHIP: BLE commissioning advert, Thread, ICD server. esp-matter prints
     // the onboarding QR / manual pairing code to the console at startup.
     esp_err_t err = esp_matter::start(on_matter_event);
-    if (err != ESP_OK)
-        ESP_LOGE(TAG, "esp_matter::start failed: %d", err);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_matter::start failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // esp_matter::start() does NOT print the onboarding payload itself — do it explicitly so
+    // the QR string + manual pairing code land on the console for BLE commissioning. kBLE is
+    // the rendezvous transport (the phone reaches the device over BLE, then provisions Thread).
+    ESP_LOGI(TAG, "Matter started — onboarding codes below; waiting for commissioner (BLE)");
+    PrintOnboardingCodes(chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
 }
 
 void matter_sensor_update(std::optional<float> temperature_c, std::optional<float> humidity_pct)
 {
     if (temperature_c.has_value() && s_temp_endpoint_id) {
-        esp_matter_attr_val_t val = esp_matter_nullable_int16(to_centi_i16(*temperature_c));
-        attribute::update(s_temp_endpoint_id, TemperatureMeasurement::Id,
+        const int16_t centi = to_centi_i16(*temperature_c);
+        esp_matter_attr_val_t val = esp_matter_nullable_int16(centi);
+        const esp_err_t err = attribute::update(s_temp_endpoint_id, TemperatureMeasurement::Id,
                           TemperatureMeasurement::Attributes::MeasuredValue::Id, &val);
+        ESP_LOGI(TAG, "ep %u Temperature.MeasuredValue <- %d (%.2f C) [%s]",
+                 s_temp_endpoint_id, centi, *temperature_c, esp_err_to_name(err));
     }
     if (humidity_pct.has_value() && s_humidity_endpoint_id) {
-        esp_matter_attr_val_t val = esp_matter_nullable_uint16(to_centi_u16(*humidity_pct));
-        attribute::update(s_humidity_endpoint_id, RelativeHumidityMeasurement::Id,
+        const uint16_t centi = to_centi_u16(*humidity_pct);
+        esp_matter_attr_val_t val = esp_matter_nullable_uint16(centi);
+        const esp_err_t err = attribute::update(s_humidity_endpoint_id, RelativeHumidityMeasurement::Id,
                           RelativeHumidityMeasurement::Attributes::MeasuredValue::Id, &val);
+        ESP_LOGI(TAG, "ep %u RelativeHumidity.MeasuredValue <- %u (%.2f %%RH) [%s]",
+                 s_humidity_endpoint_id, centi, *humidity_pct, esp_err_to_name(err));
     }
 }

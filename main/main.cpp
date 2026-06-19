@@ -12,7 +12,6 @@
 
 #include "main.h"
 #include "common_utils.h"
-#include "secrets.h"
 #include "calibration.h"
 #include "sensorstask.h"
 #include "errortask.h"
@@ -83,9 +82,8 @@ extern "C" void app_main(void)
     sensorTask->configureCalibration(rh_offset, temp_offset);
 
     // Each cycle's calibrated reading is pushed into the Matter Temperature/Humidity
-    // attributes; the Matter subscription engine + ICD report it to the controller.
-    // No per-cycle connection to open/drain — so no attach gate and no wait-for-idle
-    // (both of which the MQTT design needed).
+    // attributes; the Matter subscription engine reports it to the controller on its own
+    // schedule. The sink just stores the latest value — no connection to open per cycle.
     sensorTask->configureReadyEvent([](const SensorsValues &values) static
     {
         matter_sensor_update(values.envTemperature, values.envHumidity);
@@ -93,8 +91,8 @@ extern "C" void app_main(void)
 
     // ── Matter ────────────────────────────────────────────────────────────────
     // Root node + Temperature (0x0402) + Humidity (0x0405) endpoints, OpenThread
-    // platform config, then start CHIP (BLE commissioning + Thread + ICD). esp-matter
-    // prints the onboarding QR / manual pairing code to the console at startup.
+    // platform config, then start CHIP (BLE commissioning + Thread). esp-matter prints
+    // the onboarding QR / manual pairing code to the console at startup.
     matter_sensor_init();
 
     // sensors_task is the driver of the read→update→sleep cadence.
@@ -107,6 +105,6 @@ extern "C" void app_main(void)
     startErrorTask(ErrorTask::ErrorCode::ecOK);
 
     // app_main returns; the FreeRTOS scheduler keeps sensors_task and the Matter/OT
-    // tasks running. Light sleep is automatic (CONFIG_PM_ENABLE + tickless idle),
-    // coordinated with the Matter ICD — not forced from the sensor task.
+    // tasks running. The device runs as an rx-on Thread MTD for now (a sleepy ICD/LIT
+    // power pass is future work — see README).
 }

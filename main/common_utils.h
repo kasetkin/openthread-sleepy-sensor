@@ -11,14 +11,6 @@ void enableUserLED(const bool enableLED);
 /// brief diagnostic flash: LED on for `onMs`, then off. Negligible power vs a held LED.
 void blinkUserLED(const uint32_t onMs);
 
-/// configure wakeup timer
-[[nodiscard("device won't wake on timer if unchecked")]]
-esp_err_t registerWakeupTimer(const uint64_t wakeupMicrosec);
-esp_err_t registerWakeupTimer(int) = delete;//("duration must be uint32_t microseconds — negative values silently wrap to enormous sleep");
-
-/// sleep for wakeupMicrosec from above + ?10ms? using esp_light_sleep
-void correctLightSleep();
-
 [[nodiscard("NVS unavailable if init failure ignored")]]
 esp_err_t initNvsFlash();
 
