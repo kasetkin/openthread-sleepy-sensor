@@ -13,6 +13,14 @@
 #include <esp_matter.h>
 #include <esp_matter_endpoint.h>
 
+// TemperatureMeasurement is a "code-driven" cluster in this CHIP version: esp-matter registers a
+// TemperatureMeasurementCluster object (its own storage) in the data-model provider's registry, so
+// that object — not esp_matter's attribute store — serves controller reads. esp_matter::attribute::
+// update() therefore reports ESP_OK but never reaches the reported value (verified on-device: read
+// back as null every cycle). We set the value on the registered cluster object instead.
+#include <app/clusters/temperature-measurement-server/TemperatureMeasurementCluster.h>
+#include <data_model_provider/esp_matter_data_model_provider.h>
+
 #include <setup_payload/OnboardingCodesUtil.h>
 
 #include <esp_openthread.h>
@@ -110,7 +118,7 @@ void matter_sensor_init()
     temperature_sensor::config_t temp_config;
     const uint16_t nodesCount = get_count(node);
     ESP_LOGI(TAG, "node count %u", nodesCount);
-    
+
     endpoint_t *temp_ep = temperature_sensor::create(node, &temp_config, ENDPOINT_FLAG_NONE, nullptr);
     if (!temp_ep) {
         ESP_LOGE(TAG, "Failed to create Temperature sensor endpoint");
@@ -172,11 +180,18 @@ void matter_sensor_update(std::optional<float> temperature_c, std::optional<floa
 {
     if (temperature_c.has_value() && s_temp_endpoint_id) {
         const int16_t centi = to_centi_i16(*temperature_c);
-        esp_matter_attr_val_t val = esp_matter_nullable_int16(centi);
-        const esp_err_t err = attribute::update(s_temp_endpoint_id, TemperatureMeasurement::Id,
-                          TemperatureMeasurement::Attributes::MeasuredValue::Id, &val);
-        ESP_LOGI(TAG, "ep %u Temperature.MeasuredValue <- %d (%.2f C) [%s]",
-                 s_temp_endpoint_id, centi, *temperature_c, esp_err_to_name(err));
+        // The setter mutates the registered cluster and notifies the IM — hold the stack lock.
+        esp_matter::lock::ScopedChipStackLock lock(portMAX_DELAY);
+        auto *sc = esp_matter::data_model::provider::get_instance().registry().Get(
+            chip::app::ConcreteClusterPath(s_temp_endpoint_id, TemperatureMeasurement::Id));
+        if (sc) {
+            auto *tmc = static_cast<chip::app::Clusters::TemperatureMeasurementCluster *>(sc);
+            const CHIP_ERROR cerr = tmc->SetMeasuredValue(chip::app::DataModel::Nullable<int16_t>(centi));
+            ESP_LOGI(TAG, "ep %u Temperature.MeasuredValue <- %d (%.2f C) [%s]",
+                     s_temp_endpoint_id, centi, *temperature_c, cerr == CHIP_NO_ERROR ? "ESP_OK" : "err");
+        } else {
+            ESP_LOGE(TAG, "TemperatureMeasurement cluster not registered on ep %u", s_temp_endpoint_id);
+        }
     }
     if (humidity_pct.has_value() && s_humidity_endpoint_id) {
         const uint16_t centi = to_centi_u16(*humidity_pct);
