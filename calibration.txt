@@ -1,2 +1,2 @@
-rh_offset: "-20.1"
+rh_offset: "0.0"
 temp_offset: "0.0"
