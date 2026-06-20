@@ -10,7 +10,8 @@ struct MqttConfig {
     uint16_t         port;       // MQTT port, e.g. 1883
     std::string      username;
     std::string      password;
-    std::string_view device_id;  // compile-time constant, e.g. "esp32c6_sensor_1"
+    std::string      device_id;    // unique id, e.g. "<device_name>_a1b2c3" (name + chip MAC suffix)
+    std::string      device_name;  // human-readable name from secrets.yaml "device_name"
 };
 
 // Call once before the sensor task starts.

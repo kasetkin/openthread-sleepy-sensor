@@ -4,6 +4,7 @@
 #include <charconv>
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 
 #include "main.h"
 #include "common_utils.h"
@@ -198,6 +199,28 @@ void process_state_change(otChangedFlags flags, void* context)
     }
 }
 
+// Build a stable, unique MQTT device id from the human-readable name plus the
+// chip's factory MAC suffix, so two boards sharing a secrets.yaml still differ.
+// The name is sanitised to MQTT/HA-safe characters ([A-Za-z0-9_-]); everything
+// else becomes '_'.
+static std::string make_device_id(std::string_view device_name)
+{
+    std::string id;
+    id.reserve(device_name.size() + 7);
+    for (char c : device_name) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '_';
+        id.push_back(ok ? c : '_');
+    }
+
+    uint8_t mac[6] = {};
+    esp_read_mac(mac, ESP_MAC_BASE);  // factory MAC in efuse — stable per chip
+    char suffix[8];
+    snprintf(suffix, sizeof(suffix), "_%02x%02x%02x", mac[3], mac[4], mac[5]);
+    id += suffix;
+    return id;
+}
+
 extern "C" void app_main(void)
 {
     esp_err_t ret;
@@ -224,7 +247,11 @@ extern "C" void app_main(void)
     ESP_LOGI("main", "secrets.yaml embedded size: %d bytes", static_cast<int>(yaml.size()));
     ESP_LOGI("main", "secrets.yaml first 40 chars: %.40s", yaml.data());
     const std::string ot_tlv    = yaml_get_string(yaml, "ot_tlv");
-    const std::string device_name = yaml_get_string(yaml, "device_name"); 
+    std::string device_name = yaml_get_string(yaml, "device_name");
+    if (device_name.empty()) {
+        device_name = "openthread-sleepy-sensor";
+        ESP_LOGW("main", "secrets.yaml has no 'device_name', falling back to '%s'", device_name.c_str());
+    }
     const std::string mqtt_broker_ipv4   = yaml_get_string(yaml, "mqtt_broker_ipv4");
     const std::string mqtt_port_str = yaml_get_string(yaml, "mqtt_port");
     const std::string mqtt_user = yaml_get_string(yaml, "mqtt_username");
@@ -240,13 +267,15 @@ extern "C" void app_main(void)
         : static_cast<uint16_t>(std::stoul(mqtt_port_str));
 
     // ── initialise MQTT sender ─────────────────────────────────────────────────
-    static constexpr std::string_view DEVICE_ID = "esp32c6_sensor_1";
+    const std::string device_id = make_device_id(device_name);
+    ESP_LOGI("main", "MQTT device_id: %s", device_id.c_str());
     mqtt_sender_init(MqttConfig{
         .ha_ipv4   = mqtt_broker_ipv4,
         .port      = mqtt_port,
         .username  = mqtt_user,
         .password  = mqtt_pass,
-        .device_id = DEVICE_ID,
+        .device_id = device_id,
+        .device_name = device_name,
     });
 
     // ── sensors ───────────────────────────────────────────────────────────────

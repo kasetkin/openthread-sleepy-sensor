@@ -93,7 +93,7 @@ static std::string make_nat64_uri(const std::string &ipv4, uint16_t port)
 
 static std::string discovery_payload(const char *name, const char *device_class,
                                      const char *unit, const char *value_key,
-                                     std::string_view device_id)
+                                     std::string_view device_id, std::string_view device_name)
 {
     char buf[512];
     snprintf(buf, sizeof(buf),
@@ -104,13 +104,14 @@ static std::string discovery_payload(const char *name, const char *device_class,
         "\"value_template\":\"{{value_json.%s}}\","
         "\"unit_of_measurement\":\"%s\","
         "\"unique_id\":\"%.*s_%s\","
-        "\"device\":{\"identifiers\":[\"%.*s\"],\"name\":\"Sleepy Sensor\"}"
+        "\"device\":{\"identifiers\":[\"%.*s\"],\"name\":\"%.*s\"}"
         "}",
         name, device_class,
         static_cast<int>(device_id.size()), device_id.data(), value_key,
         unit,
         static_cast<int>(device_id.size()), device_id.data(), value_key,
-        static_cast<int>(device_id.size()), device_id.data());
+        static_cast<int>(device_id.size()), device_id.data(),
+        static_cast<int>(device_name.size()), device_name.data());
     return buf;
 }
 
@@ -218,6 +219,7 @@ static void mqtt_publish_task(void *arg)
     // ── publish if connected ──────────────────────────────────────────────────
     if (bits & BIT_CONNECTED) {
         const std::string_view dev = s_cfg.device_id;
+        const std::string_view dev_name = s_cfg.device_name;
         const bool need_discovery = !s_discovery_sent.load();
         const int expected = 1 + (need_discovery ? 2 : 0);
 
@@ -229,13 +231,13 @@ static void mqtt_publish_task(void *arg)
         if (need_discovery && (hasTemp || hasHumid)) {
             if (hasTemp) {
                 const std::string t_topic   = "homeassistant/sensor/" + std::string(dev) + "/temperature/config";
-                const std::string t_payload = discovery_payload("Temperature", "temperature", "°C", "t", dev);
+                const std::string t_payload = discovery_payload("Temperature", "temperature", "°C", "t", dev, dev_name);
                 esp_mqtt_client_publish(client, t_topic.c_str(), t_payload.c_str(), 0, 1, 1);
             }
 
             if (hasHumid) {
                 const std::string h_topic   = "homeassistant/sensor/" + std::string(dev) + "/humidity/config";
-                const std::string h_payload = discovery_payload("Humidity", "humidity", "%", "h", dev);
+                const std::string h_payload = discovery_payload("Humidity", "humidity", "%", "h", dev, dev_name);
                 esp_mqtt_client_publish(client, h_topic.c_str(), h_payload.c_str(), 0, 1, 1);
             }
         }
