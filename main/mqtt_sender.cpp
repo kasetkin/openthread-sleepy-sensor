@@ -22,10 +22,19 @@ static constexpr EventBits_t BIT_ERROR     = BIT2;
 // Separate, module-level event group used only to signal "no publish cycle in flight".
 static constexpr EventBits_t BIT_IDLE = BIT0;
 
+// Set once a NAT64 prefix has been learned from Thread network data.  The publish
+// task blocks on this so it never connects with the stale well-known default.
+static constexpr EventBits_t BIT_PREFIX_KNOWN = BIT0;
+
+// How long the publish task waits for the NAT64 prefix before giving up on a cycle.
+// After attach the route can land slightly late; a few seconds covers the gap.
+static constexpr uint32_t PREFIX_WAIT_MS = 5000;
+
 static MqttConfig s_cfg;
 static std::atomic<bool> s_discovery_sent{false};
 static std::atomic<bool> s_task_running{false};
-static EventGroupHandle_t s_idle_eg = nullptr;  // created in mqtt_sender_init(); starts idle
+static EventGroupHandle_t s_idle_eg = nullptr;    // created in mqtt_sender_init(); starts idle
+static EventGroupHandle_t s_prefix_eg = nullptr;  // created in mqtt_sender_init(); starts unknown
 
 // NAT64 /96 prefix used to reach the IPv4 broker.  Default: IANA well-known 64:ff9b::/96.
 // Overridden at runtime via mqtt_sender_set_nat64_prefix() once Thread network data arrives.
@@ -59,6 +68,8 @@ static void set_poll_period(uint32_t ms)
 void mqtt_sender_set_nat64_prefix(const uint8_t *p12)
 {
     memcpy(s_nat64_prefix, p12, 12);
+    if (s_prefix_eg)
+        xEventGroupSetBits(s_prefix_eg, BIT_PREFIX_KNOWN);
 }
 
 static std::string make_nat64_uri(const std::string &ipv4, uint16_t port)
@@ -169,19 +180,36 @@ static void mqtt_publish_task(void *arg)
     MqttCtx ctx;
     ctx.eg = xEventGroupCreate();
 
-    const std::string uri = make_nat64_uri(s_cfg.ha_ipv4, s_cfg.port);
-    if (uri.empty()) {
-        ESP_LOGE(TAG, "ha_ipv4 not set or invalid, cannot connect");
+    // Helper for the early-exit paths: release fast poll, free state, mark idle, end task.
+    auto abort_cycle = [&ctx]() {
         vEventGroupDelete(ctx.eg);
+        set_poll_period(POLL_SLOW_MS);
         s_task_running.store(false);
         if (s_idle_eg)
-        	xEventGroupSetBits(s_idle_eg, BIT_IDLE);
-        	
+            xEventGroupSetBits(s_idle_eg, BIT_IDLE);
         vTaskDelete(nullptr);
+    };
+
+    set_poll_period(POLL_FAST_MS);  // fast polls so the NAT64 prefix (network data) and TCP ACKs arrive promptly
+
+    // Block until the NAT64 prefix is learned from Thread network data.  On the first
+    // cycle after attach the route can land a little late; connecting with the default
+    // well-known prefix would just route nowhere and time out the TLS handshake.
+    if (!s_prefix_eg ||
+        !(xEventGroupWaitBits(s_prefix_eg, BIT_PREFIX_KNOWN, pdFALSE, pdFALSE,
+                              pdMS_TO_TICKS(PREFIX_WAIT_MS)) & BIT_PREFIX_KNOWN)) {
+        ESP_LOGE(TAG, "NAT64 prefix not learned within %lu ms, skipping cycle",
+                 (unsigned long)PREFIX_WAIT_MS);
+        abort_cycle();
         return;
     }
 
-    set_poll_period(POLL_FAST_MS);  // need fast polls so TCP ACKs arrive promptly
+    const std::string uri = make_nat64_uri(s_cfg.ha_ipv4, s_cfg.port);
+    if (uri.empty()) {
+        ESP_LOGE(TAG, "ha_ipv4 not set or invalid, cannot connect");
+        abort_cycle();
+        return;
+    }
 
     esp_mqtt_client_handle_t client = start_client(uri.c_str(), ctx);
     EventBits_t bits = xEventGroupWaitBits(ctx.eg, BIT_CONNECTED | BIT_ERROR,
@@ -254,6 +282,8 @@ void mqtt_sender_init(const MqttConfig &cfg)
         if (s_idle_eg)
         	xEventGroupSetBits(s_idle_eg, BIT_IDLE);  // idle until first publish
     }
+    if (!s_prefix_eg)
+        s_prefix_eg = xEventGroupCreate();  // starts cleared: prefix unknown until learned
 }
 
 void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity)
