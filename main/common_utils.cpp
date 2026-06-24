@@ -107,11 +107,13 @@ void enableUserLED(const bool enableLED)
         ESP_LOGD(LEDTAG, "gpio_set_level OK for GPIO_NUM_15 and level %d", led_flag);
 }
 
-void blinkUserLED(const uint32_t onMs)
+void blinkUserLED(const uint32_t onMs, size_t count)
 {
-    enableUserLED(true);
-    vTaskDelay(pdMS_TO_TICKS(onMs));
-    enableUserLED(false);
+    for (size_t i = 0; i < count; ++i) {
+        enableUserLED(true);
+        vTaskDelay(pdMS_TO_TICKS(onMs));
+        enableUserLED(false);
+    }
 }
 
 esp_err_t initNvsFlash()

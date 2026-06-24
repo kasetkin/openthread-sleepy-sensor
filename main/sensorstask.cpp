@@ -248,7 +248,7 @@ void SensorsTask::executeTask()
         ESP_LOGE(TAG, "can not register wakeup timer: %d — sleep interval undefined", timerRes);
 
     while (true) {
-
+        bool ledShowError = true;
         // Don't read/publish until attached as CHILD. This is a blocking wait (not light sleep) so
         // OpenThread can finish MLE attachment / re-attach after a lost parent; light-sleeping while
         // detached would freeze the radio and stall attachment. If the network is absent the gate
@@ -307,11 +307,18 @@ void SensorsTask::executeTask()
             // a completed publish gets a brief LED heartbeat; a timeout means MQTT stalled, so we
             // skip the blink and sleep anyway rather than stay awake burning battery.
             if (mqtt_is_busy()) {
-                if (mqtt_wait_for_idle(PUBLISH_TIMEOUT_MS))
+                if (mqtt_wait_for_idle(PUBLISH_TIMEOUT_MS)) {
                     blinkUserLED(LED_BLINK_MS);
-                else
+                    ledShowError = false;
+                } else {
                     ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
+                }
             }
+        }
+
+        if (ledShowError) {
+            ESP_LOGW(TAG, "for some reason data was not published");
+            blinkUserLED(LED_BLINK_MS, 5);
         }
 
         ESP_LOGI(TAG, "sensor values ready, go to sleep");
