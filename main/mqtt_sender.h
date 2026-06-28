@@ -34,3 +34,8 @@ bool mqtt_is_busy();
 // Returns true if the sender is idle (cycle completed, or none was running), false on timeout.
 // Call this before light-sleeping so sleep does not suspend the MQTT task/radio mid-publish.
 bool mqtt_wait_for_idle(uint32_t timeout_ms);
+
+// Outcome of the most recently finished publish cycle: true only when the broker connected AND
+// ACKed the state message ("data actually reached HA"), false on any failure (no connect, no ACK,
+// nothing to send, or an aborted cycle). Only meaningful once mqtt_wait_for_idle() reports idle.
+bool mqtt_last_publish_succeeded();

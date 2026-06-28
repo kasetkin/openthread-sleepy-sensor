@@ -8,6 +8,7 @@
 #include <freertos/task.h>
 #include <esp_log.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 #include <esp_timer.h>
 
 #include "common_utils.h"
@@ -79,6 +80,11 @@ void SensorsTask::configureReadyEvent(SensorsReadyEvent readyEvent)
 void SensorsTask::configureAttachGate(AttachGate attachGate)
 {
     m_attachGate = std::move(attachGate);
+}
+
+void SensorsTask::configureRefreshNat64(RefreshNat64 refreshNat64)
+{
+    m_refreshNat64 = std::move(refreshNat64);
 }
 
 void SensorsTask::configureCalibration(float rhOffset, float tempOffset)
@@ -248,7 +254,9 @@ void SensorsTask::executeTask()
         ESP_LOGE(TAG, "can not register wakeup timer: %d — sleep interval undefined", timerRes);
 
     while (true) {
-        bool ledShowError = true;
+        // Whether data actually reached the broker this cycle. Stays false unless a publish was
+        // started AND mqtt_last_publish_succeeded() confirms a connected, ACKed state message.
+        bool publishedOk = false;
         // Don't read/publish until attached as CHILD. This is a blocking wait (not light sleep) so
         // OpenThread can finish MLE attachment / re-attach after a lost parent; light-sleeping while
         // detached would freeze the radio and stall attachment. If the network is absent the gate
@@ -302,23 +310,44 @@ void SensorsTask::executeTask()
             if (m_readyEvent)
                 m_readyEvent(v);  // triggers an async MQTT publish when attached as CHILD
 
-            // Only wait/blink if a publish was actually started (skipped when not yet attached).
-            // Waiting before sleeping stops light sleep from freezing the MQTT task/radio mid-flight:
-            // a completed publish gets a brief LED heartbeat; a timeout means MQTT stalled, so we
-            // skip the blink and sleep anyway rather than stay awake burning battery.
+            // Only wait if a publish was actually started (skipped when not yet attached). Waiting
+            // before sleeping stops light sleep from freezing the MQTT task/radio mid-flight.
+            // mqtt_wait_for_idle() only reports the task ended, not that it succeeded — that ending
+            // is identical for a failed connect — so the real outcome comes from
+            // mqtt_last_publish_succeeded(). A timeout means MQTT stalled; sleep anyway rather than
+            // stay awake burning battery.
             if (mqtt_is_busy()) {
                 if (mqtt_wait_for_idle(PUBLISH_TIMEOUT_MS)) {
-                    blinkUserLED(LED_BLINK_MS);
-                    ledShowError = false;
+                    publishedOk = mqtt_last_publish_succeeded();
                 } else {
                     ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
                 }
             }
         }
 
-        if (ledShowError) {
-            ESP_LOGW(TAG, "for some reason data was not published");
+        // Honest local indicator: 1 blink = data reached the broker, 5 blinks = it did not.
+        if (publishedOk) {
+            blinkUserLED(LED_BLINK_MS);
+        } else {
+            ESP_LOGW(TAG, "data was not published to the broker this cycle");
             blinkUserLED(LED_BLINK_MS, 5);
+        }
+
+        // Recovery supervisor: count consecutive failed cycles and reboot once they pass the
+        // threshold. There is no other path back from a persistent reachability loss — a reboot
+        // re-attaches to Thread and re-learns the NAT64 route. Before that, give a softer nudge:
+        // re-read network data so a merely-stale NAT64 prefix is fixed without a reboot.
+        if (publishedOk) {
+            m_consecutiveFailures = 0;
+        } else {
+            if (m_refreshNat64)
+                m_refreshNat64();
+                
+            if (++m_consecutiveFailures >= REBOOT_AFTER_FAILS) {
+                ESP_LOGE(TAG, "%lu consecutive cycles without a successful publish — rebooting to recover",
+                         static_cast<unsigned long>(m_consecutiveFailures));
+                esp_restart();
+            }
         }
 
         ESP_LOGI(TAG, "sensor values ready, go to sleep");

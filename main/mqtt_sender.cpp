@@ -33,6 +33,7 @@ static constexpr uint32_t PREFIX_WAIT_MS = 5000;
 static MqttConfig s_cfg;
 static std::atomic<bool> s_discovery_sent{false};
 static std::atomic<bool> s_task_running{false};
+static std::atomic<bool> s_last_ok{false};        // true iff the most recent finished cycle connected AND was ACKed
 static EventGroupHandle_t s_idle_eg = nullptr;    // created in mqtt_sender_init(); starts idle
 static EventGroupHandle_t s_prefix_eg = nullptr;  // created in mqtt_sender_init(); starts unknown
 
@@ -181,8 +182,10 @@ static void mqtt_publish_task(void *arg)
     MqttCtx ctx;
     ctx.eg = xEventGroupCreate();
 
-    // Helper for the early-exit paths: release fast poll, free state, mark idle, end task.
+    // Helper for the early-exit paths: mark this cycle failed, release fast poll, free state,
+    // mark idle, end task.  s_last_ok must be stored before BIT_IDLE so the waiter sees it.
     auto abort_cycle = [&ctx]() {
+        s_last_ok.store(false);
         vEventGroupDelete(ctx.eg);
         set_poll_period(POLL_SLOW_MS);
         s_task_running.store(false);
@@ -217,18 +220,29 @@ static void mqtt_publish_task(void *arg)
                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
 
     // ── publish if connected ──────────────────────────────────────────────────
+    // ok stays false unless we connect, publish a state message, AND the broker ACKs it.
+    // This is the signal the sensor task uses for the LED and the reboot supervisor, so it
+    // must mean "data actually reached the broker", not merely "the task ran".
+    bool ok = false;
     if (bits & BIT_CONNECTED) {
         const std::string_view dev = s_cfg.device_id;
         const std::string_view dev_name = s_cfg.device_name;
-        const bool need_discovery = !s_discovery_sent.load();
-        const int expected = 1 + (need_discovery ? 2 : 0);
+        const bool hasAny = hasTemp || hasHumid;
+        const bool need_discovery = !s_discovery_sent.load() && hasAny;
+
+        // Expected ACKs must match what we actually publish below: one state message plus one
+        // discovery message per present value.  A fixed "+2" assumes both T and H discovery are
+        // sent; with humidity disabled only T is sent, so BIT_ALL_ACKED would never set and the
+        // first cycle would be wrongly counted as a failure.
+        const int discovery_msgs = need_discovery ? ((hasTemp ? 1 : 0) + (hasHumid ? 1 : 0)) : 0;
+        const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
         // Set counters BEFORE publishing so the handler never races ahead
         ctx.expected_acks.store(expected);
         ctx.received_acks.store(0);
         xEventGroupClearBits(ctx.eg, BIT_ALL_ACKED);
 
-        if (need_discovery && (hasTemp || hasHumid)) {
+        if (need_discovery) {
             if (hasTemp) {
                 const std::string t_topic   = "homeassistant/sensor/" + std::string(dev) + "/temperature/config";
                 const std::string t_payload = discovery_payload("Temperature", "temperature", "°C", "t", dev, dev_name);
@@ -242,26 +256,32 @@ static void mqtt_publish_task(void *arg)
             }
         }
 
-        char state[64];
-        //! \todo use std::format and std::to_chars instead of snprintf
-        if (hasTemp && hasHumid)
-            snprintf(state, sizeof(state), "{\"t\":%.3g,\"h\":%.3g}", temp, hum);
-        else if (hasTemp)
-            snprintf(state, sizeof(state), "{\"t\":%.3g}", temp);
-        else if (hasHumid)
-            snprintf(state, sizeof(state), "{\"h\":%.3g}", hum);
+        if (hasAny) {
+            char state[64];
+            //! \todo use std::format and std::to_chars instead of snprintf
+            if (hasTemp && hasHumid)
+                snprintf(state, sizeof(state), "{\"t\":%.3g,\"h\":%.3g}", temp, hum);
+            else if (hasTemp)
+                snprintf(state, sizeof(state), "{\"t\":%.3g}", temp);
+            else  // hasHumid
+                snprintf(state, sizeof(state), "{\"h\":%.3g}", hum);
 
-        const std::string state_topic = std::string(dev) + "/state";
-        esp_mqtt_client_publish(client, state_topic.c_str(), state, 0, 1, 0);
-        ESP_LOGI(TAG, "sent %s", state);
+            const std::string state_topic = std::string(dev) + "/state";
+            esp_mqtt_client_publish(client, state_topic.c_str(), state, 0, 1, 0);
+            ESP_LOGI(TAG, "sent %s", state);
 
-        // QoS-1 acks over a healthy Thread link return well under a second; cap short
-        // so we stop fast-polling (and sleep) promptly instead of idling the radio.
-        xEventGroupWaitBits(ctx.eg, BIT_ALL_ACKED, pdFALSE, pdTRUE, pdMS_TO_TICKS(4000));
-        s_discovery_sent.store(true);
+            // QoS-1 acks over a healthy Thread link return well under a second; cap short
+            // so we stop fast-polling (and sleep) promptly instead of idling the radio.
+            ok = (xEventGroupWaitBits(ctx.eg, BIT_ALL_ACKED, pdFALSE, pdTRUE,
+                                      pdMS_TO_TICKS(4000)) & BIT_ALL_ACKED) != 0;
+            s_discovery_sent.store(true);
+        } else {
+            ESP_LOGW(TAG, "no sensor values to publish this cycle");
+        }
     } else {
         ESP_LOGE(TAG, "MQTT connection failed, skipping cycle");
     }
+    s_last_ok.store(ok);  // published before BIT_IDLE is set in the cleanup below
 
     // ── clean up — safe here because we are NOT in the MQTT event handler ─────
     esp_mqtt_client_stop(client);
@@ -311,6 +331,11 @@ void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float
 bool mqtt_is_busy()
 {
     return s_task_running.load();
+}
+
+bool mqtt_last_publish_succeeded()
+{
+    return s_last_ok.load();
 }
 
 bool mqtt_wait_for_idle(uint32_t timeout_ms)

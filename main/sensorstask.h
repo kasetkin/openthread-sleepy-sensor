@@ -49,6 +49,11 @@ public:
     using AttachGate = std::function<bool(uint32_t timeoutMs)>;
     void configureAttachGate(AttachGate attachGate);
 
+    /// Re-reads Thread network data so a changed NAT64 prefix is picked up without a reboot.
+    /// Injected by main (it owns the OpenThread instance); called after a failed publish cycle.
+    using RefreshNat64 = std::function<void()>;
+    void configureRefreshNat64(RefreshNat64 refreshNat64);
+
     /// Per-device calibration offsets added to each raw reading before publishing.
     /// Sourced from calibration.txt and injected by main (default 0 = no correction).
     void configureCalibration(float rhOffset, float tempOffset);
@@ -59,6 +64,11 @@ private:
 
     /// per-cycle awake budget to (re)attach before sleeping anyway; > typical attach time and SENSORS_PERIOD_MS
     static constexpr uint32_t ATTACH_TIMEOUT_MS = 30 * 1000;
+
+    /// Recovery: reboot after this many consecutive cycles without a successful publish. A transient
+    /// reachability loss (stale NAT64 prefix, broker blip) otherwise persists forever; rebooting
+    /// re-attaches and re-learns the NAT64 route. ~5 cycles ≈ 5 min of no data before recovering.
+    static constexpr uint32_t REBOOT_AFTER_FAILS = 5;
 
     /// --- heater maintenance / plausibility self-test (see Sensirion docs in docs/) ---
     /// periodic cadence (~24 h at SENSORS_PERIOD_MS): routine plausibility check + creep mitigation
@@ -85,7 +95,11 @@ private:
     bool m_i2cInitialized = false;
     SensorsReadyEvent m_readyEvent;
     AttachGate m_attachGate;
+    RefreshNat64 m_refreshNat64;
     sht3x_t m_sht3dev;
+
+    /// consecutive cycles with no successful publish; drives the reboot supervisor (see REBOOT_AFTER_FAILS)
+    uint32_t m_consecutiveFailures = 0;
 
     /// maintenance scheduling counters (persist across light sleep — RAM is retained)
     uint32_t m_cyclesSinceHeater = 0;

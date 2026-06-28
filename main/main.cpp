@@ -166,6 +166,28 @@ static void log_thread_network_info()
     if (!any) ESP_LOGW(TAG, "  (none — NAT64 route not yet in network data)");
 }
 
+// Re-scan current Thread network data for a NAT64 /96 route and update the sender's prefix.
+// Called from the sensor task (which holds no OpenThread lock) after a failed publish, so it
+// acquires the lock itself — unlike log_thread_network_info(), which runs inside the already-locked
+// state-changed callback. Lets a merely-stale NAT64 prefix recover without waiting for a reboot.
+static void refresh_nat64_prefix()
+{
+    otInstance *ot = esp_openthread_get_instance();
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otNetworkDataIterator it = OT_NETWORK_DATA_ITERATOR_INIT;
+    otExternalRouteConfig route;
+    bool found = false;
+    while (otNetDataGetNextRoute(ot, &it, &route) == OT_ERROR_NONE) {
+        if (route.mNat64 && route.mPrefix.mLength == 96) {
+            mqtt_sender_set_nat64_prefix(route.mPrefix.mPrefix.mFields.m8);
+            found = true;
+        }
+    }
+    esp_openthread_lock_release();
+    if (!found)
+        ESP_LOGW(TAG, "refresh_nat64_prefix: no NAT64 route in current network data");
+}
+
 void process_state_change(otChangedFlags flags, void* context)
 {
     otDeviceRole role = otThreadGetDeviceRole(esp_openthread_get_instance());
@@ -310,6 +332,13 @@ extern "C" void app_main(void)
     sensorTask->configureAttachGate([](uint32_t ms) static
     {
     	return wait_for_ot_attached(ms);
+    });
+
+    // On a failed publish the sensor task asks us to re-read network data, so a changed NAT64
+    // prefix is picked up without needing the reboot supervisor to kick in.
+    sensorTask->configureRefreshNat64([]() static
+    {
+        refresh_nat64_prefix();
     });
 
     // ── OpenThread ────────────────────────────────────────────────────────────
