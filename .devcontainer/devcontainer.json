@@ -1,5 +1,5 @@
 {
-  "name": "ESP32 Sensor SD Logger",
+  "name": "ESP32 Sensor OpenThread MQTT",
   "image": "espressif/idf:v6.0.1",
   "runArgs": [
     "--device=/dev/ttyACM0",
