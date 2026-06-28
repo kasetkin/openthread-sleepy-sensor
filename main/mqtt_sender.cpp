@@ -1,8 +1,9 @@
 #include "mqtt_sender.h"
+#include "common_utils.h"
 
+#include <algorithm>
 #include <atomic>
-#include <cstdio>
-#include <cstring>
+#include <format>
 #include <string>
 
 #include "esp_log.h"
@@ -11,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "mqtt_client.h"
+#include "openthread/ip6.h"
 #include "openthread/link.h"
 
 static const char *TAG = "mqtt-sender";
@@ -68,52 +70,56 @@ static void set_poll_period(uint32_t ms)
 
 void mqtt_sender_set_nat64_prefix(const uint8_t *p12)
 {
-    memcpy(s_nat64_prefix, p12, 12);
+    std::copy_n(p12, 12, s_nat64_prefix);
     if (s_prefix_eg)
         xEventGroupSetBits(s_prefix_eg, BIT_PREFIX_KNOWN);
 }
 
-static std::string make_nat64_uri(const std::string &ipv4, uint16_t port)
+static std::string make_nat64_uri(std::string_view ipv4, uint16_t port)
 {
-    unsigned a, b, c, d;
-    if (sscanf(ipv4.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
-        ESP_LOGE(TAG, "bad IPv4 '%s'", ipv4.c_str());
+    const auto octets = parseIpv4(ipv4);
+    if (!octets) {
+        ESP_LOGE(TAG, "bad IPv4 '%.*s'", static_cast<int>(ipv4.size()), ipv4.data());
         return {};
     }
-    const uint8_t *p = s_nat64_prefix;
-    char uri[80];
-    // Build full 128-bit IPv6 from 96-bit NAT64 prefix + 32-bit IPv4
-    snprintf(uri, sizeof(uri),
-             "mqtt://[%x:%x:%x:%x:%x:%x:%02x%02x:%02x%02x]:%u",
-             (unsigned)((p[0]<<8)|p[1]),  (unsigned)((p[2]<<8)|p[3]),
-             (unsigned)((p[4]<<8)|p[5]),  (unsigned)((p[6]<<8)|p[7]),
-             (unsigned)((p[8]<<8)|p[9]),  (unsigned)((p[10]<<8)|p[11]),
-             a, b, c, d, port);
-    return uri;
+
+    // Build full 128-bit IPv6 from 96-bit NAT64 prefix + 32-bit IPv4, then let OpenThread
+    // format it (canonical, ::-compressed) instead of hand-pairing bytes into hextets.
+    otIp6Address addr = {};
+    std::copy_n(s_nat64_prefix, 12, addr.mFields.m8);   // 96-bit NAT64 prefix
+    std::ranges::copy(*octets, addr.mFields.m8 + 12);   // 32-bit IPv4 -> low bytes
+
+    char host[OT_IP6_ADDRESS_STRING_SIZE];
+    otIp6AddressToString(&addr, host, sizeof(host));
+    return std::format("mqtt://[{}]:{}", host, port);
 }
+
+// HA MQTT-discovery config payload. Shown un-escaped for readability; in the format
+// string every literal { } is doubled, and Jinja "{{ value_json.X }}" -> "{{{{value_json.{}}}}}".
+//   {"name":"<>","device_class":"<>","state_topic":"<id>/state",
+//    "value_template":"{{value_json.<key>}}","unit_of_measurement":"<>",
+//    "unique_id":"<id>_<key>","device":{"identifiers":["<id>"],"name":"<name>"}}
+static constexpr std::string_view DISCOVERY_FMT =
+    "{{"
+    "\"name\":\"{}\","
+    "\"device_class\":\"{}\","
+    "\"state_topic\":\"{}/state\","
+    "\"value_template\":\"{{{{value_json.{}}}}}\","
+    "\"unit_of_measurement\":\"{}\","
+    "\"unique_id\":\"{}_{}\","
+    "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\"}}"
+    "}}";
 
 static std::string discovery_payload(const char *name, const char *device_class,
                                      const char *unit, const char *value_key,
                                      std::string_view device_id, std::string_view device_name)
 {
-    char buf[512];
-    snprintf(buf, sizeof(buf),
-        "{"
-        "\"name\":\"%s\","
-        "\"device_class\":\"%s\","
-        "\"state_topic\":\"%.*s/state\","
-        "\"value_template\":\"{{value_json.%s}}\","
-        "\"unit_of_measurement\":\"%s\","
-        "\"unique_id\":\"%.*s_%s\","
-        "\"device\":{\"identifiers\":[\"%.*s\"],\"name\":\"%.*s\"}"
-        "}",
+    return std::format(DISCOVERY_FMT,
         name, device_class,
-        static_cast<int>(device_id.size()), device_id.data(), value_key,
+        device_id, value_key,
         unit,
-        static_cast<int>(device_id.size()), device_id.data(), value_key,
-        static_cast<int>(device_id.size()), device_id.data(),
-        static_cast<int>(device_name.size()), device_name.data());
-    return buf;
+        device_id, value_key,
+        device_id, device_name);
 }
 
 // ── event handler — ONLY sets event group bits, never touches the client ──────
@@ -257,18 +263,17 @@ static void mqtt_publish_task(void *arg)
         }
 
         if (hasAny) {
-            char state[64];
-            //! \todo use std::format and std::to_chars instead of snprintf
+            std::string state;
             if (hasTemp && hasHumid)
-                snprintf(state, sizeof(state), "{\"t\":%.3g,\"h\":%.3g}", temp, hum);
+                state = std::format("{{\"t\":{:.3g},\"h\":{:.3g}}}", temp, hum);
             else if (hasTemp)
-                snprintf(state, sizeof(state), "{\"t\":%.3g}", temp);
+                state = std::format("{{\"t\":{:.3g}}}", temp);
             else  // hasHumid
-                snprintf(state, sizeof(state), "{\"h\":%.3g}", hum);
+                state = std::format("{{\"h\":{:.3g}}}", hum);
 
             const std::string state_topic = std::string(dev) + "/state";
-            esp_mqtt_client_publish(client, state_topic.c_str(), state, 0, 1, 0);
-            ESP_LOGI(TAG, "sent %s", state);
+            esp_mqtt_client_publish(client, state_topic.c_str(), state.c_str(), 0, 1, 0);
+            ESP_LOGI(TAG, "sent %s", state.c_str());
 
             // QoS-1 acks over a healthy Thread link return well under a second; cap short
             // so we stop fast-polling (and sleep) promptly instead of idling the radio.
