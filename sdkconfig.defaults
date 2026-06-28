@@ -62,3 +62,15 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 #
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # end of Compiler
+
+#
+# Flash & Partition Table
+# C6FH4 has 4 MB flash; the default 1 MB single-app partition can't hold the
+# std::format-using firmware (~1.33 MB), so use a 2 MB factory app (partitions.csv).
+#
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+# end of Flash & Partition Table

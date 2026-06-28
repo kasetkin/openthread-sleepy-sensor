@@ -1,0 +1,7 @@
+# Custom partition table: ESP32-C6FH4 has 4 MB flash, so give the app a 2 MB
+# factory partition (the default single-app layout caps it at 1 MB, which the
+# std::format-using firmware overflows). nvs/phy_init keep the IDF default offsets.
+# Name,     Type, SubType, Offset,   Size, Flags
+nvs,        data, nvs,     0x9000,   24K,
+phy_init,   data, phy,     0xf000,   4K,
+factory,    app,  factory, 0x10000,  2M,
