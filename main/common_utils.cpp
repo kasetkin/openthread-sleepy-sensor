@@ -1,6 +1,7 @@
 #include "common_utils.h"
 
 #include <chrono>
+#include <ranges>
 #include <string_view>
 #include <esp_log.h>
 #include <esp_sleep.h>
@@ -155,4 +156,20 @@ uint64_t getValidTime()
     const auto durationSec = std::chrono::duration_cast<std::chrono::seconds>(nowAsDuration);
     const uint64_t rtc_sec = static_cast<uint64_t>(durationSec.count());
     return rtc_sec;
+}
+
+std::optional<std::array<uint8_t, 4>> parseIpv4(std::string_view s)
+{
+    std::array<uint8_t, 4> octets{};
+    std::size_t n = 0;
+    for (const auto field : s | std::views::split('.')) {       // for each '.'-separated field
+        const std::string_view tok{field.begin(), field.end()};
+        unsigned value;
+        const auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), value);
+        if (n >= octets.size() || ec != std::errc{} ||
+            ptr != tok.data() + tok.size() || value > 255)      // non-numeric / trailing / >255
+            return std::nullopt;
+        octets[n++] = static_cast<uint8_t>(value);
+    }
+    return n == 4 ? std::optional{octets} : std::nullopt;       // reject wrong field count
 }

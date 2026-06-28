@@ -30,6 +30,12 @@ uint64_t getValidTime();
 #include <charconv>
 #include <optional>
 #include <type_traits>
+#include <array>
+#include <string_view>
+#include <cstdint>
+
+// Parse a dotted-quad IPv4 ("a.b.c.d") into 4 octets; nullopt on any malformation.
+std::optional<std::array<uint8_t, 4>> parseIpv4(std::string_view s);
 
 // Append any integer or float/double to `out` via to_chars — zero heap allocation.
 // Buffer sizing (shortest round-trip, base 10):
