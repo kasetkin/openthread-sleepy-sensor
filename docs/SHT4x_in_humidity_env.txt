@@ -1,0 +1,408 @@
+Application Note
+
+Using the Integrated Heater of SHT4x in High-Humidity
+Environments
+
+Abstract
+Polymer-based capacitive humidity sensors are best suited for operation at intermediate humidity levels. When
+exposed to high humidity environments (~>90%RH) for extended exposure times they develop a reversible,
+positive humidity offset. In the following, this offset is called Creep. It occurs when water molecules continuously
+soak the polymer without escaping from it. Original accuracy specifications are restored by itself through
+exposing the sensor to regular humidity and temperature conditions again. This process takes longer the more
+water is impregnated into the polymer. This document outlines how SHT4x’s integrated on-chip heater can be
+used to mitigate creep and take highly accurate measurements. Two different approaches to creep-free
+operation are discussed: Continuous and single-shot measurement. In both cases, the thermal energy provided
+by the integrated heater removes excess water from the sensing polymer. In the continuous case the heater is
+activated periodically while for the single-shot, it is turned on only in case a measurement is due. Finally, best
+practices for this application are summarized.
+
+Contents
+1
+2
+3
+4
+5
+6
+7
+8
+
+Introduction – Creep Definition................................................................................................................. 2
+Creep Mitigation ......................................................................................................................................... 2
+Continuous Creep Mitigation .................................................................................................................... 3
+Single-Shot Creep Mitigation .................................................................................................................... 4
+Creep Mitigation in Analog Sensors ......................................................................................................... 4
+Further Information .................................................................................................................................... 4
+Revision History ......................................................................................................................................... 4
+Bibliography ............................................................................................................................................... 5
+
+www.sensirion.com
+
+Version 1 - April 2022
+
+1/6
+
+1 Creep Definition
+Polymer-based capacitive humidity sensors show best performances when operating within their recommended
+temperature and humidity range, i.e., 5 °C – 60 °C and 20 %RH – 80 %RH [1]. Long-term sensor exposure outside of
+these conditions, especially at relative humidity (RH) levels larger than 90%RH, may induce a reversible, positive RH
+offset. This effect will be called Creep in the following. Nevertheless, after returning into recommended operating
+conditions, the sensor gradually converges back to within accuracy specification by itself.
+Sensirion defines the creep of a humidity sensor by its RH offset accumulated during exposure to 90%RH for 61 hours.
+The typical RH transient drift acquired over that period for different humidity sensors is illustrated in Figure 1. To get a
+reproduceable quantification of a sensor’s creep, the first 30 min and the last 60 min of the RH transient are averaged,
+respectively. The difference of these two average values is attributed to creep.
+
+SHT4x
+
+omp.
+
+omp.
+
+omp.
+
+6
+
+4
+
+3
+
+0
+0
+
+0
+
+0
+
+30
+
+40
+
+0
+
+60
+
+Figure 1 Creep comparison of multiple commercially available capacitive humidity sensors. All sensors are kept at 90 %RH over
+the whole measurement duration, and only the build-up of the creep offset is plotted here.
+
+2 Creep Mitigation
+2.1 Scope and Applications
+This application note describes how creep can be efficiently mitigated when using Sensirion’s SHT4x. It is achieved by
+heating the sensor using its integrated heater. Here, two different application scenarios are distinguished:
+I) Continuous creep mitigation. The sensor is continuously exposed to a high relative humidity environment. Periodic
+heating of the sensor for a short period of time can reduce or even entirely mitigate creep.
+II) Single-Shot creep mitigation. The sensor is exposed to an undefined environment, which might include a high
+relative humidity environment. Right before the measurement is taken, the heater is activated for a short period to
+reduce the effect of a potential creep offset.
+Note:
+The usage of the heater enables reliable operation even in extreme environment. Moreover, no previous
+humidity information (“history”) is needed when applying creep mitigation measures, making the SHT4x very
+versatile for many applications. However, it is worth to remind that the overall sensor’s power consumption
+increases during the activation of the heater and that the sampling rate must be reduced.
+
+2.2 Test Setup and Heater Commands
+For evaluation two lots of SHT4x sensors were soldered on 1.5 mm thick printed circuit board (PCB). The PCB consists
+of FR-4 and the die pad of the sensors was not soldered to increase the peak temperature after the heat pulse. In the
+SHT4x family, a set of discrete heat powers and times is available to the user, see Table 1. The assembled PCBs were
+kept in a controlled humidity environment for upcoming experiments. At a base temperature of 25°C the activation of
+
+www.sensirion.com
+
+Version 1 - April 2022
+
+2/6
+
+the heater at a given power and for a given time results in an average temperature increase also summarized in Table
+1.
+Command (hex)
+
+0x15
+
+0x1E
+
+0x24
+
+0x2F
+
+0x32
+
+0x39
+
+Heating Power (mW)
+
+20
+
+20
+
+110
+
+110
+
+200
+
+200
+
+Heating Duration (s)
+
+0.1
+
+1.0
+
+0.1
+
+1.0
+
+0.1
+
+1.0
+
+verage ΔT (°C]
+
+3
+
+6
+
+16
+
+31
+
+29
+
+50
+
+Table 1 SHT4x heater commands with related heating power, duration, and resulting temperature increase.
+
+Attention:
+
+The average temperature increase strongly depends on the heating commands, the thermal coupling to
+the sensor environment (thermal capacity, thermal conductivity) and on external parameters such as e.g.,
+free and forced convection. The parameters listed in this Application Note were identified exemplarily for
+the described experimental setup. They shall serve as starting point for further device-specific engineering.
+
+3 Continuous Creep Mitigation
+If the sensor is permanently operated in high humidity environments, a periodic heater activation will mitigate the creep
+offset. To properly readout the correct value, the following scheme applies to each cycle execution: heating pulse,
+waiting time until thermal equilibrium is reached again (called equilibration time), read-out of creep-free RH signal. In
+this case, the highest measurement frequency is limited by the equilibration time for the sensor to reach ambient
+temperature again. It can be estimated by monitoring the temperature signal and comparing it to the temperature just
+before heating. Since the response time of the humidity sensor is temperature dependent, it is important to keep in
+mind that the results presented here were performed at 25 °C ambient temperature. In fact, the equilibration time would
+probably increase at temperatures below 25 °C because of the slower diffusion process of water molecules into the
+sensing polymer.
+The creep reduction was evaluated exposing the sensors to 90 %RH over an extended period. With a periodic heating
+pulse of 200 mW for 1 second every minute and an equilibration time of 1min, Figure 2 shows that the creep offset can
+be almost completely compensated for.
+In principle, since the creep mitigation works independently of “creep severity”, it should always be possible to do this
+once the best parameters are found since they only depend on humidity and environment conditions.
+
+Reference
+
+SHT4x ot Heated
+
+SHT4x Heated
+
+3
+
+0
+
+0
+
+0
+
+30
+
+40
+
+0
+
+60
+
+Figure 2 Continuous creep mitigation results. Both sensors were allowed to creep at 90 %RH, with one of the two turned
+into a periodic heating scheme after t = 20h. The heated sensor shows a reading within typical specifications while the not
+heated sensor develops further creep offset. Creep mitigation was achieved with following, continuous heating cycle: A
+200mW-1s-heating-pulse every minute.
+
+www.sensirion.com
+
+Version 1 - April 2022
+
+3/6
+
+4 Single-Shot Creep Mitigation
+In case the humidity history of the sensor is not known several consecutive heating pulses are used to increase thermal
+activation of the water-soaked polymer. The heating phase is then followed by an equilibration time in which the
+temperature reaches ambient again. Once the sensor is cooled down, the creep mitigated RH value is ready to be
+read. For example, the results reported in Figure 3 were performed after an unknown sensor exposure to 90 %RH at
+25 °C, causing the sensor to leave its typical specifications. In this case a heating period of 2 minutes using 200 mW
+pulses every two seconds was used. During the heating time, the RH signal is corrupted by the additional heat in the
+sensor. After a waiting time of two minutes, the sensor reports temperatures just as before the heating and is therefore
+equilibrated again. Now, the RH sensor can be operated within its typical specifications until the creep built-up gets
+significant again.
+
+Reference
+4
+
+SHT 4x
+
+heating cooling
+
+reading
+
+0
+
+6
+60
+40
+0
+0
+
+0
+
+6
+
+4
+
+0
+
+4
+
+6
+
+0
+
+Figure 3 Single-shot creep mitigation of a pre-creeped sensor. At t = 0min a heating phase is started for two minutes. After
+a certain waiting time, “cooling”, the sensor is in thermal equilibrium again. Then, RH readings within typical accuracy
+specifications can be taken.
+
+In this scenario it is important to thoroughly evaluate the equilibration time that is necessary for a correct measurement.
+Quite generally, heating times of a few minutes have been prooved sufficient, however need application specific
+engineering.
+
+5 Creep Mitigation in Analog Sensors
+For all digital versions of the SHT4x family, controlling the heater is achieved through its I2C commands listed in Table
+1. In the analog version of the SHT4x family, the heater cannot be switched on by sending an input from the master.
+However, an on-chip anti-creep option for pre-selection will be available, see (SHT4xI-Analog datasheet). Once
+powered up, the sensor will periodically heat according to the selected option enabling creep-free measurement also
+for analog sensors.
+
+6 Further Information
+For further reading on the SHT4x specifications, communication, and heater details, please consult the SHT4x
+datasheet provided on the Sensirion download center: https://sensirion.com/products/downloads/
+
+7 Revision History
+Date
+April 2022
+
+www.sensirion.com
+
+Version
+1
+
+Page(s)
+all
+
+Changes
+Initial release
+
+Version 1 - April 2022
+
+4/6
+
+8 Bibliography
+[1] Sensirion, "SHT4x Datasheet," 2020. [Online]. Available: Datasheet SHT4x (sensirion.com).
+
+www.sensirion.com
+
+Version 1 - April 2022
+
+5/6
+
+Important Notices
+Warning, Personal Injury
+Do not use this product as safety or emergency stop devices or in any other application where failure of the product could result
+in personal injury. Do not use this product for applications other than its intended and authorized use. Before installing, handling,
+using or servicing this product, please consult the data sheet and application notes. Failure to comply with these instructions
+could result in death or serious injury.
+If the Buyer shall purchase or use SENSIRION products for any unintended or unauthorized application, Buyer shall defend, indemnify and
+hold harmless SENSIRION and its officers, employees, subsidiaries, affiliates and distributors against all claims, costs, damages and
+expenses, and reasonable attorney fees arising out of, directly or indirectly, any claim of personal injury or death associated with such
+unintended or unauthorized use, even if SENSIRION shall be allegedly negligent with respect to the design or the manufacture of the product.
+ESD Precautions
+The inherent design of this component causes it to be sensitive to electrostatic discharge (ESD). To prevent ESD-induced damage and/or
+degradation, take customary and statutory ESD precautions when handling this product. See application note “ESD, Latchup and EM ” for
+more information.
+Warranty
+SENSIRION warrants solely to the original purchaser of this product for a period of 12 months (one year) from the date of delivery that this
+product shall be of the quality, material and workmanship defined in SE SIRIO ’s published specifications of the product. Within such
+period, if proven to be defective, SENSIRION shall repair and/or replace this product, in SENSIRION’s discretion, free of charge to the uyer,
+provided that:
+•
+notice in writing describing the defects shall be given to SENSIRION within fourteen (14) days after their appearance;
+•
+such defects shall be found, to SE SIRIO ’s reasonable satisfaction, to have arisen from SE SIRIO ’s faulty design, material, or
+workmanship;
+•
+the defective product shall be returned to SE SIRIO ’s factory at the uyer’s expense; and
+•
+the warranty period for any repaired or replaced product shall be limited to the unexpired portion of the original period.
+This warranty does not apply to any equipment which has not been installed and used within the specifications recommended by SENSIRION
+for the intended and proper use of the equipment. EXCEPT FOR THE WARRANTIES EXPRESSLY SET FORTH HEREIN, SENSIRION
+MAKES NO WARRANTIES, EITHER EXPRESS OR IMPLIED, WITH RESPECT TO THE PRODUCT. ANY AND ALL WARRANTIES,
+INCLUDING WITHOUT LIMITATION, WARRANTIES OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE, ARE
+EXPRESSLY EXCLUDED AND DECLINED.
+SENSIRION is only liable for defects of this product arising under the conditions of operation provided for in the data sheet and proper use
+of the goods. SENSIRION explicitly disclaims all warranties, express or implied, for any period during which the goods are operated or stored
+not in accordance with the technical specifications.
+SENSIRION does not assume any liability arising out of any application or use of any product or circuit and specifically disclaims any and all
+liability, including without limitation consequential or incidental damages. All operating parameters, including without limitation recommended
+parameters, must be validated for each customer’s applications by customer’s technical experts. Recommended parameters can and do
+vary in different applications.
+SENSIRION reserves the right, without further notice, (i) to change the product specifications and/or the information in this document and (ii)
+to improve reliability, functions and design of this product.
+Copyright © 2022, by SENSIRION. CMOSens® is a trademark of Sensirion. All rights reserved
+
+Headquarters and Subsidiaries
+Sensirion AG
+Laubisruetistr. 50
+CH-8712 Staefa ZH
+Switzerland
+
+Sensirion Inc., USA
+phone: +1 312 690 5858
+info-us@sensirion.com
+www.sensirion.com
+
+Sensirion Korea Co. Ltd.
+phone: +82 31 337 7700~3
+info-kr@sensirion.com
+www.sensirion.com/kr
+
+phone: +41 44 306 40 00
+fax:
++41 44 306 40 30
+info@sensirion.com
+www.sensirion.com
+
+Sensirion Japan Co. Ltd.
+phone: +81 3 3444 4940
+info-jp@sensirion.com
+www.sensirion.com/jp
+
+Sensirion China Co. Ltd.
+phone: +86 755 8252 1501
+info-cn@sensirion.com
+www.sensirion.com/cn
+
+Sensirion Taiwan Co. Ltd
+phone: +886 3 5506701
+info@sensirion.com
+www.sensirion.com
+
+www.sensirion.com
+
+To find your local representative, please visit www.sensirion.com/distributors
+
+Version 1 - April 2022
+
+6/6
+
+
