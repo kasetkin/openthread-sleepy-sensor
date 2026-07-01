@@ -1,2 +1,7 @@
 rh_offset: "0.0"
+rh_min_change: "1.0"
 temp_offset: "0.0"
+temp_min_change: "0.2"
+max_skip_cycles: "10"
+cycle_duration_sec: "60"
+

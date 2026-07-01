@@ -69,43 +69,6 @@ void startErrorTask(ErrorTask::ErrorCode code)
     }, "error_task", DEFAULT_TASK_STACK_SIZE, nullptr, 6, nullptr);
 }
 
-// Parse a float offset from calibration.txt; returns 0.0f if the key is missing/unparseable.
-// from_chars (not stof) because C++ exceptions are disabled in this build.
-static float parse_calib_offset(std::string_view content, std::string_view key)
-{
-    const std::string s = yaml_get_string(content, key);
-    float value = 0.0f;
-    if (!s.empty())
-        std::from_chars(s.data(), s.data() + s.size(), value);  // leaves value=0 on failure
-    return value;
-}
-
-static uint8_t hex_nibble(char c)
-{
-    if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
-    if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
-    if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
-    return 0;
-}
-
-static bool parse_dataset_tlvs(const std::string &hex, otOperationalDatasetTlvs &out)
-{
-    size_t hex_len = hex.size();
-
-    if (hex_len == 0 || hex_len % 2 != 0 || hex_len / 2 > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
-        ESP_LOGE(TAG, "Invalid OT TLV hex string (len=%d)", static_cast<int>(hex_len));
-        return false;
-    }
-
-    out = {};
-    for (size_t i = 0; i < hex_len; i += 2)
-        out.mTlvs[out.mLength++] = static_cast<uint8_t>(
-            (hex_nibble(hex[i]) << 4) | hex_nibble(hex[i + 1]));
-
-    ESP_LOGI(TAG, "Parsed %d bytes from OT TLV dataset", out.mLength);
-    return true;
-}
-
 static void configure_ot_network(const std::string &ot_tlv_hex)
 {
     otOperationalDatasetTlvs dataset_tlvs;
@@ -304,20 +267,25 @@ extern "C" void app_main(void)
     });
 
     // ── sensors ───────────────────────────────────────────────────────────────
+    const SensorsTaskSettings sSettings {
+        .rh_offset = parse_as_float(calibration_txt(), "rh_offset"),
+        .rh_min_change = parse_as_float(calibration_txt(), "rh_min_change"),
+        .temp_offset = parse_as_float(calibration_txt(), "temp_offset"),
+        .temp_min_change = parse_as_float(calibration_txt(), "temp_min_change"),
+        .max_skip_cycles = parse_as_uint32(calibration_txt(), "max_skip_cycles"),
+        .cycle_duration_sec = parse_as_uint32(calibration_txt(), "cycle_duration_sec")
+    };
+
+    ESP_LOGI("main", "sensor settings: TODO");
+
     ESP_LOGI(TAG, "create sensors task");
-    sensorTask = std::make_shared<SensorsTask>();
+    sensorTask = std::make_shared<SensorsTask>(sSettings);
 
     ret = sensorTask->init();
     if (ret != ESP_OK) {
         startErrorTask(ErrorTask::ErrorCode::ecSensorsFail);
         return;
     }
-
-    // ── per-device calibration (calibration.txt, embedded at build time) ────────
-    const float rh_offset   = parse_calib_offset(calibration_txt(), "rh_offset");
-    const float temp_offset = parse_calib_offset(calibration_txt(), "temp_offset");
-    ESP_LOGI("main", "calibration offsets: RH %+.2f %%RH, T %+.2f C", rh_offset, temp_offset);
-    sensorTask->configureCalibration(rh_offset, temp_offset);
 
     sensorTask->configureReadyEvent([](const SensorsValues &values) static
     {

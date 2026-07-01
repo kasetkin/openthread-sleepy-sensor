@@ -14,6 +14,12 @@
 #include "common_utils.h"
 #include "mqtt_sender.h"
 
+SensorsTask::SensorsTask(SensorsTaskSettings settings):
+    m_settings{settings}
+{
+
+}
+
 std::string SensorsValues::toTelemetryRoundedString(const float value)
 {
     // buf[24]: fixed,3 for sensor ranges (±150 °C, 0–1200 hPa) never exceeds 10 chars.
@@ -85,12 +91,6 @@ void SensorsTask::configureAttachGate(AttachGate attachGate)
 void SensorsTask::configureRefreshNat64(RefreshNat64 refreshNat64)
 {
     m_refreshNat64 = std::move(refreshNat64);
-}
-
-void SensorsTask::configureCalibration(float rhOffset, float tempOffset)
-{
-    m_rhOffset = rhOffset;
-    m_tempOffset = tempOffset;
 }
 
 std::expected<SensorBackend, esp_err_t> SensorsTask::probeSht4x()
@@ -445,13 +445,23 @@ void SensorsTask::executeTask()
 {
     static const char * TAG = "sensors-task";
 
+    /// \todo use constexpr or values from calibration.txt for min/max values
+    const auto calibrateTemperature = [this](float t) {
+        return std::clamp(t + m_settings.temp_min_change, -273.15f, 3000.0f);
+    };
+
+    /// \todo use constexpr for min/max values
+    const auto calibrateHum = [this](float rh) {
+        return std::clamp(rh + m_settings.rh_offset, 0.0f, 100.0f);
+    };
+
     // Cap on how long to stay awake for a publish before sleeping anyway.
     static constexpr uint32_t PUBLISH_TIMEOUT_MS = 15 * 1000;
     static constexpr uint32_t LED_BLINK_MS       = 50;
 
     // This task is the sole driver of the sleep cadence: arm the wakeup timer once, then
     // read → publish → wait-for-idle → light-sleep on every iteration.
-    if (const esp_err_t timerRes = registerWakeupTimer(static_cast<uint64_t>(SENSORS_PERIOD_MS) * 1000);
+    if (const esp_err_t timerRes = registerWakeupTimer(static_cast<uint64_t>(m_settings.cycle_duration_sec) * 1000 * 1000);
         timerRes != ESP_OK)
         ESP_LOGE(TAG, "can not register wakeup timer: %d — sleep interval undefined", timerRes);
 
@@ -469,16 +479,6 @@ void SensorsTask::executeTask()
             SensorsValues v{};
 
             if (auto reading = readEnvironment(); reading) {
-                /// \todo use constexpr for min/max values
-                const auto calibrateTemperature = [this](float t) {
-                    return std::clamp(t + m_tempOffset, -273.15f, 3000.0f);
-                };
-
-                /// \todo use constexpr for min/max values
-                const auto calibrateHum = [this](float rh) {
-                    return std::clamp(rh + m_rhOffset, 0.0f, 100.0f);
-                };
-
                 std::optional<float> rawTemp = reading->temperature;
                 std::optional<float> rawHum = reading->humidity;
 
@@ -534,21 +534,37 @@ void SensorsTask::executeTask()
                 ESP_LOGE(TAG, "sensor read error: %d", reading.error());
             }
 
-            if (m_readyEvent)
-                m_readyEvent(v);  // triggers an async MQTT publish when attached as CHILD
+            bool sameAsPreviousDelivered = true;
+            const float tempChange = std::abs(v.envTemperature.value_or(1000000.0) - m_previousDeliveredValue.envTemperature.value_or(0.0));
+            if (tempChange >= m_settings.temp_min_change)
+                sameAsPreviousDelivered = false;
 
-            // Only wait if a publish was actually started (skipped when not yet attached). Waiting
-            // before sleeping stops light sleep from freezing the MQTT task/radio mid-flight.
-            // mqtt_wait_for_idle() only reports the task ended, not that it succeeded — that ending
-            // is identical for a failed connect — so the real outcome comes from
-            // mqtt_last_publish_succeeded(). A timeout means MQTT stalled; sleep anyway rather than
-            // stay awake burning battery.
-            if (mqtt_is_busy()) {
-                if (mqtt_wait_for_idle(PUBLISH_TIMEOUT_MS)) {
-                    publishedOk = mqtt_last_publish_succeeded();
-                } else {
-                    ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
+            const float rhChange = std::abs(v.envHumidity.value_or(1000000.0) - m_previousDeliveredValue.envHumidity.value_or(0.0));
+            if (rhChange >= m_settings.rh_min_change)
+                sameAsPreviousDelivered = false;
+
+            if ((!sameAsPreviousDelivered) || (m_sameValueSkippedCycles > m_settings.max_skip_cycles)) {
+                if (m_readyEvent)
+                    m_readyEvent(v);  // triggers an async MQTT publish when attached as CHILD
+
+                // Only wait if a publish was actually started (skipped when not yet attached). Waiting
+                // before sleeping stops light sleep from freezing the MQTT task/radio mid-flight.
+                // mqtt_wait_for_idle() only reports the task ended, not that it succeeded — that ending
+                // is identical for a failed connect — so the real outcome comes from
+                // mqtt_last_publish_succeeded(). A timeout means MQTT stalled; sleep anyway rather than
+                // stay awake burning battery.
+                if (mqtt_is_busy()) {
+                    if (mqtt_wait_for_idle(PUBLISH_TIMEOUT_MS)) {
+                        publishedOk = mqtt_last_publish_succeeded();
+                        m_previousDeliveredValue = v;
+                        m_sameValueSkippedCycles = 0;
+                    } else {
+                        ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
+                    }
                 }
+            } else {
+                /// skip this cycle because it has nearly the same values as already delivered ones
+                m_sameValueSkippedCycles += 1;
             }
         }
 
@@ -578,7 +594,7 @@ void SensorsTask::executeTask()
         }
 
         ESP_LOGI(TAG, "sensor values ready, go to sleep");
-        // vTaskDelay(pdMS_TO_TICKS(SENSORS_PERIOD_MS));
-        correctLightSleep();  // light-sleep for SENSORS_PERIOD_MS until the next cycle
+        vTaskDelay(pdMS_TO_TICKS(static_cast<uint32_t>(m_settings.cycle_duration_sec) * 1000));
+        // correctLightSleep();  // light-sleep for SENSORS_PERIOD_MS until the next cycle
     }
 }

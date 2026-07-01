@@ -38,8 +38,19 @@ enum class SensorBackend
     InternalTemp,
 };
 
-/// One environment reading. Humidity is optional because the internal CPU
-/// temperature fallback has no humidity channel (stays std::nullopt there).
+struct SensorsTaskSettings
+{
+    float rh_offset = 0.0;
+    float rh_min_change = 0.0;
+    float temp_offset = 0.0;
+    float temp_min_change = 0.0;
+    uint32_t max_skip_cycles = 0;
+
+    /// single source of truth for the wake→read→publish→sleep cadence
+    uint32_t cycle_duration_sec = 60;
+};
+
+//! \todo delete this struct and use SensorsValues
 struct EnvReading
 {
     std::optional<float> temperature;
@@ -50,7 +61,7 @@ class SensorsTask
 {
 public:
     ~SensorsTask();
-    SensorsTask() = default;
+    SensorsTask(SensorsTaskSettings settings);
     SensorsTask(const SensorsTask &) = delete("SensorsTask owns I2C device handles — copying aliases hardware resources");
     SensorsTask &operator=(const SensorsTask &) = delete("SensorsTask owns I2C device handles — copying aliases hardware resources");
 
@@ -76,15 +87,8 @@ public:
     /// Injected by main (it owns the OpenThread instance); called after a failed publish cycle.
     using RefreshNat64 = std::function<void()>;
     void configureRefreshNat64(RefreshNat64 refreshNat64);
-
-    /// Per-device calibration offsets added to each raw reading before publishing.
-    /// Sourced from calibration.txt and injected by main (default 0 = no correction).
-    void configureCalibration(float rhOffset, float tempOffset);
-
+    
 private:
-    /// single source of truth for the wake→read→publish→sleep cadence
-    static constexpr uint32_t SENSORS_PERIOD_MS = 60 * 1000;
-
     /// per-cycle awake budget to (re)attach before sleeping anyway; > typical attach time and SENSORS_PERIOD_MS
     static constexpr uint32_t ATTACH_TIMEOUT_MS = 30 * 1000;
 
@@ -128,6 +132,8 @@ private:
     static constexpr gpio_num_t I2C_MASTER_SCL = GPIO_NUM_23;
     static constexpr i2c_port_t SHT3X_I2C_PORT = I2C_NUM_0;
     
+    const SensorsTaskSettings m_settings;
+
     bool m_i2cInitialized = false;
     SensorsReadyEvent m_readyEvent;
     AttachGate m_attachGate;
@@ -143,9 +149,9 @@ private:
     /// maintenance scheduling counters (persist across light sleep — RAM is retained)
     uint32_t m_cyclesSinceHeater = 0;
     uint32_t m_highRhCycles = 0;
-    /// calibration offsets injected via configureCalibration()
-    float m_rhOffset = 0.0f;
-    float m_tempOffset = 0.0f;
+    SensorsValues m_previousDeliveredValue{};
+    uint32_t m_sameValueSkippedCycles = 0;
+
 
     [[nodiscard("I2C unavailable if init failure ignored")]]
     esp_err_t initI2C();
