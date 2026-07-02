@@ -469,6 +469,7 @@ void SensorsTask::executeTask()
         // Whether data actually reached the broker this cycle. Stays false unless a publish was
         // started AND mqtt_last_publish_succeeded() confirms a connected, ACKed state message.
         bool publishedOk = false;
+        bool skippedSameValuesCycle = false;
         // Don't read/publish until attached as CHILD. This is a blocking wait (not light sleep) so
         // OpenThread can finish MLE attachment / re-attach after a lost parent; light-sleeping while
         // detached would freeze the radio and stall attachment. If the network is absent the gate
@@ -543,7 +544,9 @@ void SensorsTask::executeTask()
             if (rhChange >= m_settings.rh_min_change)
                 sameAsPreviousDelivered = false;
 
-            if ((!sameAsPreviousDelivered) || (m_sameValueSkippedCycles > m_settings.max_skip_cycles)) {
+            skippedSameValuesCycle = sameAsPreviousDelivered && (m_sameValueSkippedCycles <= m_settings.max_skip_cycles);
+
+            if (!skippedSameValuesCycle) {
                 if (m_readyEvent)
                     m_readyEvent(v);  // triggers an async MQTT publish when attached as CHILD
 
@@ -572,15 +575,20 @@ void SensorsTask::executeTask()
         if (publishedOk) {
             blinkUserLED(LED_BLINK_MS);
         } else {
-            ESP_LOGW(TAG, "data was not published to the broker this cycle");
-            blinkUserLED(LED_BLINK_MS, 5);
+            if (skippedSameValuesCycle) {
+                ESP_LOGI(TAG, "data was not published because it has same values");
+                blinkUserLED(LED_BLINK_MS, 2);
+            } else {
+                ESP_LOGW(TAG, "data was not published to the broker this cycle");
+                blinkUserLED(LED_BLINK_MS, 5);
+            }
         }
 
         // Recovery supervisor: count consecutive failed cycles and reboot once they pass the
         // threshold. There is no other path back from a persistent reachability loss — a reboot
         // re-attaches to Thread and re-learns the NAT64 route. Before that, give a softer nudge:
         // re-read network data so a merely-stale NAT64 prefix is fixed without a reboot.
-        if (publishedOk) {
+        if (publishedOk || skippedSameValuesCycle) {
             m_consecutiveFailures = 0;
         } else {
             if (m_refreshNat64)
