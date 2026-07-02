@@ -5,8 +5,10 @@
 #include <optional>
 #include <cstdint>
 
+#include "network_link.h"
+
 struct MqttConfig {
-    std::string      ha_ipv4;    // fallback IPv4, e.g. "192.168.77.250"
+    std::string      broker_address; // literal IPv4 or IPv6 address, e.g. "192.168.77.250" or "fd12:3456:789a::10"
     uint16_t         port;       // MQTT port, e.g. 1883
     std::string      username;
     std::string      password;
@@ -14,13 +16,9 @@ struct MqttConfig {
     std::string      device_name;  // human-readable name from secrets.yaml "device_name"
 };
 
-// Call once before the sensor task starts.
-void mqtt_sender_init(const MqttConfig &cfg);
-
-// Update the NAT64 prefix used to reach the IPv4 broker from Thread.
-// prefix_bytes must point to 12 bytes (a /96 prefix, e.g. from otExternalRouteConfig).
-// Call this when the Thread network data contains a nat64=1 route.
-void mqtt_sender_set_nat64_prefix(const uint8_t *prefix_bytes);
+// Call once before the sensor task starts. `link` must outlive the sensor task — it
+// backs the transport-specific parts (broker URI, reachability, publish-window hooks).
+void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link);
 
 // Trigger a connect → publish discovery + state → disconnect cycle.
 // Safe to call from any task; non-blocking (the MQTT event loop does the work).

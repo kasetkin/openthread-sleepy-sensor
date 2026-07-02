@@ -23,8 +23,15 @@ CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
 #
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
 CONFIG_LWIP_IPV6_NUM_ADDRESSES=8
-CONFIG_LWIP_IPV4=n
-CONFIG_LWIP_ND6=n
+# IPV4 + ND6 on for Wi-Fi (direct IPv4 connect; ND6/RA needed for SLAAC). Thread's netif
+# doesn't use either (it's IPv6-only via NAT64, and does neighbor/route discovery at its
+# own MLE layer via esp_openthread_netif_glue, bypassing lwIP's ND6 state machine) but
+# there's one shared sdkconfig for the whole image, so both builds link this in.
+CONFIG_LWIP_IPV4=y
+CONFIG_LWIP_ND6=y
+# SLAAC (RFC 4862) global/ULA address generation on the Wi-Fi STA netif, for
+# wifi_address_family: "ipv6". Needs CONFIG_LWIP_ND6=y above to process Router Advertisements.
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
 # end of lwIP
 
 #

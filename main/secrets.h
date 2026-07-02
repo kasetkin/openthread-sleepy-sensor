@@ -15,19 +15,34 @@ inline std::string_view secrets_yaml() {
             static_cast<size_t>(_binary_secrets_yaml_end - _binary_secrets_yaml_start)};
 }
 
-// Finds `key: "value"` in the YAML content and returns the quoted value.
-// Returns "" if the key is not found.
+// Finds `key: "value"` in the YAML content and returns the quoted value, skipping any
+// match that's commented out (a '#' earlier on the same line) — otherwise a stray
+// `#key: "old value"` left above the real line would silently shadow it.
+// Returns "" if no uncommented match is found.
 inline std::string yaml_get_string(std::string_view content, std::string_view key) {
     std::string search{key};
     search += ": \"";
-    const auto pos = content.find(search);
-    if (pos == std::string_view::npos)
-        return {};
-    const auto val_start = pos + search.size();
-    const auto val_end = content.find('"', val_start);
-    if (val_end == std::string_view::npos)
-        return {};
-    return std::string{content.substr(val_start, val_end - val_start)};
+
+    size_t search_from = 0;
+    while (true) {
+        const auto pos = content.find(search, search_from);
+        if (pos == std::string_view::npos)
+            return {};
+
+        const auto line_start = content.rfind('\n', pos);
+        const auto line_begin = (line_start == std::string_view::npos) ? 0 : line_start + 1;
+        const auto hash_pos = content.find('#', line_begin);
+        if (hash_pos != std::string_view::npos && hash_pos < pos) {
+            search_from = pos + search.size();
+            continue;  // this match is commented out; keep looking
+        }
+
+        const auto val_start = pos + search.size();
+        const auto val_end = content.find('"', val_start);
+        if (val_end == std::string_view::npos)
+            return {};
+        return std::string{content.substr(val_start, val_end - val_start)};
+    }
 }
 
 inline float parse_as_float(std::string_view content, std::string_view key)

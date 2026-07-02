@@ -1,5 +1,4 @@
 #include "mqtt_sender.h"
-#include "common_utils.h"
 
 #include <algorithm>
 #include <atomic>
@@ -7,13 +6,9 @@
 #include <string>
 
 #include "esp_log.h"
-#include "esp_openthread.h"
-#include "esp_openthread_lock.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "mqtt_client.h"
-#include "openthread/ip6.h"
-#include "openthread/link.h"
 
 static const char *TAG = "mqtt-sender";
 
@@ -24,27 +19,18 @@ static constexpr EventBits_t BIT_ERROR     = BIT2;
 // Separate, module-level event group used only to signal "no publish cycle in flight".
 static constexpr EventBits_t BIT_IDLE = BIT0;
 
-// Set once a NAT64 prefix has been learned from Thread network data.  The publish
-// task blocks on this so it never connects with the stale well-known default.
-static constexpr EventBits_t BIT_PREFIX_KNOWN = BIT0;
-
-// How long the publish task waits for the NAT64 prefix before giving up on a cycle.
-// After attach the route can land slightly late; a few seconds covers the gap.
-static constexpr uint32_t PREFIX_WAIT_MS = 5000;
+// How long the publish task waits for the broker to become reachable before giving up
+// on a cycle (backed by NetworkLink::waitForBrokerReachable — e.g. OT: NAT64 prefix
+// learned, only for an IPv4 broker; Wi-Fi: always immediate). After attach a NAT64
+// route can land slightly late; a few seconds covers the gap.
+static constexpr uint32_t BROKER_REACHABLE_WAIT_MS = 5000;
 
 static MqttConfig s_cfg;
+static const NetworkLink *s_link = nullptr;       // set in mqtt_sender_init(); backs the transport
 static std::atomic<bool> s_discovery_sent{false};
 static std::atomic<bool> s_task_running{false};
 static std::atomic<bool> s_last_ok{false};        // true iff the most recent finished cycle connected AND was ACKed
 static EventGroupHandle_t s_idle_eg = nullptr;    // created in mqtt_sender_init(); starts idle
-static EventGroupHandle_t s_prefix_eg = nullptr;  // created in mqtt_sender_init(); starts unknown
-
-// NAT64 /96 prefix used to reach the IPv4 broker.  Default: IANA well-known 64:ff9b::/96.
-// Overridden at runtime via mqtt_sender_set_nat64_prefix() once Thread network data arrives.
-static uint8_t s_nat64_prefix[12] =
-{
-    0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
 
 // ── context shared between the publish task and the event handler ─────────────
 struct MqttCtx
@@ -53,46 +39,6 @@ struct MqttCtx
     std::atomic<int>   expected_acks{0};
     std::atomic<int>   received_acks{0};
 };
-
-// Poll periods: fast during the MQTT window so TCP ACKs arrive promptly;
-// slow the rest of the time to maximise sleep.
-static constexpr uint32_t POLL_FAST_MS = 500;
-static constexpr uint32_t POLL_SLOW_MS = 70000;
-
-static void set_poll_period(uint32_t ms)
-{
-    esp_openthread_lock_acquire(portMAX_DELAY);
-    otLinkSetPollPeriod(esp_openthread_get_instance(), ms);
-    esp_openthread_lock_release();
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-void mqtt_sender_set_nat64_prefix(const uint8_t *p12)
-{
-    std::copy_n(p12, 12, s_nat64_prefix);
-    if (s_prefix_eg)
-        xEventGroupSetBits(s_prefix_eg, BIT_PREFIX_KNOWN);
-}
-
-static std::string make_nat64_uri(std::string_view ipv4, uint16_t port)
-{
-    const auto octets = parseIpv4(ipv4);
-    if (!octets) {
-        ESP_LOGE(TAG, "bad IPv4 '%.*s'", static_cast<int>(ipv4.size()), ipv4.data());
-        return {};
-    }
-
-    // Build full 128-bit IPv6 from 96-bit NAT64 prefix + 32-bit IPv4, then let OpenThread
-    // format it (canonical, ::-compressed) instead of hand-pairing bytes into hextets.
-    otIp6Address addr = {};
-    std::copy_n(s_nat64_prefix, 12, addr.mFields.m8);   // 96-bit NAT64 prefix
-    std::ranges::copy(*octets, addr.mFields.m8 + 12);   // 32-bit IPv4 -> low bytes
-
-    char host[OT_IP6_ADDRESS_STRING_SIZE];
-    otIp6AddressToString(&addr, host, sizeof(host));
-    return std::format("mqtt://[{}]:{}", host, port);
-}
 
 // HA MQTT-discovery config payload. Shown un-escaped for readability; in the format
 // string every literal { } is doubled, and Jinja "{{ value_json.X }}" -> "{{{{value_json.{}}}}}".
@@ -193,30 +139,27 @@ static void mqtt_publish_task(void *arg)
     auto abort_cycle = [&ctx]() {
         s_last_ok.store(false);
         vEventGroupDelete(ctx.eg);
-        set_poll_period(POLL_SLOW_MS);
+        s_link->onPublishWindowEnd();
         s_task_running.store(false);
         if (s_idle_eg)
             xEventGroupSetBits(s_idle_eg, BIT_IDLE);
         vTaskDelete(nullptr);
     };
 
-    set_poll_period(POLL_FAST_MS);  // fast polls so the NAT64 prefix (network data) and TCP ACKs arrive promptly
+    s_link->onPublishWindowBegin();  // OT: fast polls so NAT64 prefix + TCP ACKs arrive promptly; Wi-Fi: no-op
 
-    // Block until the NAT64 prefix is learned from Thread network data.  On the first
-    // cycle after attach the route can land a little late; connecting with the default
-    // well-known prefix would just route nowhere and time out the TLS handshake.
-    if (!s_prefix_eg ||
-        !(xEventGroupWaitBits(s_prefix_eg, BIT_PREFIX_KNOWN, pdFALSE, pdFALSE,
-                              pdMS_TO_TICKS(PREFIX_WAIT_MS)) & BIT_PREFIX_KNOWN)) {
-        ESP_LOGE(TAG, "NAT64 prefix not learned within %lu ms, skipping cycle",
-                 (unsigned long)PREFIX_WAIT_MS);
+    // Block until the broker's address family is reachable (OT: NAT64 prefix learned,
+    // only for an IPv4 broker; Wi-Fi: always immediate — see NetworkLink::waitForBrokerReachable).
+    if (!s_link->waitForBrokerReachable(s_cfg.broker_address, BROKER_REACHABLE_WAIT_MS)) {
+        ESP_LOGE(TAG, "broker not reachable within %lu ms, skipping cycle",
+                 (unsigned long)BROKER_REACHABLE_WAIT_MS);
         abort_cycle();
         return;
     }
 
-    const std::string uri = make_nat64_uri(s_cfg.ha_ipv4, s_cfg.port);
+    const std::string uri = s_link->brokerUri(s_cfg.broker_address, s_cfg.port);
     if (uri.empty()) {
-        ESP_LOGE(TAG, "ha_ipv4 not set or invalid, cannot connect");
+        ESP_LOGE(TAG, "broker_address not set or invalid, cannot connect");
         abort_cycle();
         return;
     }
@@ -292,7 +235,7 @@ static void mqtt_publish_task(void *arg)
     esp_mqtt_client_stop(client);
     esp_mqtt_client_destroy(client);
     vEventGroupDelete(ctx.eg);
-    set_poll_period(POLL_SLOW_MS);  // back to slow poll until next sensor cycle
+    s_link->onPublishWindowEnd();  // OT: back to slow poll until next sensor cycle; Wi-Fi: no-op
     s_task_running.store(false);
     if (s_idle_eg)
     	xEventGroupSetBits(s_idle_eg, BIT_IDLE);  // wake any mqtt_wait_for_idle() caller
@@ -301,16 +244,15 @@ static void mqtt_publish_task(void *arg)
 
 // ── public API ────────────────────────────────────────────────────────────────
 
-void mqtt_sender_init(const MqttConfig &cfg)
+void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link)
 {
     s_cfg = cfg;
+    s_link = link;
     if (!s_idle_eg) {
         s_idle_eg = xEventGroupCreate();
         if (s_idle_eg)
         	xEventGroupSetBits(s_idle_eg, BIT_IDLE);  // idle until first publish
     }
-    if (!s_prefix_eg)
-        s_prefix_eg = xEventGroupCreate();  // starts cleared: prefix unknown until learned
 }
 
 void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity)
