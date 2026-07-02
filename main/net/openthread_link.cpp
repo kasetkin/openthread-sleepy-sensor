@@ -34,6 +34,11 @@ static EventGroupHandle_t s_ot_attached_eg = nullptr;
 // Set once a NAT64 prefix has been learned from Thread network data. Only consulted when
 // the configured broker address is IPv4 — an IPv6 broker never needs NAT64.
 static constexpr EventBits_t BIT_PREFIX_KNOWN = BIT0;
+// Set once Thread network data has at least one external route (the Border Router is
+// publishing off-mesh routing), independent of NAT64. Consulted for IPv6 brokers — Network
+// Data can lag a few hundred ms behind the CHILD-role transition, so a connect attempted
+// right at attach can race a route table that's still empty.
+static constexpr EventBits_t BIT_ROUTE_KNOWN = BIT1;
 static EventGroupHandle_t s_prefix_eg = nullptr;
 
 // NAT64 /96 prefix used to reach an IPv4 broker. Default: IANA well-known 64:ff9b::/96.
@@ -107,7 +112,12 @@ static void log_thread_network_info()
         if (route.mNat64 && route.mPrefix.mLength == 96)
             setNat64Prefix(route.mPrefix.mPrefix.mFields.m8);
     }
-    if (!any) ESP_LOGW(TAG, "  (none — NAT64 route not yet in network data)");
+    if (any) {
+        if (s_prefix_eg)
+            xEventGroupSetBits(s_prefix_eg, BIT_ROUTE_KNOWN);
+    } else {
+        ESP_LOGW(TAG, "  (none — NAT64 route not yet in network data)");
+    }
 }
 
 // Re-scan current Thread network data for a NAT64 /96 route and update the prefix. Called
@@ -121,12 +131,16 @@ static void refresh_nat64_prefix()
     otNetworkDataIterator it = OT_NETWORK_DATA_ITERATOR_INIT;
     otExternalRouteConfig route;
     bool found = false;
+    bool any = false;
     while (otNetDataGetNextRoute(ot, &it, &route) == OT_ERROR_NONE) {
+        any = true;
         if (route.mNat64 && route.mPrefix.mLength == 96) {
             setNat64Prefix(route.mPrefix.mPrefix.mFields.m8);
             found = true;
         }
     }
+    if (any && s_prefix_eg)
+        xEventGroupSetBits(s_prefix_eg, BIT_ROUTE_KNOWN);
     esp_openthread_lock_release();
     if (!found)
         ESP_LOGW(TAG, "refresh_nat64_prefix: no NAT64 route in current network data");
@@ -251,10 +265,19 @@ static esp_err_t start()
 
 static bool waitForBrokerReachable(std::string_view broker_address, uint32_t timeout_ms)
 {
-    // NAT64 is only needed to reach an IPv4 broker; an IPv6 broker is reached via the
-    // Border Router's normal off-mesh routing, already available once attached.
-    if (looksLikeIpv6(broker_address))
+    // NAT64 is only needed to reach an IPv4 broker; an IPv6 broker instead needs the Border
+    // Router's off-mesh route to have actually landed in Thread network data — that can lag
+    // a few hundred ms behind the CHILD-role transition, so wait for it rather than assuming
+    // it's already there.
+    if (looksLikeIpv6(broker_address)) {
+        if (!s_prefix_eg ||
+            !(xEventGroupWaitBits(s_prefix_eg, BIT_ROUTE_KNOWN, pdFALSE, pdFALSE,
+                                  pdMS_TO_TICKS(timeout_ms)) & BIT_ROUTE_KNOWN)) {
+            ESP_LOGE(TAG, "off-mesh route not learned within %lu ms", (unsigned long)timeout_ms);
+            return false;
+        }
         return true;
+    }
 
     if (!s_prefix_eg ||
         !(xEventGroupWaitBits(s_prefix_eg, BIT_PREFIX_KNOWN, pdFALSE, pdFALSE,
