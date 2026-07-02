@@ -102,6 +102,16 @@ extern "C" void app_main(void)
     const std::string mqtt_user = yaml_get_string(yaml, "mqtt_username");
     const std::string mqtt_pass = yaml_get_string(yaml, "mqtt_password");
 
+    const std::string mqtt_tls_str = yaml_get_string(yaml, "mqtt_tls");
+    bool mqtt_tls = false;
+    if (!mqtt_tls_str.empty() && mqtt_tls_str != "true" && mqtt_tls_str != "false") {
+        ESP_LOGW("main", "secrets.yaml has invalid 'mqtt_tls' (%s), falling back to 'false'",
+                 mqtt_tls_str.c_str());
+    } else {
+        mqtt_tls = (mqtt_tls_str == "true");
+    }
+    const std::string mqtt_tls_ca_cert = yaml_get_string(yaml, "mqtt_tls_ca_cert");
+
     std::string transport_str = yaml_get_string(yaml, "transport");
     if (transport_str.empty())
         transport_str = "thread";
@@ -167,6 +177,8 @@ extern "C" void app_main(void)
         .password  = mqtt_pass,
         .device_id = mqtt_name_and_id,
         .device_name = mqtt_name_and_id,
+        .use_tls = mqtt_tls,
+        .tls_ca_cert_b64 = mqtt_tls_ca_cert,
     }, &s_link);
 
     // ── sensors ───────────────────────────────────────────────────────────────

@@ -14,6 +14,9 @@ struct MqttConfig {
     std::string      password;
     std::string      device_id;    // unique id, e.g. "<device_name>_a1b2c3" (name + chip MAC suffix)
     std::string      device_name;  // human-readable name from secrets.yaml "device_name"
+    bool             use_tls = false;      // true: mqtts:// with server verification; false: plaintext mqtt://
+    std::string      tls_ca_cert_b64;      // optional CA/leaf cert, base64 body only (no PEM markers/newlines);
+                                            // empty => trust ESP-IDF's public CA bundle instead. Only used if use_tls.
 };
 
 // Call once before the sensor task starts. `link` must outlive the sensor task — it

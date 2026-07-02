@@ -15,6 +15,14 @@ inline bool looksLikeIpv6(std::string_view addr)
     return addr.find(':') != std::string_view::npos;
 }
 
+// Picks the MQTT URI scheme for a given transport-security mode. Shared by every
+// NetworkLink implementation's brokerUri() so "mqtt" vs "mqtts" is decided in exactly
+// one place, mirroring looksLikeIpv6()'s role for address-family sniffing above.
+inline std::string_view mqttScheme(bool use_tls)
+{
+    return use_tls ? "mqtts" : "mqtt";
+}
+
 // Abstracts "how do I reach an IP-connected MQTT broker" over OpenThread or
 // Wi-Fi so mqtt_sender.cpp and SensorsTask stay transport-agnostic. A plain
 // struct of std::function seams (matching SensorsTask's configureAttachGate/
@@ -29,8 +37,8 @@ struct NetworkLink
     std::function<bool(uint32_t timeoutMs)> waitForReady;
 
     // Builds the MQTT broker URI for broker_address (a literal IPv4 or IPv6
-    // address — no DNS names).
-    std::function<std::string(std::string_view broker_address, uint16_t port)> brokerUri;
+    // address — no DNS names). use_tls selects the "mqtt"/"mqtts" scheme.
+    std::function<std::string(std::string_view broker_address, uint16_t port, bool use_tls)> brokerUri;
 
     // Blocks up to timeoutMs until broker_address's family is reachable
     // (OT: NAT64 prefix learned, only for an IPv4 broker; Wi-Fi: always true

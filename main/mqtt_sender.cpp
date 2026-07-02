@@ -5,6 +5,7 @@
 #include <format>
 #include <string>
 
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -31,6 +32,25 @@ static std::atomic<bool> s_discovery_sent{false};
 static std::atomic<bool> s_task_running{false};
 static std::atomic<bool> s_last_ok{false};        // true iff the most recent finished cycle connected AND was ACKed
 static EventGroupHandle_t s_idle_eg = nullptr;    // created in mqtt_sender_init(); starts idle
+
+// Full "-----BEGIN CERTIFICATE-----...-----END CERTIFICATE-----" PEM, built once in
+// mqtt_sender_init() from MqttConfig::tls_ca_cert_b64. esp-mqtt stores the pointer passed
+// via broker.verification.certificate raw — it never copies or frees it (confirmed against
+// esp-mqtt's source: esp_mqtt_destroy_config() frees host/uri/path/scheme/alpn_protos/etc.
+// but not cacert_buf) — so it must outlive every per-cycle client's create/connect/destroy
+// lifecycle, not just one start_client() call. A file-scope static that's never freed
+// satisfies that. Empty when tls_ca_cert_b64 is empty (falls back to the public CA bundle).
+static std::string s_tls_ca_cert_pem;
+
+// Wraps a headerless/footerless base64 body into a parseable PEM certificate — the same
+// runtime-wrap trick esp-mqtt's own ssl example uses for CONFIG_BROKER_CERTIFICATE_OVERRIDE,
+// proven against this mbedtls PEM parser. Returns "" if body is empty.
+static std::string wrap_pem_certificate(std::string_view base64_body)
+{
+    if (base64_body.empty())
+        return {};
+    return std::format("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", base64_body);
+}
 
 // ── context shared between the publish task and the event handler ─────────────
 struct MqttCtx
@@ -84,8 +104,9 @@ static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
     case MQTT_EVENT_ERROR: {
         const auto *err = static_cast<esp_mqtt_event_handle_t>(event_data)->error_handle;
         if (err) {
-            ESP_LOGE(TAG, "MQTT error: type=%d esp_tls=%d errno=%d",
-                     err->error_type, err->esp_tls_last_esp_err, err->esp_transport_sock_errno);
+            ESP_LOGE(TAG, "MQTT error: type=%d esp_tls=%d errno=%d tls_stack=%d cert_verify_flags=%d",
+                     err->error_type, err->esp_tls_last_esp_err, err->esp_transport_sock_errno,
+                     err->esp_tls_stack_err, err->esp_tls_cert_verify_flags);
         }
         xEventGroupSetBits(ctx->eg, BIT_ERROR);
         break;
@@ -104,10 +125,29 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
     cfg.credentials.authentication.password = s_cfg.password.c_str();
     cfg.session.keepalive        = 10;
 
-    cfg.network.timeout_ms            = 3000;   // bound TCP ops so stop() returns quickly on failure
+    if (s_cfg.use_tls) {
+        // Broker is always dialed by literal IP, never a hostname (see MqttConfig::
+        // broker_address), so CN/SAN matching against the connect address was never
+        // possible — skip it for both the pinned-cert and public-bundle paths below.
+        cfg.broker.verification.skip_cert_common_name_check = true;
+        if (!s_tls_ca_cert_pem.empty()) {
+            // Pinned CA/leaf cert path (secrets.yaml "mqtt_tls_ca_cert"). certificate_len
+            // stays 0 ("NUL-terminated string" mode, guaranteed by c_str()) — passing
+            // .size() here would switch the parser into DER-length mode and break PEM parsing.
+            cfg.broker.verification.certificate = s_tls_ca_cert_pem.c_str();
+            cfg.broker.verification.certificate_len = 0;
+        } else {
+            cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;  // ESP-IDF's public CA bundle
+        }
+    }
+
+    // Bound TCP ops so stop() returns quickly on failure. TLS needs more headroom than
+    // plaintext: a full asymmetric handshake over a WAN link (searching/verifying against
+    // the public CA bundle on this core) takes longer than a plaintext TCP connect+CONNACK.
+    cfg.network.timeout_ms            = s_cfg.use_tls ? 8000 : 3000;
     cfg.network.disable_auto_reconnect = true;  // we manage reconnects ourselves (one task per cycle)
 
-    ESP_LOGI(TAG, "connecting to %s", uri);
+    ESP_LOGI(TAG, "connecting to %s (tls=%d)", uri, static_cast<int>(s_cfg.use_tls));
     xEventGroupClearBits(ctx.eg, BIT_CONNECTED | BIT_ALL_ACKED | BIT_ERROR);
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(client, MQTT_EVENT_ANY, mqtt_event_handler, &ctx);
@@ -157,7 +197,7 @@ static void mqtt_publish_task(void *arg)
         return;
     }
 
-    const std::string uri = s_link->brokerUri(s_cfg.broker_address, s_cfg.port);
+    const std::string uri = s_link->brokerUri(s_cfg.broker_address, s_cfg.port, s_cfg.use_tls);
     if (uri.empty()) {
         ESP_LOGE(TAG, "broker_address not set or invalid, cannot connect");
         abort_cycle();
@@ -165,8 +205,11 @@ static void mqtt_publish_task(void *arg)
     }
 
     esp_mqtt_client_handle_t client = start_client(uri.c_str(), ctx);
+    // TLS needs more time than plaintext: a full handshake over a WAN link (vs. plaintext's
+    // bare TCP connect+CONNACK) can take several seconds on this core.
+    const uint32_t connect_wait_ms = s_cfg.use_tls ? 15000 : 5000;
     EventBits_t bits = xEventGroupWaitBits(ctx.eg, BIT_CONNECTED | BIT_ERROR,
-                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(connect_wait_ms));
 
     // ── publish if connected ──────────────────────────────────────────────────
     // ok stays false unless we connect, publish a state message, AND the broker ACKs it.
@@ -248,6 +291,7 @@ void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link)
 {
     s_cfg = cfg;
     s_link = link;
+    s_tls_ca_cert_pem = wrap_pem_certificate(cfg.tls_ca_cert_b64);  // "" if tls_ca_cert_b64 is empty
     if (!s_idle_eg) {
         s_idle_eg = xEventGroupCreate();
         if (s_idle_eg)

@@ -128,11 +128,12 @@ static bool waitForWifiReady(uint32_t timeout_ms)
     return (bits & want) != 0;
 }
 
-static std::string brokerUri(std::string_view broker_address, uint16_t port)
+static std::string brokerUri(std::string_view broker_address, uint16_t port, bool use_tls)
 {
+    const auto scheme = mqttScheme(use_tls);
     if (looksLikeIpv6(broker_address))
-        return std::format("mqtt://[{}]:{}", broker_address, port);
-    return std::format("mqtt://{}:{}", broker_address, port);
+        return std::format("{}://[{}]:{}", scheme, broker_address, port);
+    return std::format("{}://{}:{}", scheme, broker_address, port);
 }
 
 // waitForReady() already guarantees the one family Wi-Fi brought up is ready, and the
