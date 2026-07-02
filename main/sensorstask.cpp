@@ -602,7 +602,7 @@ void SensorsTask::executeTask()
         }
 
         ESP_LOGI(TAG, "sensor values ready, go to sleep");
-        vTaskDelay(pdMS_TO_TICKS(static_cast<uint32_t>(m_settings.cycle_duration_sec) * 1000));
-        // correctLightSleep();  // light-sleep for SENSORS_PERIOD_MS until the next cycle
+        // vTaskDelay(pdMS_TO_TICKS(static_cast<uint32_t>(m_settings.cycle_duration_sec) * 1000));
+        correctLightSleep();  // light-sleep for SENSORS_PERIOD_MS until the next cycle
     }
 }
