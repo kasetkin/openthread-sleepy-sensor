@@ -447,7 +447,7 @@ void SensorsTask::executeTask()
 
     /// \todo use constexpr or values from calibration.txt for min/max values
     const auto calibrateTemperature = [this](float t) {
-        return std::clamp(t + m_settings.temp_min_change, -273.15f, 3000.0f);
+        return std::clamp(t + m_settings.temp_offset, -273.15f, 3000.0f);
     };
 
     /// \todo use constexpr for min/max values
@@ -469,7 +469,7 @@ void SensorsTask::executeTask()
         // Whether data actually reached the broker this cycle. Stays false unless a publish was
         // started AND mqtt_last_publish_succeeded() confirms a connected, ACKed state message.
         bool publishedOk = false;
-        bool skippedSameValuesCycle = false;
+        bool skipSameValuesCycle = false;
         // Don't read/publish until attached as CHILD. This is a blocking wait (not light sleep) so
         // OpenThread can finish MLE attachment / re-attach after a lost parent; light-sleeping while
         // detached would freeze the radio and stall attachment. If the network is absent the gate
@@ -537,16 +537,23 @@ void SensorsTask::executeTask()
 
             bool sameAsPreviousDelivered = true;
             const float tempChange = std::abs(v.envTemperature.value_or(1000000.0) - m_previousDeliveredValue.envTemperature.value_or(0.0));
-            if (tempChange >= m_settings.temp_min_change)
+            if (tempChange >= m_settings.temp_min_change) {
+                ESP_LOGI(TAG, "temperature value changed for %.2f and it's bigger then threshold %.2f", tempChange, m_settings.temp_min_change);
+                ESP_LOGI(TAG, "SHOULD DELIVER NEW VALUE 1");
                 sameAsPreviousDelivered = false;
+            }
 
             const float rhChange = std::abs(v.envHumidity.value_or(1000000.0) - m_previousDeliveredValue.envHumidity.value_or(0.0));
-            if (rhChange >= m_settings.rh_min_change)
+            if (rhChange >= m_settings.rh_min_change) {
+                ESP_LOGI(TAG, "relative humidity value changed for %.2f and it's bigger then threshold %.2f", rhChange, m_settings.rh_min_change);
+                ESP_LOGI(TAG, "SHOULD DELIVER NEW VALUE 2");
                 sameAsPreviousDelivered = false;
+            }
 
-            skippedSameValuesCycle = sameAsPreviousDelivered && (m_sameValueSkippedCycles <= m_settings.max_skip_cycles);
+            skipSameValuesCycle = sameAsPreviousDelivered && (m_sameValueSkippedCycles < m_settings.max_skip_cycles);
 
-            if (!skippedSameValuesCycle) {
+            if (!skipSameValuesCycle) {
+                ESP_LOGI(TAG, "Start telemetry delivering, sameValueSkippedCycles is %u, threshold is %u", m_sameValueSkippedCycles, m_settings.max_skip_cycles);
                 if (m_readyEvent)
                     m_readyEvent(v);  // triggers an async MQTT publish when attached as CHILD
 
@@ -560,26 +567,37 @@ void SensorsTask::executeTask()
                     if (mqtt_wait_for_idle(PUBLISH_TIMEOUT_MS)) {
                         publishedOk = mqtt_last_publish_succeeded();
                         m_previousDeliveredValue = v;
-                        m_sameValueSkippedCycles = 0;
                     } else {
                         ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
                     }
+                } else {
+                    ESP_LOGW(TAG, "mqtt is not working? not sure");
                 }
             } else {
                 /// skip this cycle because it has nearly the same values as already delivered ones
-                m_sameValueSkippedCycles += 1;
+                ESP_LOGI(TAG, "skip MQTT delivery because temperature and relative humidity didn't change too much");
+                ESP_LOGI(TAG, "old values: %.2f, %.2f; new values: %.2f, %.2f; number of skipped deliveries %u", 
+                    m_previousDeliveredValue.envTemperature.value_or(0.0),
+                    m_previousDeliveredValue.envHumidity.value_or(0.0),
+                    v.envTemperature.value_or(0.0),
+                    v.envHumidity.value_or(0.0),
+                    m_sameValueSkippedCycles
+                );
             }
         }
 
         // Honest local indicator: 1 blink = data reached the broker, 5 blinks = it did not.
         if (publishedOk) {
+            m_sameValueSkippedCycles = 0;
             blinkUserLED(LED_BLINK_MS);
         } else {
-            if (skippedSameValuesCycle) {
+            m_sameValueSkippedCycles += 1;
+
+            if (skipSameValuesCycle) {
                 ESP_LOGI(TAG, "data was not published because it has same values");
                 blinkUserLED(LED_BLINK_MS, 2);
             } else {
-                ESP_LOGW(TAG, "data was not published to the broker this cycle");
+                ESP_LOGW(TAG, "data was not published to the broker this cycle (but should be)");
                 blinkUserLED(LED_BLINK_MS, 5);
             }
         }
@@ -588,7 +606,7 @@ void SensorsTask::executeTask()
         // threshold. There is no other path back from a persistent reachability loss — a reboot
         // re-attaches to Thread and re-learns the NAT64 route. Before that, give a softer nudge:
         // re-read network data so a merely-stale NAT64 prefix is fixed without a reboot.
-        if (publishedOk || skippedSameValuesCycle) {
+        if (publishedOk || skipSameValuesCycle) {
             m_consecutiveFailures = 0;
         } else {
             if (m_refreshNat64)
