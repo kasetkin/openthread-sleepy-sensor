@@ -3,3 +3,4 @@ build/
 /.claude/
 secrets.yaml
 /managed_components/
+/logs/
