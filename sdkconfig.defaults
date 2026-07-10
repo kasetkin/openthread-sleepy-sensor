@@ -84,6 +84,24 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 # end of ESP System Settings
 
 #
+# Logging
+# Default "RTOS" timestamps are xTaskGetTickCount()-based, and this project's own light-sleep
+# wrapper (correctLightSleep(), main/common_utils.cpp) calls esp_light_sleep_start() directly
+# rather than through the automatic tickless-idle path -- so the tick count is never
+# compensated for time spent asleep (vTaskStepTick() is only called from esp_pm/pm_impl.c's
+# own idle-hook sleep path), and RTOS-sourced log timestamps silently stop accounting for the
+# ~15s+ spent in every light sleep. "SYSTEM" is gettimeofday()-backed (ultimately
+# esp_timer_get_time(), confirmed RTC-backed and sleep-immune -- see the "t=%lld ms" fields
+# already in correctLightSleep()'s own diagnostics), so it keeps counting through sleep. Only
+# option available under this project's CONFIG_LOG_VERSION_1 that does -- LOG_VERSION_2's
+# "UNIX" (a plain non-wrapping ms counter, nicer for diffing) needs a bigger, riskier logging
+# subsystem upgrade not worth doing mid-investigation. Trade-off: SYSTEM prints HH:MM:SS.sss
+# wall-clock-style and wraps at 24h (no RTC/NTP sync here, so it's really just elapsed time
+# since boot) -- fine for the bounded captures this is being used for.
+CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y
+# end of Logging
+
+#
 # Compiler
 #
 CONFIG_COMPILER_OPTIMIZATION_PERF=y

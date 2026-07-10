@@ -79,4 +79,8 @@ private:
     /// last heater run LP reported (heartbeat_counter value at the time), so the post-hoc
     /// diagnostic log line only fires once per new run rather than every wake.
     uint32_t m_lastSeenHeaterRunCycle = 0;
+
+    /// TEMP DIAGNOSTIC (2026-07-10 instability investigation): LP's heartbeat_counter as of
+    /// the last HP wake, so each new wake can log how many real LP cycles elapsed since then.
+    uint32_t m_lastSeenHeartbeat = 0;
 };

@@ -9,6 +9,7 @@
 #include <esp_timer.h>
 #include <nvs_flash.h>
 #include <driver/gpio.h>
+#include <driver/uart.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -25,28 +26,27 @@ void correctLightSleep()
 {
     static const char *LSLEEPTAG = "light_sleep";
 
-    // TEMP DIAGNOSTIC (power-reduction Hypothesis 4 bench test): the post-wake vTaskDelay()
-    // that used to sit here is removed entirely, not just zeroed -- vTaskDelay(0) is NOT a
-    // no-op (FreeRTOS's tasks.c: "A delay time of zero just forces a reschedule", still calls
-    // portYIELD_WITHIN_API() unconditionally), so testing the real "this code doesn't exist"
-    // end state means deleting the call, not parameterizing it to 0. Its old rationale ("RF,
-    // BLE, etc. not ready") traces to a wholesale copy-paste from an unrelated prior project
-    // (commit b68eefd) -- this project has no BLE at all, and neither ESP-IDF's Sleep Modes
-    // docs, the 802.15.4/OpenThread PM-lock path (esp_openthread_sleep.c), nor the
-    // USB-Serial-JTAG console docs document any need for a fixed post-wake delay on this
-    // chip/IDF version for the wake sources this project actually arms (timer, ULP). Watch
-    // for garbled/missing console output right after a wake (would point at a real but
-    // mislabeled USB-JTAG settling need) or any new MQTT/radio failures (would mean the
-    // PM-lock analysis is incomplete) -- restore some form of delay only if either shows up.
-    // See the migration plan's "Phase 5 expanded, Hypothesis 4" section.
-
-    // Fires every wake, so this and the two lines below are ESP_LOGD (not I): a synchronous
+    // Fires every wake, so this and the line below are ESP_LOGD (not I): a synchronous
     // UART/USB-JTAG write on every single cycle is real, avoidable awake-time on an
     // otherwise-quiet path. Bump CONFIG_LOG_DEFAULT_LEVEL to see them again for debugging.
     ESP_LOGD(LSLEEPTAG, "cycle before light sleep");
 
-    /// with this code, everything doesn't wotk without connected logger
-    // uart_wait_tx_idle_polling(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
+    // Matches ESP-IDF's own official light_sleep example (examples/system/light_sleep/main/
+    // light_sleep_example_main.c) verbatim, same placement: "To make sure the complete line
+    // is printed before entering sleep mode, need to wait until UART TX FIFO is empty." Was
+    // previously commented out here with a note that it "doesn't work without connected
+    // logger" -- but this whole file was bulk copy-pasted from an unrelated prior project
+    // (commit b68eefd), so that note's origin/validity for *this* codebase is unverified, and
+    // uart_wait_tx_idle_polling() is a plain register poll (uart_hal_is_tx_idle()) with no
+    // dependency on a listener being present, unlike the USB-Serial-JTAG equivalent
+    // (usb_serial_jtag_wait_tx_done(), not used here -- it dereferences a driver object only
+    // allocated by an explicit usb_serial_jtag_driver_install(), which this project never
+    // calls, only the passive Kconfig secondary-console path, so calling it would likely
+    // crash). This only addresses the primary UART0 console (raw TX/RX pins, e.g. this
+    // project's external CP2102 adapter capture path) -- USB-Serial-JTAG's own light-sleep
+    // re-enumeration behavior is a separate, already-documented limitation (host-side, needs
+    // a cable replug or CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION, not fixable via a TX-wait call).
+    uart_wait_tx_idle_polling(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
 
     const int64_t t_before_us = esp_timer_get_time();
     esp_light_sleep_start();
@@ -68,6 +68,35 @@ void correctLightSleep()
 
     ESP_LOGD(LSLEEPTAG, "Returned from light sleep, reason: %s, t=%lld ms, slept for %lld ms",
             wakeup_reason.data(), t_after_us / 1000, (t_after_us - t_before_us) / 1000);
+
+    // Instability investigation, 2026-07-10: this delay was removed entirely (not zeroed --
+    // vTaskDelay(0) still forces a reschedule, see git history) as a bench test for whether
+    // its original comment ("RF, BLE, etc. not ready") was cargo-cult copy-paste (commit
+    // b68eefd, an unrelated prior project -- this one has no BLE, and neither ESP-IDF's docs
+    // nor esp_openthread_sleep.c's PM-lock path document any need for it). The removal
+    // reproduced a real MQTT/OpenThread failure: publish cycles firing every ~1.5-8s instead
+    // of the configured 15s backstop, OpenThread's message-buffer pool exhausting ("Failed to
+    // copy to OpenThread message: NoBufs"), detach, and a forced reboot.
+    //
+    // Retest 1: vTaskDelay(pdMS_TO_TICKS(10)) at this exact spot -- same magnitude as the
+    // historically-stable value. Did NOT fix it: same rapid sub-3s LP-driven publish burst,
+    // same connect-timeout/NoBufs/reboot chain, reproduced twice in a row with near-identical
+    // timing.
+    //
+    // Retest 2: esp_rom_delay_us(10000) at this exact spot (a ROM-level busy-wait, immune to
+    // being silently absorbed by automatic tickless-idle sleep the way vTaskDelay() can be).
+    // Also did NOT fix it -- the failure's timing became much MORE regular (a consistent
+    // ~2.18s between publishes, vs. the previous runs' irregular 1.2-2.8s) but the core
+    // problem -- publishing every ~2s instead of every 15s -- was unchanged, and it still
+    // ended in the same connect-timeout/NoBufs/reboot chain.
+    //
+    // Both retests kept the extra delay in this POST-wake position (right after
+    // esp_light_sleep_start() returns). The one build that WAS stable (extra ESP_LOGI, no
+    // delay at all here) also had a second log line in a PRE-sleep position -- right before
+    // SensorsTask::executeTask() calls this function, i.e. right before the CPU halts for
+    // sleep, not after it wakes -- which neither retest has isolated on its own. Moved there
+    // for the next test (see SensorsTask::executeTask() in sensorstask.cpp) rather than
+    // stacked here, to keep it a single-variable comparison. Root cause still not confirmed.
 }
 
 void enableRf(const bool enableRf)
