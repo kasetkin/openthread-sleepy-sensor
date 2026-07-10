@@ -8,5 +8,5 @@
     "ESP_ROM_ELF_DIR": "/opt/esp/tools/esp-rom-elfs/20241011"
   },
   "idf.flashType": "UART",
-  "idf.port": "/dev/ttyACM0"
+  "idf.port": "/dev/ttyUSB0"
 }
