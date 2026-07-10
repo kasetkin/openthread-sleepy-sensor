@@ -7,6 +7,15 @@ source /opt/esp/idf/export.sh 2>/dev/null
 # Allow git to operate in bind-mounted workspace (owned by host UID, not container UID)
 git config --global --add safe.directory '*'
 
+# udevadm is required by the ESP-IDF VS Code extension's serial port picker
+# (it shells out to `udevadm info -e` to enumerate/describe devices); the
+# base image ships libudev1 but not the udev package itself.
+if ! command -v udevadm >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y --no-install-recommends udev
+  rm -rf /var/lib/apt/lists/*
+fi
+
 # Generate env file for all bash shells:
 #   interactive terminals  → sourced via ~/.bashrc
 #   non-interactive shells → sourced via BASH_ENV (set in devcontainer.json remoteEnv)
