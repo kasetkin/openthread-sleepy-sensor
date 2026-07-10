@@ -32,6 +32,13 @@ struct SensorsTaskSettings
 class SensorsTask
 {
 public:
+    static constexpr uint32_t PUBLISH_TIMEOUT_MS = 15 * 1000;
+    // Flash-detection research suggested ~15-20ms as a safe floor, but this LED is bright
+    // enough that 5ms is still clearly visible on the actual hardware (confirmed by eye) --
+    // going shorter than the research's nominal threshold is fine given real brightness margin.
+    static constexpr uint32_t LED_BLINK_MS       = 5;
+
+
     SensorsTask(SensorsTaskSettings settings);
     SensorsTask(const SensorsTask &) = delete;
     SensorsTask &operator=(const SensorsTask &) = delete;

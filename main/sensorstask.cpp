@@ -95,9 +95,6 @@ void SensorsTask::executeTask()
 {
     static const char * TAG = "sensors-task";
 
-    static constexpr uint32_t PUBLISH_TIMEOUT_MS = 15 * 1000;
-    static constexpr uint32_t LED_BLINK_MS       = 50;
-
     // This task is the sole driver of the HP backstop cadence: arm the wakeup timer once,
     // then wake → read LP's state → publish (if flagged) → wait-for-idle → light-sleep on
     // every iteration. The LP core (components/lp_sensor_core) can also wake HP early via
@@ -173,7 +170,10 @@ void SensorsTask::executeTask()
                     ESP_LOGW(TAG, "mqtt is not working? not sure");
                 }
             } else {
-                ESP_LOGI(TAG, "LP has nothing new to report this wake");
+                // Fires on the majority of wakes in steady state -- ESP_LOGD, not I (see
+                // correctLightSleep()'s comment on why per-cycle logging costs real awake
+                // time). Bump CONFIG_LOG_DEFAULT_LEVEL to see it again for debugging.
+                ESP_LOGD(TAG, "LP has nothing new to report this wake");
             }
         }
 
@@ -182,13 +182,14 @@ void SensorsTask::executeTask()
         // Not attaching at all is never healthy, even if LP would have had nothing new to say.
         const bool cycleOk = publishedOk || (attached && !shouldWake);
 
-        // Honest local indicator: 1 blink = data reached the broker, 2 = LP had nothing new,
-        // 5 = should have published but didn't.
+        // Honest local indicator: 1 blink = data reached the broker, 5 = should have
+        // published but didn't. No LED at all for "LP had nothing new" -- that's the most
+        // common steady-state case (especially with a lengthened backstop) and isn't worth
+        // forced-awake LED time for an unattended deployed sensor; the serial log line above
+        // still covers it for bench debugging.
         if (publishedOk) {
             blinkUserLED(LED_BLINK_MS);
-        } else if (cycleOk) {
-            blinkUserLED(LED_BLINK_MS, 2);
-        } else {
+        } else if (!cycleOk) {
             ESP_LOGW(TAG, "data was not published to the broker this cycle (but should be)");
             blinkUserLED(LED_BLINK_MS, 5);
         }
@@ -210,7 +211,7 @@ void SensorsTask::executeTask()
             }
         }
 
-        ESP_LOGI(TAG, "sensor values ready, go to sleep");
+        ESP_LOGD(TAG, "sensor values ready, go to sleep");
         correctLightSleep();  // light-sleep until the backstop timer or an LP-triggered ULP wake
     }
 }

@@ -25,12 +25,25 @@ void correctLightSleep()
 {
     static const char *LSLEEPTAG = "light_sleep";
 
-    /// without this not all systems (RF, BLE, etc.) are ready right after wakeup
-    /// not sure why,
-    //! \todo check documentation and remove if possible 
-    static const uint32_t AFTER_WAKEUP_SLEEP = 10; //ms
+    // TEMP DIAGNOSTIC (power-reduction Hypothesis 4 bench test): the post-wake vTaskDelay()
+    // that used to sit here is removed entirely, not just zeroed -- vTaskDelay(0) is NOT a
+    // no-op (FreeRTOS's tasks.c: "A delay time of zero just forces a reschedule", still calls
+    // portYIELD_WITHIN_API() unconditionally), so testing the real "this code doesn't exist"
+    // end state means deleting the call, not parameterizing it to 0. Its old rationale ("RF,
+    // BLE, etc. not ready") traces to a wholesale copy-paste from an unrelated prior project
+    // (commit b68eefd) -- this project has no BLE at all, and neither ESP-IDF's Sleep Modes
+    // docs, the 802.15.4/OpenThread PM-lock path (esp_openthread_sleep.c), nor the
+    // USB-Serial-JTAG console docs document any need for a fixed post-wake delay on this
+    // chip/IDF version for the wake sources this project actually arms (timer, ULP). Watch
+    // for garbled/missing console output right after a wake (would point at a real but
+    // mislabeled USB-JTAG settling need) or any new MQTT/radio failures (would mean the
+    // PM-lock analysis is incomplete) -- restore some form of delay only if either shows up.
+    // See the migration plan's "Phase 5 expanded, Hypothesis 4" section.
 
-    ESP_LOGI(LSLEEPTAG, "cycle before light sleep");
+    // Fires every wake, so this and the two lines below are ESP_LOGD (not I): a synchronous
+    // UART/USB-JTAG write on every single cycle is real, avoidable awake-time on an
+    // otherwise-quiet path. Bump CONFIG_LOG_DEFAULT_LEVEL to see them again for debugging.
+    ESP_LOGD(LSLEEPTAG, "cycle before light sleep");
 
     /// with this code, everything doesn't wotk without connected logger
     // uart_wait_tx_idle_polling(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
@@ -53,11 +66,8 @@ void correctLightSleep()
     else
         wakeup_reason = "other";
 
-    ESP_LOGI(LSLEEPTAG, "Returned from light sleep, reason: %s, t=%lld ms, slept for %lld ms",
+    ESP_LOGD(LSLEEPTAG, "Returned from light sleep, reason: %s, t=%lld ms, slept for %lld ms",
             wakeup_reason.data(), t_after_us / 1000, (t_after_us - t_before_us) / 1000);
-
-    ESP_LOGI(LSLEEPTAG, "cycle right after wakeup, sleep for %d msec", AFTER_WAKEUP_SLEEP);
-    vTaskDelay(pdMS_TO_TICKS(AFTER_WAKEUP_SLEEP));
 }
 
 void enableRf(const bool enableRf)
@@ -96,13 +106,22 @@ void enableExtAntenna(const bool enableExtAnt)
 
 void enableUserLED(const bool enableLED)
 {
-    static const char *LEDTAG = "gpio-ANT";
-    const gpio_num_t EXT_LED_GPIO = GPIO_NUM_15;
-    const uint32_t LED_ON_LEVEL = 0;
-    const uint32_t LED_OFF_LEVEL = (LED_ON_LEVEL + 1) % 2;
+    static const char *LEDTAG = "gpio-LED";
+    static const gpio_num_t EXT_LED_GPIO = GPIO_NUM_15;
+    static const uint32_t LED_ON_LEVEL = 0;
+    static const uint32_t LED_OFF_LEVEL = (LED_ON_LEVEL + 1) % 2;
+
+    // Configure the pin once on first use rather than on every toggle -- this is called
+    // twice per blink (on, then off), and gpio_reset_pin()/gpio_set_direction() only need
+    // to run once.
+    static bool configured = false;
+    if (!configured) {
+        gpio_reset_pin(EXT_LED_GPIO);
+        gpio_set_direction(EXT_LED_GPIO, GPIO_MODE_OUTPUT);
+        configured = true;
+    }
+
     const uint32_t led_flag = enableLED ? LED_ON_LEVEL : LED_OFF_LEVEL;
-    gpio_reset_pin(EXT_LED_GPIO);
-    gpio_set_direction(EXT_LED_GPIO, GPIO_MODE_OUTPUT);
     const esp_err_t ledEnableErr = gpio_set_level(EXT_LED_GPIO, led_flag);
     if (ledEnableErr != ESP_OK)
         ESP_LOGE(LEDTAG, "gpio_set_level error for GPIO_NUM_15 and level %d, error %d", led_flag, ledEnableErr);
@@ -116,6 +135,10 @@ void blinkUserLED(const uint32_t onMs, size_t count)
         enableUserLED(true);
         vTaskDelay(pdMS_TO_TICKS(onMs));
         enableUserLED(false);
+        // Off-gap between successive blinks (not after the last one) so a multi-blink
+        // pattern stays visually countable as separate pulses once onMs is short.
+        if (i + 1 < count)
+            vTaskDelay(pdMS_TO_TICKS(onMs));
     }
 }
 
