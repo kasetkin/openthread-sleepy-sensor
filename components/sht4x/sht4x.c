@@ -42,7 +42,7 @@
 #include <esp_timer.h>
 #include "sht4x.h"
 
-#define I2C_FREQ_HZ 1000000 // 1MHz
+#define I2C_FREQ_HZ 100000 // TEMP DIAGNOSTIC: was 1000000 (1MHz) — testing whether marginal pull-ups on the new GPIO6/7 wiring need slower (100kHz) timing
 
 // due to the fact that ticks can be smaller than portTICK_PERIOD_MS, one and
 // a half tick period added to the duration to be sure that waiting time for
@@ -177,13 +177,29 @@ static esp_err_t read_res(sht4x_t *dev, sht4x_raw_data_t res)
 
 static esp_err_t exec_cmd(sht4x_t *dev, uint8_t cmd, size_t delay_ticks, sht4x_raw_data_t res)
 {
-    I2C_DEV_TAKE_MUTEX(&dev->i2c_dev);
-    I2C_DEV_CHECK(&dev->i2c_dev, send_cmd_nolock(dev, cmd));
-    vTaskDelay(delay_ticks + 1);
-    I2C_DEV_CHECK(&dev->i2c_dev, read_res_nolock(dev, res));
-    I2C_DEV_GIVE_MUTEX(&dev->i2c_dev);
+    esp_err_t err = i2c_dev_take_mutex(&dev->i2c_dev);
+    if (err != ESP_OK)
+        return err;
 
-    return ESP_OK;
+    // Held across the whole write -> conversion-wait -> read sequence: without it, automatic
+    // light sleep can power-gate the I2C peripheral during the vTaskDelay() below, and the
+    // sensor NACKs the subsequent read (ESP_ERR_INVALID_RESPONSE). Single-exit so the lock is
+    // always released, unlike the I2C_DEV_CHECK/_TAKE_/_GIVE_MUTEX macros used elsewhere, which
+    // early-return on error.
+    if (dev->pm_lock)
+        esp_pm_lock_acquire(dev->pm_lock);
+
+    err = send_cmd_nolock(dev, cmd);
+    if (err == ESP_OK) {
+        vTaskDelay(delay_ticks + 1);
+        err = read_res_nolock(dev, res);
+    }
+
+    if (dev->pm_lock)
+        esp_pm_lock_release(dev->pm_lock);
+    i2c_dev_give_mutex(&dev->i2c_dev);
+
+    return err;
 }
 
 static inline bool is_measuring(sht4x_t *dev)
@@ -211,12 +227,26 @@ esp_err_t sht4x_init_desc(sht4x_t *dev, i2c_port_t port, gpio_num_t sda_gpio, gp
     dev->i2c_dev.cfg.master.clk_speed = I2C_FREQ_HZ;
 #endif
 
-    return i2c_dev_create_mutex(&dev->i2c_dev);
+    CHECK(i2c_dev_create_mutex(&dev->i2c_dev));
+
+    // Non-fatal if this fails (e.g. CONFIG_PM_ENABLE not set) — exec_cmd() skips the
+    // acquire/release when dev->pm_lock is NULL, just without the light-sleep race protection.
+    dev->pm_lock = NULL;
+    const esp_err_t pm_err = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "sht4x_i2c", &dev->pm_lock);
+    if (pm_err != ESP_OK)
+        ESP_LOGW(TAG, "esp_pm_lock_create() failed: %d — measurements unprotected from light sleep", pm_err);
+
+    return ESP_OK;
 }
 
 esp_err_t sht4x_free_desc(sht4x_t *dev)
 {
     CHECK_ARG(dev);
+
+    if (dev->pm_lock) {
+        esp_pm_lock_delete(dev->pm_lock);
+        dev->pm_lock = NULL;
+    }
 
     return i2c_dev_delete_mutex(&dev->i2c_dev);
 }

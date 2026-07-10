@@ -1143,31 +1143,6 @@ CONFIG_COMPILER_CXX_GLIBCXX_CONSTEXPR_NO_CHANGE=y
 # end of Console Library
 
 #
-# Legacy Driver Configurations
-#
-
-#
-# Legacy TWAI Driver Configurations
-#
-# default:
-# CONFIG_TWAI_ISR_IN_IRAM_LEGACY is not set
-# default:
-# CONFIG_TWAI_SUPPRESS_DEPRECATE_WARN is not set
-# default:
-# CONFIG_TWAI_SKIP_LEGACY_CONFLICT_CHECK is not set
-# end of Legacy TWAI Driver Configurations
-
-#
-# Legacy I2C Driver Configurations
-#
-# default:
-# CONFIG_I2C_SUPPRESS_DEPRECATE_WARN is not set
-# default:
-# CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK is not set
-# end of Legacy I2C Driver Configurations
-# end of Legacy Driver Configurations
-
-#
 # eFuse Bit Manager
 #
 # default:
@@ -1204,6 +1179,17 @@ CONFIG_ESP_TLS_USE_DS_PERIPHERAL=y
 # default:
 CONFIG_ESP_TLS_DYN_BUF_STRATEGY_SUPPORTED=y
 # end of ESP-TLS
+
+#
+# ADC and ADC Calibration
+#
+# default:
+# CONFIG_ADC_ONESHOT_CTRL_FUNC_IN_IRAM is not set
+# default:
+# CONFIG_ADC_CONTINUOUS_ISR_IRAM_SAFE is not set
+# default:
+# CONFIG_ADC_ENABLE_DEBUG_LOG is not set
+# end of ADC and ADC Calibration
 
 #
 # Wireless Coexistence
@@ -1246,15 +1232,15 @@ CONFIG_GDMA_OBJ_DRAM_SAFE=y
 # end of ESP-Driver:GPIO Configurations
 
 #
-# ESP-Driver:I2C Configurations
+# ESP-Driver:I2S Configurations
 #
 # default:
-# CONFIG_I2C_ISR_IRAM_SAFE is not set
+# CONFIG_I2S_ISR_IRAM_SAFE is not set
 # default:
-# CONFIG_I2C_ENABLE_DEBUG_LOG is not set
+# CONFIG_I2S_CTRL_FUNC_IN_IRAM is not set
 # default:
-CONFIG_I2C_MASTER_ISR_HANDLER_IN_IRAM=y
-# end of ESP-Driver:I2C Configurations
+# CONFIG_I2S_ENABLE_DEBUG_LOG is not set
+# end of ESP-Driver:I2S Configurations
 
 #
 # ESP-Driver:SPI Configurations
@@ -1266,15 +1252,6 @@ CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 # default:
 CONFIG_SPI_SLAVE_ISR_IN_IRAM=y
 # end of ESP-Driver:SPI Configurations
-
-#
-# ESP-Driver:Temperature Sensor Configurations
-#
-# default:
-# CONFIG_TEMP_SENSOR_ENABLE_DEBUG_LOG is not set
-# default:
-# CONFIG_TEMP_SENSOR_ISR_IRAM_SAFE is not set
-# end of ESP-Driver:Temperature Sensor Configurations
 
 #
 # ESP-Driver:UART Configurations
@@ -1299,7 +1276,8 @@ CONFIG_SPI_SLAVE_ISR_IN_IRAM=y
 #
 # default:
 CONFIG_USJ_ENABLE_USB_SERIAL_JTAG=y
-CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
+# default:
+# CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION is not set
 # end of ESP-Driver:USB Serial/JTAG Configuration
 
 #
@@ -2529,8 +2507,6 @@ CONFIG_LWIP_HOOK_NETCONN_EXT_RESOLVE_NONE=y
 # default:
 # CONFIG_LWIP_HOOK_NETCONN_EXT_RESOLVE_CUSTOM is not set
 # default:
-CONFIG_LWIP_HOOK_DNS_EXTERNAL_RESOLVE_SELECT_CUSTOM=y
-# default:
 CONFIG_LWIP_HOOK_DNS_EXT_RESOLVE_NONE=y
 # default:
 # CONFIG_LWIP_HOOK_DNS_EXT_RESOLVE_CUSTOM is not set
@@ -3031,15 +3007,7 @@ CONFIG_OPENTHREAD_SRP_CLIENT_MAX_SERVICES=5
 
 # default:
 CONFIG_OPENTHREAD_DNS_CLIENT=y
-CONFIG_OPENTHREAD_DNS64_CLIENT=y
-
-#
-# DNS64 Client Configurations
-#
-# default:
-CONFIG_OPENTHREAD_DNS_SERVER_ADDR="8.8.8.8"
-# end of DNS64 Client Configurations
-
+# CONFIG_OPENTHREAD_DNS64_CLIENT is not set
 # default:
 # CONFIG_OPENTHREAD_TIMING_OPTIMIZATION is not set
 # default:
@@ -3282,6 +3250,29 @@ CONFIG_WS_BUFFER_SIZE=1024
 # CONFIG_WS_DYNAMIC_BUFFER is not set
 # end of Websocket
 # end of TCP Transport
+
+#
+# Ultra Low Power (ULP) Co-processor
+#
+CONFIG_ULP_COPROC_ENABLED=y
+CONFIG_ULP_COPROC_TYPE_LP_CORE=y
+CONFIG_ULP_COPROC_RESERVE_MEM=8192
+# default:
+CONFIG_ULP_SHARED_MEM=0x10
+# default:
+CONFIG_ULP_TRAP_WAKEUP=y
+
+#
+# ULP Debugging Options
+#
+# default:
+# CONFIG_ULP_PANIC_OUTPUT_ENABLE is not set
+# default:
+# CONFIG_ULP_HP_UART_CONSOLE_PRINT is not set
+# default:
+CONFIG_ULP_NORESET_UNDER_DEBUG=y
+# end of ULP Debugging Options
+# end of Ultra Low Power (ULP) Co-processor
 
 #
 # Virtual file system

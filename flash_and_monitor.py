@@ -52,12 +52,16 @@ def flash(build_dir: str, port: str, baud: int) -> bool:
         return False
     # Mirror idf.py's esptool invocation; flash mode/size/freq + offsets come from @flash_args.
     # (This esptool build uses underscore action names: default_reset / hard_reset / write_flash.)
+    # --before usb-reset (not default_reset): this board's native USB-Serial-JTAG doesn't
+    # support the DTR/RTS-based default_reset strategy reliably here -- it consistently fails
+    # with "OSError: [Errno 71] Protocol error" from the TIOCMBIC ioctl, while usb-reset (which
+    # uses USB control transfers instead of DTR/RTS) has worked every time.
     cmd = [
         sys.executable, "-m", "esptool",
         "--chip", "esp32c6",
         "-b", str(baud),
         "-p", port,
-        "--before", "default_reset",
+        "--before", "usb-reset",
         "--after", "hard_reset",
         "write_flash",
         "@flash_args",

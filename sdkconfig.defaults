@@ -12,7 +12,18 @@ CONFIG_MBEDTLS_ECJPAKE_C=y
 CONFIG_OPENTHREAD_ENABLED=y
 CONFIG_OPENTHREAD_BORDER_ROUTER=n
 CONFIG_OPENTHREAD_MTD=y
-CONFIG_OPENTHREAD_DNS64_CLIENT=y
+# Deliberately OFF. This project never resolves hostnames -- MqttConfig::broker_address is
+# always a literal IPv4/IPv6 address, and NAT64 synthesis is done manually in
+# openthread_link.cpp (otNetDataGetNextRoute()), not via this feature. Enabling it selects
+# lwIP's custom DNS-external-resolve hook (esp_openthread_dns64.c), which intercepts EVERY
+# getaddrinfo() call on the OT netif and forces a recursive IPv4-only sub-lookup -- even for
+# an input that's already a literal IPv6 address. That sub-lookup's own type-mismatch check
+# rejects the literal-address fast path and falls through to a real DNS query for a string
+# that isn't a hostname, failing with EAI_FAIL (esp-tls: "getaddrinfo() returns 202"). Broke
+# every MQTT connect (NAT64-synthesized AND plain IPv6 broker addresses alike) once a
+# CMakeLists.txt-triggered reconfigure finally applied this long-dormant default -- see the
+# migration plan/memory for the full diagnosis.
+CONFIG_OPENTHREAD_DNS64_CLIENT=n
 CONFIG_OPENTHREAD_CLI=y
 CONFIG_OPENTHREAD_TASK_SIZE=4096
 CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
@@ -57,6 +68,14 @@ CONFIG_ESP_MODEM_CLOCK_ENABLE_CHECKING=y
 #
 CONFIG_ESP_PHY_MAC_BB_PD=y
 # end of Sleep Config
+
+#
+# ULP / LP core (sensor read offload — see lp_sensor_core component)
+#
+CONFIG_ULP_COPROC_ENABLED=y
+CONFIG_ULP_COPROC_TYPE_LP_CORE=y
+CONFIG_ULP_COPROC_RESERVE_MEM=8192
+# end of ULP / LP core
 
 #
 # ESP System Settings

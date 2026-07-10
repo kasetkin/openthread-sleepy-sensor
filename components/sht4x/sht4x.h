@@ -42,6 +42,7 @@
 #include <stdbool.h>
 #include <i2cdev.h>
 #include <esp_err.h>
+#include <esp_pm.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -91,6 +92,11 @@ typedef struct
 
     bool meas_started;            //!< indicates whether measurement started
     uint64_t meas_start_time;     //!< measurement start time in us
+
+    //!< held across the write-command -> conversion-wait -> read sequence so automatic light
+    //!< sleep can't power-gate the I2C peripheral mid-conversion and make the sensor NACK the
+    //!< read; NULL if esp_pm_lock_create() failed (e.g. CONFIG_PM_ENABLE not set)
+    esp_pm_lock_handle_t pm_lock;
 } sht4x_t;
 
 /**

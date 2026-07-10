@@ -25,6 +25,8 @@
 
 #include "network_link.h"
 
+#include "lp_sensor_core.h"
+
 static const char *TAG = "main-body";
 constexpr uint32_t DEFAULT_TASK_STACK_SIZE = 16384;
 
@@ -182,25 +184,18 @@ extern "C" void app_main(void)
     }, &s_link);
 
     // ── sensors ───────────────────────────────────────────────────────────────
+    // The LP core (components/lp_sensor_core) owns the sensor entirely: I2C, calibration,
+    // the skip-threshold publish decision, and heater maintenance. HP never touches the
+    // sensor bus -- see the migration plan. sensors_task's own cycle_duration_sec is now
+    // just a backstop ceiling, not the primary cadence.
     const SensorsTaskSettings sSettings {
-        .rh_offset = parse_as_float(calibration_txt(), "rh_offset"),
-        .rh_min_change = parse_as_float(calibration_txt(), "rh_min_change"),
-        .temp_offset = parse_as_float(calibration_txt(), "temp_offset"),
-        .temp_min_change = parse_as_float(calibration_txt(), "temp_min_change"),
-        .max_skip_cycles = parse_as_uint32(calibration_txt(), "max_skip_cycles"),
         .cycle_duration_sec = parse_as_uint32(calibration_txt(), "cycle_duration_sec")
     };
 
-    ESP_LOGI("main", "sensor settings: TODO");
+    ESP_LOGI("main", "sensor settings: cycle_duration_sec=%lu",
+             static_cast<unsigned long>(sSettings.cycle_duration_sec));
 
-    ESP_LOGI(TAG, "create sensors task");
     sensorTask = std::make_shared<SensorsTask>(sSettings);
-
-    ret = sensorTask->init();
-    if (ret != ESP_OK) {
-        startErrorTask(ErrorTask::ErrorCode::ecSensorsFail);
-        return;
-    }
 
     sensorTask->configureReadyEvent([](const SensorsValues &values) static
     {
@@ -221,6 +216,33 @@ extern "C" void app_main(void)
 
     // Attachment is awaited per-cycle inside the sensor task via the gate configured above,
     // so it also covers later re-attachment.
+
+    // ── LP core sensor ownership ─────────────────────────────────────────────
+    const lp_sensor_core_config_t lpConfig {
+        .temp_offset_c = parse_as_float(calibration_txt(), "temp_offset"),
+        .temp_min_change_c = parse_as_float(calibration_txt(), "temp_min_change"),
+        .rh_offset_pct = parse_as_float(calibration_txt(), "rh_offset"),
+        .rh_min_change_pct = parse_as_float(calibration_txt(), "rh_min_change"),
+        .max_skip_cycles = parse_as_uint32(calibration_txt(), "max_skip_cycles"),
+    };
+    const uint32_t lpPollIntervalSec = parse_as_uint32(calibration_txt(), "lp_poll_interval_sec");
+    ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, temp_offset=%.2f temp_min_change=%.2f "
+                  "rh_offset=%.2f rh_min_change=%.2f max_skip_cycles=%lu",
+             static_cast<unsigned long>(lpPollIntervalSec),
+             static_cast<double>(lpConfig.temp_offset_c), static_cast<double>(lpConfig.temp_min_change_c),
+             static_cast<double>(lpConfig.rh_offset_pct), static_cast<double>(lpConfig.rh_min_change_pct),
+             static_cast<unsigned long>(lpConfig.max_skip_cycles));
+
+    if (const esp_err_t lpInitErr = lp_sensor_core_init(&lpConfig); lpInitErr != ESP_OK) {
+        ESP_LOGE(TAG, "lp_sensor_core_init failed: %d", lpInitErr);
+        startErrorTask(ErrorTask::ErrorCode::ecSensorsFail);
+        return;
+    }
+    if (const esp_err_t lpStartErr = lp_sensor_core_start(lpPollIntervalSec * 1'000'000u); lpStartErr != ESP_OK) {
+        ESP_LOGE(TAG, "lp_sensor_core_start failed: %d", lpStartErr);
+        startErrorTask(ErrorTask::ErrorCode::ecSensorsFail);
+        return;
+    }
 
     xTaskCreate([](void *) static
     {

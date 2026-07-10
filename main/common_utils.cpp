@@ -43,6 +43,8 @@ void correctLightSleep()
     if (const uint32_t wakeupCauses = esp_sleep_get_wakeup_causes();
         wakeupCauses & BIT(ESP_SLEEP_WAKEUP_TIMER))
         wakeup_reason = "timer";
+    else if (wakeupCauses & BIT(ESP_SLEEP_WAKEUP_ULP))
+        wakeup_reason = "ulp";
     else if (wakeupCauses & BIT(ESP_SLEEP_WAKEUP_GPIO))
         wakeup_reason = "pin";
     else if (wakeupCauses & BIT(ESP_SLEEP_WAKEUP_UART))
