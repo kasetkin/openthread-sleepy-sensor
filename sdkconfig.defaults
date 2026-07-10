@@ -56,6 +56,11 @@ CONFIG_IEEE802154_ENABLED=y
 #
 CONFIG_PM_ENABLE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+# Lets the app hook automatic light-sleep exit (esp_pm_light_sleep_register_cbs(), see
+# lp_sensor_core.c) to detect an LP-core-triggered ULP wakeup and signal SensorsTask early --
+# needed once sleep entry is left entirely to the automatic PM-lock-gated path (no more manual
+# esp_light_sleep_start() call to observe the wakeup cause synchronously).
+CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
 CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP=y
 CONFIG_IEEE802154_SLEEP_ENABLE=y
 CONFIG_FREERTOS_HZ=1000

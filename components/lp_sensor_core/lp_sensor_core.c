@@ -3,6 +3,9 @@
 
 #include <esp_log.h>
 #include <esp_sleep.h>
+#include <esp_pm.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/event_groups.h>
 #include "ulp_lp_core.h"
 #include "lp_core_i2c.h"
 
@@ -14,6 +17,25 @@ static const char *TAG = "lp_sensor_core";
 
 extern const uint8_t lp_core_lp_sensor_core_bin_start[] asm("_binary_lp_core_lp_sensor_core_bin_start");
 extern const uint8_t lp_core_lp_sensor_core_bin_end[]   asm("_binary_lp_core_lp_sensor_core_bin_end");
+
+// Set (from the light-sleep exit callback below) when a light sleep was ended by the LP
+// core's ULP wakeup source, so lp_sensor_core_wait_for_wake() can return early instead of
+// waiting out its full timeout.
+static const EventBits_t BIT_EARLY_WAKE = BIT0;
+static EventGroupHandle_t s_wake_eg = NULL;
+
+// Runs from IDLE task context after every automatic light-sleep attempt (CONFIG_PM_
+// LIGHT_SLEEP_CALLBACKS) -- see esp_pm_light_sleep_register_cbs()'s doc comment: no blocking
+// calls allowed here, hence the ISR-safe (deferred, non-blocking) set-bits call even though
+// this isn't a genuine ISR.
+static esp_err_t on_light_sleep_exit(int64_t sleep_time_us, void *arg)
+{
+    (void)sleep_time_us;
+    (void)arg;
+    if (esp_sleep_get_wakeup_causes() & BIT(ESP_SLEEP_WAKEUP_ULP))
+        xEventGroupSetBitsFromISR(s_wake_eg, BIT_EARLY_WAKE, NULL);
+    return ESP_OK;
+}
 
 esp_err_t lp_sensor_core_init(const lp_sensor_core_config_t *config)
 {
@@ -48,7 +70,28 @@ esp_err_t lp_sensor_core_init(const lp_sensor_core_config_t *config)
     shared->rh_min_change_pct = config->rh_min_change_pct;
     shared->max_skip_cycles = config->max_skip_cycles;
 
-    return esp_sleep_enable_ulp_wakeup();
+    const esp_err_t wakeup_err = esp_sleep_enable_ulp_wakeup();
+    if (wakeup_err != ESP_OK)
+        return wakeup_err;
+
+    // Backs lp_sensor_core_wait_for_wake() -- see on_light_sleep_exit() above. Requires
+    // CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y (sdkconfig.defaults).
+    s_wake_eg = xEventGroupCreate();
+    if (!s_wake_eg) {
+        ESP_LOGE(TAG, "xEventGroupCreate failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_pm_sleep_cbs_register_config_t cbs_conf = {
+        .exit_cb = on_light_sleep_exit,
+    };
+    const esp_err_t cb_err = esp_pm_light_sleep_register_cbs(&cbs_conf);
+    if (cb_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_pm_light_sleep_register_cbs failed: %d", cb_err);
+        return cb_err;
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t lp_sensor_core_start(uint32_t poll_interval_us)
@@ -92,4 +135,14 @@ void lp_sensor_core_ack_delivered(float temp_c, float hum_pct)
     shared->hp_acked_temp_c = temp_c;
     shared->hp_acked_hum_pct = hum_pct;
     shared->hp_ack_seq = shared->hp_ack_seq + 1;
+}
+
+bool lp_sensor_core_wait_for_wake(uint32_t timeout_ms)
+{
+    if (!s_wake_eg)
+        return false;  // lp_sensor_core_init() hasn't run (or failed) -- nothing to wait on
+
+    const EventBits_t bits = xEventGroupWaitBits(
+        s_wake_eg, BIT_EARLY_WAKE, pdTRUE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+    return (bits & BIT_EARLY_WAKE) != 0;
 }

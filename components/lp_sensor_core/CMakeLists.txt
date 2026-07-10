@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "lp_sensor_core.c"
     INCLUDE_DIRS "include"
-    REQUIRES ulp esp_hw_support
+    REQUIRES ulp esp_hw_support esp_pm freertos
 )
 
 # --- ULP LP-core sub-build (see ESP-IDF's examples/system/ulp/lp_core/lp_i2c for the

@@ -87,6 +87,11 @@ extern "C" void app_main(void)
     enableRf(true);
     enableExtAntenna(false);
 
+    // Must run before the network link starts (esp_openthread_start()/esp_wifi_start()):
+    // OpenThread's own radio-state PM lock (esp_openthread_sleep_init(), see esp_openthread
+    // component) only gates sleep through this automatic path.
+    ESP_ERROR_CHECK(enableAutomaticLightSleep());
+
     // ── parse secrets ─────────────────────────────────────────────────────────
     const std::string_view yaml = secrets_yaml();
     ESP_LOGI("main", "secrets.yaml embedded size: %d bytes", static_cast<int>(yaml.size()));
@@ -252,7 +257,9 @@ extern "C" void app_main(void)
 
     startErrorTask(ErrorTask::ErrorCode::ecOK);
 
-    // sensors_task is now the sole driver of the read→publish→wait→light-sleep cadence
-    // (it arms the wakeup timer and calls correctLightSleep itself). app_main has nothing
-    // left to do; returning is fine — the FreeRTOS scheduler keeps the other tasks running.
+    // sensors_task is now the sole driver of the read→publish→wait cadence (it blocks via
+    // lp_sensor_core_wait_for_wake() between cycles). Light sleep itself is fully automatic
+    // (see enableAutomaticLightSleep() above) — nothing has to call esp_light_sleep_start().
+    // app_main has nothing left to do; returning is fine — the FreeRTOS scheduler keeps the
+    // other tasks running.
 }

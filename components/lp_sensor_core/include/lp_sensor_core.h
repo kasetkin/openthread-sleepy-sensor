@@ -1,6 +1,7 @@
 #pragma once
 
 #include <esp_err.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "shared_layout.h"
@@ -41,6 +42,16 @@ void lp_sensor_core_get_state(lp_shared_state_t *out);
 // what lets a failed publish keep the value flagged for retry instead of being silently
 // dropped. Safe to call from any HP-side task at any time.
 void lp_sensor_core_ack_delivered(float temp_c, float hum_pct);
+
+// Blocks the calling task (intended: SensorsTask, once per cycle) until either the LP core
+// signals should_wake_hp via ulp_lp_core_wakeup_main_processor() (see lp_core/main.cpp), or
+// timeout_ms elapses. Does NOT itself trigger any sleep -- the caller is expected to have
+// nothing else to do while blocked, which is exactly what lets ESP-IDF's automatic tickless-
+// idle light sleep engage underneath this wait (see enableAutomaticLightSleep(),
+// main/common_utils.cpp). Returns true if woken early by LP, false on timeout. Requires
+// lp_sensor_core_init() to have run first (it registers the light-sleep exit callback that
+// detects the ULP wakeup cause and signals this wait).
+bool lp_sensor_core_wait_for_wake(uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

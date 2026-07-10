@@ -11,13 +11,16 @@ void enableUserLED(const bool enableLED);
 /// brief diagnostic flash: LED on for `onMs`, then off. Negligible power vs a held LED.
 void blinkUserLED(const uint32_t onMs, size_t count = 1);
 
-/// configure wakeup timer
-[[nodiscard("device won't wake on timer if unchecked")]]
-esp_err_t registerWakeupTimer(const uint64_t wakeupMicrosec);
-esp_err_t registerWakeupTimer(int) = delete("duration must be uint32_t microseconds — negative values silently wrap to enormous sleep");
-
-/// sleep for wakeupMicrosec from above + ?10ms? using esp_light_sleep
-void correctLightSleep();
+/// Enables ESP-IDF's automatic, PM-lock-gated light sleep (esp_pm_configure() with
+/// light_sleep_enable=true). Call once at boot, before starting OpenThread/Wi-Fi — mirrors
+/// ESP-IDF's own ot_sleepy_device/light_sleep example. max==min keeps CPU pinned at
+/// CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ (DFS doesn't help a radio-bound sleepy end device) while
+/// still enabling the light-sleep gate. No app code needs to call esp_light_sleep_start()
+/// itself afterward — FreeRTOS's tickless-idle idle task enters light sleep automatically
+/// whenever no task is ready and no esp_pm lock (e.g. OpenThread's own radio-state lock, see
+/// esp_openthread_sleep.c) is held.
+[[nodiscard("light sleep silently stays disabled if the configure call is ignored")]]
+esp_err_t enableAutomaticLightSleep();
 
 [[nodiscard("NVS unavailable if init failure ignored")]]
 esp_err_t initNvsFlash();
