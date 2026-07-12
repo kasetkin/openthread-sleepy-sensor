@@ -2,6 +2,8 @@
 
 #include <string>
 #include <string_view>
+#include <optional>
+#include <charconv>
 #include "openthread/dataset.h"
 
 // Linker-generated symbols — file-private; callers use secrets_yaml() only.
@@ -45,23 +47,32 @@ inline std::string yaml_get_string(std::string_view content, std::string_view ke
     }
 }
 
-inline float parse_as_float(std::string_view content, std::string_view key)
+// nullopt if `key` is missing from `content` or its value fails to parse -- distinguishable
+// from a legitimately-configured 0, so a renamed/typo'd/dropped key in a hand-edited
+// calibration.txt doesn't silently masquerade as an intentional zero (see call sites in
+// main.cpp, which log a warning and substitute an explicit default on nullopt).
+inline std::optional<float> parse_as_float(std::string_view content, std::string_view key)
 {
     const std::string s = yaml_get_string(content, key);
+    if (s.empty())
+        return std::nullopt;
     float value = 0.0f;
-    if (!s.empty())
-        std::from_chars(s.data(), s.data() + s.size(), value);
-
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return std::nullopt;
     return value;
 }
 
-inline uint32_t parse_as_uint32(std::string_view content, std::string_view key)
+// See parse_as_float()'s comment -- same missing/malformed-vs-legitimate-zero distinction.
+inline std::optional<uint32_t> parse_as_uint32(std::string_view content, std::string_view key)
 {
     const std::string s = yaml_get_string(content, key);
+    if (s.empty())
+        return std::nullopt;
     uint32_t value = 0;
-    if (!s.empty())
-        std::from_chars(s.data(), s.data() + s.size(), value);
-
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return std::nullopt;
     return value;
 }
 
