@@ -1,9 +1,13 @@
 #include "mqtt_sender.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <format>
+#include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
@@ -52,10 +56,28 @@ static std::string wrap_pem_certificate(std::string_view base64_body)
     return std::format("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", base64_body);
 }
 
+// ── RAII wrappers for the per-cycle FreeRTOS/esp-mqtt handles ─────────────────
+// Both are owned exclusively by run_publish_cycle() below and freed via these deleters on
+// every return path (success or early-abort) — see run_publish_cycle()'s doc comment for why
+// that function, and not mqtt_publish_task() itself, is where these must live.
+using EventGroupPtr = std::unique_ptr<std::remove_pointer_t<EventGroupHandle_t>, decltype(&vEventGroupDelete)>;
+
+struct MqttClientDeleter
+{
+    void operator()(esp_mqtt_client_handle_t client) const noexcept
+    {
+        if (!client)
+            return;
+        esp_mqtt_client_stop(client);
+        esp_mqtt_client_destroy(client);
+    }
+};
+using MqttClientPtr = std::unique_ptr<std::remove_pointer_t<esp_mqtt_client_handle_t>, MqttClientDeleter>;
+
 // ── context shared between the publish task and the event handler ─────────────
 struct MqttCtx
 {
-    EventGroupHandle_t eg;
+    EventGroupHandle_t eg;  // borrowed from run_publish_cycle()'s EventGroupPtr; never owned here
     std::atomic<int>   expected_acks{0};
     std::atomic<int>   received_acks{0};
 };
@@ -76,16 +98,75 @@ static constexpr std::string_view DISCOVERY_FMT =
     "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\"}}"
     "}}";
 
-static std::string discovery_payload(const char *name, const char *device_class,
-                                     const char *unit, const char *value_key,
-                                     std::string_view device_id, std::string_view device_name)
+// The other format strings used below, named (like DISCOVERY_FMT above) so their compile-time
+// .size() can size the fixed buffers that follow instead of hand-counting characters.
+static constexpr std::string_view DISCOVERY_TOPIC_FMT = "homeassistant/sensor/{}/{}/config";
+static constexpr std::string_view STATE_TOPIC_FMT      = "{}/state";
+static constexpr std::string_view STATE_FMT_BOTH  = "{{\"t\":{:.3g},\"h\":{:.3g}}}";
+static constexpr std::string_view STATE_FMT_TEMP  = "{{\"t\":{:.3g}}}";
+static constexpr std::string_view STATE_FMT_HUMID = "{{\"h\":{:.3g}}}";
+
+// ── fixed-capacity string building — no heap allocation ────────────────────────
+// Every buffer size below is derived, not hand-picked, using one lemma: for a std::format string
+// built only from literal text, "{}" placeholders, and "{{"/"}}" escapes, the format string's own
+// .size() is always >= the length it contributes to the output once every argument is
+// hypothetically stripped to length 0 -- each "{}" placeholder consumes >=2 format-string chars
+// but contributes 0 to that baseline, and each "{{"/"}}" escape consumes 2 format-string chars
+// but contributes only 1 to the output. So `fmt.size() + (sum of each argument's own max length)`
+// is always a safe (if slightly generous) upper bound on the real output length, fully evaluated
+// by the compiler -- it can't go stale if a format string above is edited later, unlike a
+// hand-counted comment. format_into() below still detects (and logs) a truncation as defense in
+// depth, but reaching that path should now require a bug in this derivation, not just an edit
+// to one of the format strings above.
+static constexpr size_t MAX_DEVICE_ID_LEN   = MQTT_MAX_DEVICE_ID_LEN;    // mqtt_sender.h
+static constexpr size_t MAX_DEVICE_NAME_LEN = MQTT_MAX_DEVICE_NAME_LEN;  // mqtt_sender.h
+// Longest of "Temperature"/"Humidity", "temperature"/"humidity", "°C"/"%", "t"/"h" -- the only
+// values ever passed, at the two publish_discovery() call sites below.
+static constexpr size_t MAX_NAME_LEN         = std::max(sizeof("Temperature"), sizeof("Humidity")) - 1;
+static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max(sizeof("temperature"), sizeof("humidity")) - 1;
+static constexpr size_t MAX_UNIT_LEN         = std::max(sizeof("°C"), sizeof("%")) - 1;
+static constexpr size_t MAX_KEY_LEN          = sizeof("t") - 1;  // "h" is the same length
+// {:.3g} (3 significant digits) always needs fewer characters than a full round-trip float --
+// reusing common_utils.h's appendNum() bound (sign + up to 17 sig.digits + '.' + 'e' + sign + 3
+// exp.digits = 24 chars) rather than deriving a tighter one specific to 3 sig figs. This one
+// constant is a reasoned/cited numeric-formatting-width fact, not a sizeof()-derived one -- the
+// lemma above only applies to literal string lengths, not to how wide a formatted number can get.
+static constexpr size_t MAX_FORMATTED_FLOAT_LEN = 24;
+
+static constexpr size_t MAX_DISCOVERY_TOPIC_LEN =
+    DISCOVERY_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN + MAX_DEVICE_CLASS_LEN;
+static constexpr size_t MAX_STATE_TOPIC_LEN = STATE_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
+static constexpr size_t TOPIC_BUF = std::max(MAX_DISCOVERY_TOPIC_LEN, MAX_STATE_TOPIC_LEN) + 1;  // +1 NUL
+
+// device_id is substituted 3x in DISCOVERY_FMT above (state_topic, unique_id, device.identifiers)
+// -- verified against the actual format call's argument list, not just eyeballed, after an
+// earlier draft of this constant used 2x and format_to_n() silently truncated in a stress test.
+static constexpr size_t DISCOVERY_PAYLOAD_BUF = DISCOVERY_FMT.size()
+    + MAX_NAME_LEN + MAX_DEVICE_CLASS_LEN + 3 * MAX_DEVICE_ID_LEN + 2 * MAX_KEY_LEN
+    + MAX_UNIT_LEN + MAX_DEVICE_NAME_LEN + 1;  // +1 NUL
+
+static constexpr size_t STATE_BUF = std::max({
+    STATE_FMT_BOTH.size()  + 2 * MAX_FORMATTED_FLOAT_LEN,
+    STATE_FMT_TEMP.size()  + MAX_FORMATTED_FLOAT_LEN,
+    STATE_FMT_HUMID.size() + MAX_FORMATTED_FLOAT_LEN,
+}) + 1;  // +1 NUL
+
+// Formats into a fixed-capacity std::array via std::format_to_n (no heap allocation) and
+// NUL-terminates the result. Returns the formatted length, or 0 (logged) if `buf` was too small
+// for this input -- given the derivation above this should be unreachable; the check is
+// defense in depth, not an expected path.
+template <size_t N, typename... Args>
+static size_t format_into(std::array<char, N> &buf, std::format_string<Args...> fmt, Args &&...args)
 {
-    return std::format(DISCOVERY_FMT,
-        name, device_class,
-        device_id, value_key,
-        unit,
-        device_id, value_key,
-        device_id, device_name);
+    const auto res = std::format_to_n(buf.data(), N - 1, fmt, std::forward<Args>(args)...);
+    const size_t len = static_cast<size_t>(res.size);
+    if (len > N - 1) {
+        ESP_LOGE(TAG, "formatted string truncated (%zu > %zu chars) -- buffer too small for this input",
+                 len, N - 1);
+        return 0;
+    }
+    buf[len] = '\0';
+    return len;
 }
 
 // ── event handler — ONLY sets event group bits, never touches the client ──────
@@ -155,6 +236,32 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
     return client;
 }
 
+// Builds and publishes one HA MQTT-discovery config message (temperature or humidity) into
+// fixed-size stack buffers — see format_into()'s doc comment. `device_class` doubles as the
+// topic's path segment ("temperature"/"humidity"), matching what the original hand-written
+// topic strings used. `key` is the JSON field name used in state messages ("t"/"h").
+static void publish_discovery(esp_mqtt_client_handle_t client, std::string_view device_id,
+                               std::string_view device_name, const char *name,
+                               const char *device_class, const char *unit, const char *key)
+{
+    std::array<char, TOPIC_BUF> topicBuf;
+    const size_t topicLen = format_into(topicBuf, DISCOVERY_TOPIC_FMT, device_id, device_class);
+
+    std::array<char, DISCOVERY_PAYLOAD_BUF> payloadBuf;
+    const size_t payloadLen = format_into(payloadBuf, DISCOVERY_FMT,
+        name, device_class,
+        device_id, key,
+        unit,
+        device_id, key,
+        device_id, device_name);
+
+    if (topicLen == 0 || payloadLen == 0)
+        return;  // format_into() already logged the truncation
+
+    esp_mqtt_client_publish(client, topicBuf.data(), payloadBuf.data(),
+                            static_cast<int>(payloadLen), 1, 1);
+}
+
 // ── publish task — owns the client lifecycle ──────────────────────────────────
 struct PublishParams
 {
@@ -162,29 +269,27 @@ struct PublishParams
 	std::optional<float> humidity;
 };
 
-static void mqtt_publish_task(void *arg)
+// Runs one connect -> publish -> disconnect cycle and reports whether the state message was
+// confirmed delivered. Deliberately a separate, ordinary function (not inlined into
+// mqtt_publish_task()) so its RAII locals (eg, client below) are freed by an ordinary `return`
+// -- mqtt_publish_task() calls this and only afterward calls vTaskDelete(nullptr), which
+// self-deletes the calling task WITHOUT unwinding the C++ stack (the task is torn down by the
+// scheduler; destructors for anything declared in the frame that calls vTaskDelete(nullptr)
+// never run merely because it was called). Declaring eg/client directly in mqtt_publish_task()
+// and trusting them to clean up right before its final vTaskDelete(nullptr) would silently leak
+// the event group and MQTT client handle every single publish cycle.
+static bool run_publish_cycle(std::optional<float> temperature, std::optional<float> humidity)
 {
-    auto *params = static_cast<PublishParams *>(arg);
-    const bool hasTemp = params->temperature.has_value();
-    const bool hasHumid = params->humidity.has_value();
-    const float temp = params->temperature.value_or(0.0);
-    const float hum  = params->humidity.value_or(0.0);
-    delete params;
+    const bool hasTemp = temperature.has_value();
+    const bool hasHumid = humidity.has_value();
+    const float temp = temperature.value_or(0.0f);
+    const float hum  = humidity.value_or(0.0f);
 
+    // Declaration order matters: destruction runs in reverse, and client's teardown (below)
+    // still needs ctx.eg (a borrowed copy of eg's handle) to be valid, so eg must outlive it.
+    EventGroupPtr eg(xEventGroupCreate(), &vEventGroupDelete);
     MqttCtx ctx;
-    ctx.eg = xEventGroupCreate();
-
-    // Helper for the early-exit paths: mark this cycle failed, release fast poll, free state,
-    // mark idle, end task.  s_last_ok must be stored before BIT_IDLE so the waiter sees it.
-    auto abort_cycle = [&ctx]() {
-        s_last_ok.store(false);
-        vEventGroupDelete(ctx.eg);
-        s_link->onPublishWindowEnd();
-        s_task_running.store(false);
-        if (s_idle_eg)
-            xEventGroupSetBits(s_idle_eg, BIT_IDLE);
-        vTaskDelete(nullptr);
-    };
+    ctx.eg = eg.get();
 
     s_link->onPublishWindowBegin();  // OT: fast polls so NAT64 prefix + TCP ACKs arrive promptly; Wi-Fi: no-op
 
@@ -193,23 +298,23 @@ static void mqtt_publish_task(void *arg)
     if (!s_link->waitForBrokerReachable(s_cfg.broker_address, BROKER_REACHABLE_WAIT_MS)) {
         ESP_LOGE(TAG, "broker not reachable within %lu ms, skipping cycle",
                  (unsigned long)BROKER_REACHABLE_WAIT_MS);
-        abort_cycle();
-        return;
+        s_link->onPublishWindowEnd();
+        return false;
     }
 
     const std::string uri = s_link->brokerUri(s_cfg.broker_address, s_cfg.port, s_cfg.use_tls);
     if (uri.empty()) {
         ESP_LOGE(TAG, "broker_address not set or invalid, cannot connect");
-        abort_cycle();
-        return;
+        s_link->onPublishWindowEnd();
+        return false;
     }
 
-    esp_mqtt_client_handle_t client = start_client(uri.c_str(), ctx);
+    MqttClientPtr client(start_client(uri.c_str(), ctx));
     // TLS needs more time than plaintext: a full handshake over a WAN link (vs. plaintext's
     // bare TCP connect+CONNACK) can take several seconds on this core.
     const uint32_t connect_wait_ms = s_cfg.use_tls ? 15000 : 5000;
-    EventBits_t bits = xEventGroupWaitBits(ctx.eg, BIT_CONNECTED | BIT_ERROR,
-                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(connect_wait_ms));
+    const EventBits_t bits = xEventGroupWaitBits(eg.get(), BIT_CONNECTED | BIT_ERROR,
+                                                 pdFALSE, pdFALSE, pdMS_TO_TICKS(connect_wait_ms));
 
     // ── publish if connected ──────────────────────────────────────────────────
     // ok stays false unless we connect, publish a state message, AND the broker ACKs it.
@@ -232,53 +337,67 @@ static void mqtt_publish_task(void *arg)
         // Set counters BEFORE publishing so the handler never races ahead
         ctx.expected_acks.store(expected);
         ctx.received_acks.store(0);
-        xEventGroupClearBits(ctx.eg, BIT_ALL_ACKED);
+        xEventGroupClearBits(eg.get(), BIT_ALL_ACKED);
 
         if (need_discovery) {
-            if (hasTemp) {
-                const std::string t_topic   = "homeassistant/sensor/" + std::string(dev) + "/temperature/config";
-                const std::string t_payload = discovery_payload("Temperature", "temperature", "°C", "t", dev, dev_name);
-                esp_mqtt_client_publish(client, t_topic.c_str(), t_payload.c_str(), 0, 1, 1);
-            }
-
-            if (hasHumid) {
-                const std::string h_topic   = "homeassistant/sensor/" + std::string(dev) + "/humidity/config";
-                const std::string h_payload = discovery_payload("Humidity", "humidity", "%", "h", dev, dev_name);
-                esp_mqtt_client_publish(client, h_topic.c_str(), h_payload.c_str(), 0, 1, 1);
-            }
+            if (hasTemp)
+                publish_discovery(client.get(), dev, dev_name, "Temperature", "temperature", "°C", "t");
+            if (hasHumid)
+                publish_discovery(client.get(), dev, dev_name, "Humidity", "humidity", "%", "h");
         }
 
         if (hasAny) {
-            std::string state;
-            if (hasTemp && hasHumid)
-                state = std::format("{{\"t\":{:.3g},\"h\":{:.3g}}}", temp, hum);
-            else if (hasTemp)
-                state = std::format("{{\"t\":{:.3g}}}", temp);
-            else  // hasHumid
-                state = std::format("{{\"h\":{:.3g}}}", hum);
+            std::array<char, STATE_BUF> stateBuf;
+            const size_t stateLen = hasTemp && hasHumid
+                ? format_into(stateBuf, STATE_FMT_BOTH, temp, hum)
+                : hasTemp
+                    ? format_into(stateBuf, STATE_FMT_TEMP, temp)
+                    : format_into(stateBuf, STATE_FMT_HUMID, hum);  // hasHumid
 
-            const std::string state_topic = std::string(dev) + "/state";
-            esp_mqtt_client_publish(client, state_topic.c_str(), state.c_str(), 0, 1, 0);
-            ESP_LOGI(TAG, "sent %s", state.c_str());
+            std::array<char, TOPIC_BUF> stateTopicBuf;
+            const size_t stateTopicLen = format_into(stateTopicBuf, STATE_TOPIC_FMT, dev);
 
-            // QoS-1 acks over a healthy Thread link return well under a second; cap short
-            // so we stop fast-polling (and sleep) promptly instead of idling the radio.
-            ok = (xEventGroupWaitBits(ctx.eg, BIT_ALL_ACKED, pdFALSE, pdTRUE,
-                                      pdMS_TO_TICKS(4000)) & BIT_ALL_ACKED) != 0;
-            s_discovery_sent.store(true);
+            if (stateLen > 0 && stateTopicLen > 0) {
+                esp_mqtt_client_publish(client.get(), stateTopicBuf.data(), stateBuf.data(),
+                                        static_cast<int>(stateLen), 1, 0);
+                ESP_LOGI(TAG, "sent %s", stateBuf.data());
+
+                // QoS-1 acks over a healthy Thread link return well under a second; cap short
+                // so we stop fast-polling (and sleep) promptly instead of idling the radio.
+                ok = (xEventGroupWaitBits(eg.get(), BIT_ALL_ACKED, pdFALSE, pdTRUE,
+                                          pdMS_TO_TICKS(4000)) & BIT_ALL_ACKED) != 0;
+                s_discovery_sent.store(true);
+            }
         } else {
             ESP_LOGW(TAG, "no sensor values to publish this cycle");
         }
     } else {
         ESP_LOGE(TAG, "MQTT connection failed, skipping cycle");
     }
-    s_last_ok.store(ok);  // published before BIT_IDLE is set in the cleanup below
 
-    // ── clean up — safe here because we are NOT in the MQTT event handler ─────
-    esp_mqtt_client_stop(client);
-    esp_mqtt_client_destroy(client);
-    vEventGroupDelete(ctx.eg);
     s_link->onPublishWindowEnd();  // OT: back to slow poll until next sensor cycle; Wi-Fi: no-op
+    return ok;
+    // client, ctx, then eg are destroyed here (in that order) as this ordinary function returns
+    // -- esp_mqtt_client_stop()+destroy(), then (trivially) ctx, then vEventGroupDelete().
+}
+
+static void mqtt_publish_task(void *arg)
+{
+    std::optional<float> temperature, humidity;
+    {
+        // Reconstructs ownership of the heap block mqtt_send_sensor_data() handed across the
+        // xTaskCreate() void* boundary. Freed at the end of THIS inner block, deliberately not
+        // left to this unique_ptr's destructor firing at the end of mqtt_publish_task() itself
+        // -- see run_publish_cycle()'s doc comment for why that wouldn't work (vTaskDelete(nullptr)
+        // below never unwinds the stack).
+        const std::unique_ptr<PublishParams> params(static_cast<PublishParams *>(arg));
+        temperature = params->temperature;
+        humidity = params->humidity;
+    }
+
+    const bool ok = run_publish_cycle(temperature, humidity);
+
+    s_last_ok.store(ok);  // published before BIT_IDLE is set below
     s_task_running.store(false);
     if (s_idle_eg)
     	xEventGroupSetBits(s_idle_eg, BIT_IDLE);  // wake any mqtt_wait_for_idle() caller
@@ -305,18 +424,19 @@ void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float
         ESP_LOGW(TAG, "previous publish cycle still running, skipping");
         return;
     }
-    
+
     if (s_idle_eg)
     	xEventGroupClearBits(s_idle_eg, BIT_IDLE);  // mark busy until the task exits
-    	
-    auto *params = new PublishParams{temperature, humidity};
-    if (xTaskCreate(mqtt_publish_task, "mqtt_pub", 12288, params, 5, nullptr) != pdPASS) {
+
+    std::unique_ptr<PublishParams> params(new PublishParams{temperature, humidity});
+    if (xTaskCreate(mqtt_publish_task, "mqtt_pub", 12288, params.get(), 5, nullptr) != pdPASS) {
         ESP_LOGE(TAG, "failed to create mqtt_pub task");
-        delete params;
         s_task_running.store(false);
         if (s_idle_eg)
         	xEventGroupSetBits(s_idle_eg, BIT_IDLE);
+        return;  // params frees itself here
     }
+    (void)params.release();  // ownership now belongs to mqtt_publish_task
 }
 
 bool mqtt_is_busy()

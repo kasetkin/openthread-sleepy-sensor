@@ -7,13 +7,29 @@
 
 #include "network_link.h"
 
+// Upper bound on MqttConfig::device_name (enforced by main.cpp before it ever reaches here) —
+// the single source of truth both main.cpp's truncation and mqtt_sender.cpp's fixed-size
+// topic/payload buffers are sized against, so the two can't silently drift apart.
+inline constexpr size_t MQTT_MAX_DEVICE_NAME_LEN = 64;
+
+// device_id = sanitised device_name + '-' + one 2-hex-digit pair per byte of the chip's factory
+// MAC (main.cpp's addOTMacSuffix() reads an 8-byte IEEE 802.15.4 extended address via
+// esp_read_mac()). Derived, not hand-counted, so it can't drift from that function's actual
+// output shape; MQTT_MAC_ADDRESS_BYTES is also checked against addOTMacSuffix()'s mac[] array
+// via a static_assert there, so the two stay in sync.
+inline constexpr size_t MQTT_MAC_ADDRESS_BYTES = 8;
+inline constexpr size_t MQTT_MAX_DEVICE_ID_LEN =
+    MQTT_MAX_DEVICE_NAME_LEN + 1 /* '-' */ + 2 * MQTT_MAC_ADDRESS_BYTES;
+
 struct MqttConfig {
     std::string      broker_address; // literal IPv4 or IPv6 address, e.g. "192.168.77.250" or "fd12:3456:789a::10"
     uint16_t         port;       // MQTT port, e.g. 1883
     std::string      username;
     std::string      password;
-    std::string      device_id;    // unique id, e.g. "<device_name>_a1b2c3" (name + chip MAC suffix)
-    std::string      device_name;  // human-readable name from secrets.yaml "device_name"
+    // unique id: sanitised device_name + '-' + 16 hex MAC digits (see main.cpp's
+    // addOTMacSuffix()) -- at most MQTT_MAX_DEVICE_ID_LEN chars.
+    std::string      device_id;
+    std::string      device_name;  // human-readable name from secrets.yaml "device_name", capped to MQTT_MAX_DEVICE_NAME_LEN
     bool             use_tls = false;      // true: mqtts:// with server verification; false: plaintext mqtt://
     std::string      tls_ca_cert_b64;      // optional CA/leaf cert, base64 body only (no PEM markers/newlines);
                                             // empty => trust ESP-IDF's public CA bundle instead. Only used if use_tls.
