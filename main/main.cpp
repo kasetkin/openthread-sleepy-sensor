@@ -51,7 +51,7 @@ void startErrorTask(ErrorTask::ErrorCode code)
 static std::string addOTMacSuffix(std::string_view usernamePrefix)
 {
     std::string id;
-    id.reserve(usernamePrefix.size() + 7);
+    id.reserve(usernamePrefix.size() + 1 + 2 * MQTT_MAC_ADDRESS_BYTES);
     for (char c : usernamePrefix) {
         const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                         (c >= '0' && c <= '9') || c == '-' || c == '_';
@@ -59,11 +59,39 @@ static std::string addOTMacSuffix(std::string_view usernamePrefix)
     }
 
     uint8_t mac[8] = {};
+    // Ties this array's size (and the format string's 8 placeholders below) to
+    // MQTT_MAX_DEVICE_ID_LEN's derivation in mqtt_sender.h -- if one changes without the other,
+    // this fails to compile instead of silently mismatching every buffer sized from that bound.
+    static_assert(sizeof(mac) == MQTT_MAC_ADDRESS_BYTES);
     esp_read_mac(mac, ESP_MAC_IEEE802154);
     id += std::format("-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
                       mac[0], mac[1], mac[2], mac[3],
                       mac[4], mac[5], mac[6], mac[7]);
     return id;
+}
+
+// parse_as_float()/parse_as_uint32() (secrets.h) return nullopt for a missing or malformed
+// calibration.txt key rather than silently defaulting to 0 -- these two wrappers apply an
+// explicit, loud fallback at the one place (main.cpp) that owns calibration.txt policy.
+// Defaults are chosen to fail *safe*, not fail *silent-and-low-power*: e.g. lp_poll_interval_sec
+// defaulting to 0 would turn the LP timer into a busy-loop, and max_skip_cycles defaulting to 0
+// would (correctly, if noisily) publish every cycle rather than silently drop changed readings.
+static float parse_as_float_or(std::string_view content, std::string_view key, float def)
+{
+    if (const auto v = parse_as_float(content, key))
+        return *v;
+    ESP_LOGW("main", "calibration.txt missing/invalid '%.*s', falling back to %.3f",
+             static_cast<int>(key.size()), key.data(), static_cast<double>(def));
+    return def;
+}
+
+static uint32_t parse_as_uint32_or(std::string_view content, std::string_view key, uint32_t def)
+{
+    if (const auto v = parse_as_uint32(content, key))
+        return *v;
+    ESP_LOGW("main", "calibration.txt missing/invalid '%.*s', falling back to %lu",
+             static_cast<int>(key.size()), key.data(), static_cast<unsigned long>(def));
+    return def;
 }
 
 extern "C" void app_main(void)
@@ -99,8 +127,16 @@ extern "C" void app_main(void)
     const std::string ot_tlv    = yaml_get_string(yaml, "ot_tlv");
     std::string deviceNamePrefix = yaml_get_string(yaml, "device_name");
     if (deviceNamePrefix.empty()) {
-        deviceNamePrefix = "esp32-OT-MQTT-sensor";
+        deviceNamePrefix = "esp32-OT-sensor";
         ESP_LOGW("main", "secrets.yaml has no 'device_name', falling back to '%s'", deviceNamePrefix.c_str());
+    }
+    // Bounds mqtt_name_and_id below to MQTT_MAX_DEVICE_ID_LEN chars -- mqtt_sender.cpp's
+    // fixed-size topic/payload buffers are derived from that same bound (see
+    // MQTT_MAX_DEVICE_NAME_LEN/MQTT_MAX_DEVICE_ID_LEN's doc comments in mqtt_sender.h).
+    if (deviceNamePrefix.size() > MQTT_MAX_DEVICE_NAME_LEN) {
+        ESP_LOGW("main", "secrets.yaml 'device_name' (%s) exceeds %u chars, truncating",
+                 deviceNamePrefix.c_str(), static_cast<unsigned>(MQTT_MAX_DEVICE_NAME_LEN));
+        deviceNamePrefix.resize(MQTT_MAX_DEVICE_NAME_LEN);
     }
 
     const std::string mqtt_name_and_id = addOTMacSuffix(deviceNamePrefix);
@@ -194,7 +230,8 @@ extern "C" void app_main(void)
     // sensor bus -- see the migration plan. sensors_task's own cycle_duration_sec is now
     // just a backstop ceiling, not the primary cadence.
     const SensorsTaskSettings sSettings {
-        .cycle_duration_sec = parse_as_uint32(calibration_txt(), "cycle_duration_sec")
+        .cycle_duration_sec = parse_as_uint32_or(calibration_txt(), "cycle_duration_sec",
+                                                  SensorsTaskSettings{}.cycle_duration_sec)
     };
 
     ESP_LOGI("main", "sensor settings: cycle_duration_sec=%lu",
@@ -224,13 +261,16 @@ extern "C" void app_main(void)
 
     // ── LP core sensor ownership ─────────────────────────────────────────────
     const lp_sensor_core_config_t lpConfig {
-        .temp_offset_c = parse_as_float(calibration_txt(), "temp_offset"),
-        .temp_min_change_c = parse_as_float(calibration_txt(), "temp_min_change"),
-        .rh_offset_pct = parse_as_float(calibration_txt(), "rh_offset"),
-        .rh_min_change_pct = parse_as_float(calibration_txt(), "rh_min_change"),
-        .max_skip_cycles = parse_as_uint32(calibration_txt(), "max_skip_cycles"),
+        .temp_offset_c = parse_as_float_or(calibration_txt(), "temp_offset", 0.0f),
+        .temp_min_change_c = parse_as_float_or(calibration_txt(), "temp_min_change", 0.0f),
+        .rh_offset_pct = parse_as_float_or(calibration_txt(), "rh_offset", 0.0f),
+        .rh_min_change_pct = parse_as_float_or(calibration_txt(), "rh_min_change", 0.0f),
+        .max_skip_cycles = parse_as_uint32_or(calibration_txt(), "max_skip_cycles", 0),
     };
-    const uint32_t lpPollIntervalSec = parse_as_uint32(calibration_txt(), "lp_poll_interval_sec");
+    // 0 would arm the LP timer with no delay (busy-loop) -- default to the same 60s the HP
+    // backstop (SensorsTaskSettings::cycle_duration_sec) defaults to if unset.
+    const uint32_t lpPollIntervalSec = parse_as_uint32_or(calibration_txt(), "lp_poll_interval_sec",
+                                                           SensorsTaskSettings{}.cycle_duration_sec);
     ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, temp_offset=%.2f temp_min_change=%.2f "
                   "rh_offset=%.2f rh_min_change=%.2f max_skip_cycles=%lu",
              static_cast<unsigned long>(lpPollIntervalSec),
