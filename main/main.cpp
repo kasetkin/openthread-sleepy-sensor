@@ -230,12 +230,12 @@ extern "C" void app_main(void)
     // sensor bus -- see the migration plan. sensors_task's own cycle_duration_sec is now
     // just a backstop ceiling, not the primary cadence.
     const SensorsTaskSettings sSettings {
-        .cycle_duration_sec = parse_as_uint32_or(calibration_txt(), "cycle_duration_sec",
-                                                  SensorsTaskSettings{}.cycle_duration_sec)
+        .cycleDurationSec = parse_as_uint32_or(calibration_txt(), "cycle_duration_sec",
+                                                  SensorsTaskSettings{}.cycleDurationSec)
     };
 
     ESP_LOGI("main", "sensor settings: cycle_duration_sec=%lu",
-             static_cast<unsigned long>(sSettings.cycle_duration_sec));
+             static_cast<unsigned long>(sSettings.cycleDurationSec));
 
     sensorTask = std::make_shared<SensorsTask>(sSettings);
 
@@ -270,7 +270,7 @@ extern "C" void app_main(void)
     // 0 would arm the LP timer with no delay (busy-loop) -- default to the same 60s the HP
     // backstop (SensorsTaskSettings::cycle_duration_sec) defaults to if unset.
     const uint32_t lpPollIntervalSec = parse_as_uint32_or(calibration_txt(), "lp_poll_interval_sec",
-                                                           SensorsTaskSettings{}.cycle_duration_sec);
+                                                           SensorsTaskSettings{}.cycleDurationSec);
     ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, temp_offset=%.2f temp_min_change=%.2f "
                   "rh_offset=%.2f rh_min_change=%.2f max_skip_cycles=%lu",
              static_cast<unsigned long>(lpPollIntervalSec),

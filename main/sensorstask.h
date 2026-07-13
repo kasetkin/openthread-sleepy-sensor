@@ -5,18 +5,25 @@
 #include <string_view>
 #include <functional>
 #include <cstdint>
+#include <expected>
+#include <esp_adc/adc_oneshot.h>
+#include <esp_adc/adc_cali.h>
+#include <esp_adc/adc_cali_scheme.h>
+#include <driver/gpio.h>
 
 struct SensorsValues
 {
 public:
+    std::optional<int> batteryVoltageMilliV;
+    std::optional<int> batteryPercent;
     std::optional<float> envTemperature;
     std::optional<float> envHumidity;
     std::optional<float> barometricPressure;
 
-    std::string toTelemetryString() const;
-    std::string toLogString() const;
-    /// up to 3 decimal digits; trailing zeros and dot stripped
-    static std::string toTelemetryRoundedString(const float value);
+    static constexpr double MAX_VOLTAGE = 4090.0; // mV — fully charged Li-ion (measured)
+    static constexpr double MIN_VOLTAGE = 3200.0; // mV — empty (0 %)
+
+    static int convertVoltageToPercent(int batteryVoltageMilliV);
 };
 
 struct SensorsTaskSettings
@@ -26,7 +33,9 @@ struct SensorsTaskSettings
     /// wakes HP early via ulp_lp_core_wakeup_main_processor() whenever it has something
     /// worth publishing; this is just the ceiling on how stale published data can get if LP
     /// never flags a change.
-    uint32_t cycle_duration_sec = 60;
+    uint32_t cycleDurationSec = 60;
+    /// should HP core read battery Voltage via ADC GPIO pin
+    bool readVoltageViaAdc = false;
 };
 
 class SensorsTask
@@ -67,11 +76,21 @@ private:
     /// re-attaches and re-learns the NAT64 route. ~5 cycles ≈ 5 min of no data before recovering.
     static constexpr uint32_t REBOOT_AFTER_FAILS = 5;
 
+    /// Voltage section
+    static constexpr gpio_num_t VOLTAGE_PIN = GPIO_NUM_2;
+    static constexpr double RESISTOR_GND_2_SENSOR = 5035;
+    static constexpr double RESISTOR_SENSOR_2_VBAT = 5021;
+    static constexpr double voltageDividerCoefficient = (RESISTOR_GND_2_SENSOR + RESISTOR_SENSOR_2_VBAT) / RESISTOR_GND_2_SENSOR;
+    static constexpr size_t ADC_READS_COUNT = 10;
+
     const SensorsTaskSettings m_settings;
 
     SensorsReadyEvent m_readyEvent;
     AttachGate m_attachGate;
     RefreshNat64 m_refreshNat64;
+
+    adc_oneshot_unit_handle_t adc1_handle = nullptr;
+    adc_cali_handle_t adc1_cali_chan0_handle = nullptr;
 
     /// consecutive cycles with no successful publish; drives the reboot supervisor (see REBOOT_AFTER_FAILS)
     uint32_t m_consecutiveFailures = 0;
@@ -83,4 +102,12 @@ private:
     /// LP's heartbeat_counter as of the last HP wake, so each new wake can log how many real
     /// LP cycles elapsed since then.
     uint32_t m_lastSeenHeartbeat = 0;
+
+    [[nodiscard("false means ADC is uncalibrated")]]
+    static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
+    static void adc_calibration_deinit(adc_cali_handle_t handle);
+    [[nodiscard("ADC unavailable if init failure ignored")]]
+    esp_err_t initAdc();
+    void deinitAdc();
+    std::expected<int, esp_err_t> readBatteryVoltageMilliV();
 };
