@@ -20,34 +20,43 @@
 static const char *TAG = "ota-updater";
 
 // ── tuning ────────────────────────────────────────────────────────────────────
-// Battery floor for accepting a download (a ~5 mAh session on a nearly-empty pack risks
-// brownout mid-flash); manifest "force":true overrides for bench work on USB power.
+// Battery floor for accepting a download (a multi-minute radio-on session on a nearly-empty
+// pack risks brownout mid-flash); manifest "force":true overrides for bench work on USB power.
 static constexpr int OTA_MIN_BATTERY_PERCENT = 30;
-// A bad image must not drain the battery in a stage→fail→retry loop: the retained install
-// flag persists across cycles, so cap attempts per boot and go quiet until a power cycle
-// (or a fixed image, whose different sha/version resets nothing but succeeds).
-static constexpr int OTA_MAX_ATTEMPTS_PER_BOOT = 3;
-// No-progress watchdog while waiting for broker-streamed segments, and a whole-session cap.
-static constexpr uint32_t OTA_STALL_TIMEOUT_MS = 30'000;
-static constexpr uint32_t OTA_SESSION_CAP_MS   = 20 * 60'000;
+// Sessions that download at least one chunk always earn a retry (resume makes them forward
+// progress); only consecutive attempts with ZERO progress count against this budget, so a
+// bad/missing staging can't drain the battery in a retry loop.
+static constexpr int OTA_MAX_NO_PROGRESS_ATTEMPTS = 3;
+// Per-chunk wait: subscribe -> SUBACK -> retained chunk normally lands in ~1-2 s over Thread.
+static constexpr uint32_t OTA_CHUNK_TIMEOUT_MS = 20'000;
+// Whole-session cap; hitting it just ends the attempt (resume continues next cycle).
+static constexpr uint32_t OTA_SESSION_CAP_MS = 20 * 60'000;
 
-static constexpr EventBits_t OTA_BIT_DONE = BIT0;
-static constexpr EventBits_t OTA_BIT_FAIL = BIT1;
+static constexpr EventBits_t OTA_BIT_CHUNK = BIT0;  // expected chunk verified + written
+static constexpr EventBits_t OTA_BIT_FAIL  = BIT1;
 
 // ── state ─────────────────────────────────────────────────────────────────────
 static const NetworkLink *s_link = nullptr;
-static std::string s_topic_manifest, s_topic_image, s_topic_install, s_topic_installed, s_topic_status;
+static std::string s_topic_manifest, s_topic_image_prefix, s_topic_install, s_topic_installed, s_topic_status;
 
 // Latest staged manifest, filled by the esp-mqtt event task, consumed by the mqtt_pub task.
-// Guarded by s_mutex (as are the esp_ota/sha handles below — see ota_on_mqtt_data()).
+// Guarded by s_mutex (as are the esp_ota/sha handles below — see handle_image_chunk()).
 struct Manifest
 {
     std::string version;
     size_t      size = 0;
+    size_t      chunk_size = 0;
     uint8_t     sha256[32] = {};
     bool        force = false;
     bool        valid = false;
     bool        differs_from_running = false;
+
+    // Same staged image? (identity = content hash + geometry, not just the version string)
+    bool sameImage(const Manifest &o) const
+    {
+        return size == o.size && chunk_size == o.chunk_size &&
+               std::memcmp(sha256, o.sha256, sizeof(sha256)) == 0;
+    }
 };
 static Manifest s_manifest;
 static SemaphoreHandle_t s_mutex = nullptr;
@@ -56,19 +65,17 @@ static EventGroupHandle_t s_eg = nullptr;
 static std::atomic<bool>   s_install_requested{false};
 static std::atomic<bool>   s_session_active{false};
 static std::atomic<bool>   s_conn_lost{false};   // set by ota_on_mqtt_error() during a session
-static std::atomic<size_t> s_received{0};
-static std::atomic<int>    s_attempts_this_boot{0};
+static std::atomic<int>    s_no_progress_attempts{0};
 
-// Download-session flash/hash state; only touched under s_mutex while s_session_active.
+// Download progress; persists across sessions within one boot so a broken attempt RESUMES
+// from the first missing chunk. All guarded by s_mutex while a session is active.
+static bool                    s_partial_valid = false;  // handles below hold a resumable partial download
+static Manifest                s_partial_manifest;       // identity of that partial download
+static size_t                  s_next_chunk = 0;         // first chunk not yet written
+static std::atomic<size_t>     s_received{0};            // bytes written so far
 static esp_ota_handle_t        s_ota_handle = 0;
 static const esp_partition_t  *s_ota_partition = nullptr;
 static psa_hash_operation_t    s_sha_op;
-static size_t                  s_expected_size = 0;
-
-// esp-mqtt only presents the topic on the FIRST segment of a message larger than its RX
-// buffer; continuations are attributed to whatever topic'd segment came last (safe because
-// TCP ordering means one inbound publish completes before the next begins).
-static bool s_last_topic_was_image = false;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 static bool topic_is(const char *topic, size_t topic_len, const std::string &full)
@@ -113,7 +120,7 @@ static bool parse_sha256_hex(std::string_view hex, uint8_t out[32])
 // (The payload still has to BE JSON on the wire — HA's update entity templates
 // {{ value_json.version }} out of the very same retained message.) Returns the value token
 // after `"key":` — the unquoted contents for a string, the bare token for a number/bool.
-// No escape handling: none of the four fields (git-describe version, decimal size, hex
+// No escape handling: none of the manifest fields (git-describe version, decimal sizes, hex
 // sha256, boolean force) can contain escapes as ota_push.py emits them.
 static std::optional<std::string_view> manifest_field(std::string_view json, std::string_view key)
 {
@@ -140,78 +147,115 @@ static std::optional<std::string_view> manifest_field(std::string_view json, std
     return json.substr(pos, end - pos);
 }
 
+static std::optional<size_t> parse_size_field(std::string_view json, std::string_view key)
+{
+    const auto tok = manifest_field(json, key);
+    size_t value = 0;
+    if (!tok || std::from_chars(tok->data(), tok->data() + tok->size(), value).ec != std::errc{})
+        return std::nullopt;
+    return value;
+}
+
 static void handle_manifest(const char *data, size_t data_len, size_t total)
 {
     if (data_len != total) {
-        // Can't happen for a sane manifest (RX buffer is 4 KB); refuse rather than
+        // Can't happen for a sane manifest (RX buffer is 8.5 KB); refuse rather than
         // stitch together segments for a message that has no business being that big.
         ESP_LOGE(TAG, "manifest larger than RX buffer (%zu bytes) — ignored", total);
         return;
     }
     const std::string_view body(data, data_len);
 
-    const auto version = manifest_field(body, "version");
-    const auto size    = manifest_field(body, "size");
-    const auto sha     = manifest_field(body, "sha256");
-    const auto force   = manifest_field(body, "force");
+    const auto version    = manifest_field(body, "version");
+    const auto size       = parse_size_field(body, "size");
+    const auto chunk_size = parse_size_field(body, "chunk_size");
+    const auto sha        = manifest_field(body, "sha256");
+    const auto force      = manifest_field(body, "force");
 
     Manifest m;
-    size_t size_val = 0;
-    const bool size_ok = size &&
-        std::from_chars(size->data(), size->data() + size->size(), size_val).ec == std::errc{} &&
-        size_val > 0;
-    if (!version || version->empty() || !size_ok || !sha || !parse_sha256_hex(*sha, m.sha256)) {
-        ESP_LOGE(TAG, "manifest missing/invalid version|size|sha256 — ignored");
+    if (!version || version->empty() || !size || *size == 0 ||
+        !chunk_size || *chunk_size == 0 || *chunk_size > OTA_MAX_CHUNK_SIZE ||
+        !sha || !parse_sha256_hex(*sha, m.sha256)) {
+        ESP_LOGE(TAG, "manifest missing/invalid version|size|sha256|chunk_size (max %zu) — ignored",
+                 OTA_MAX_CHUNK_SIZE);
         return;
     }
-    m.version = *version;
-    m.size    = size_val;
-    m.force   = force && *force == "true";
-    m.valid   = true;
+    m.version    = *version;
+    m.size       = *size;
+    m.chunk_size = *chunk_size;
+    m.force      = force && *force == "true";
+    m.valid      = true;
     m.differs_from_running = (m.version != esp_app_get_description()->version);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_manifest = std::move(m);
     xSemaphoreGive(s_mutex);
 
-    ESP_LOGI(TAG, "manifest: version=%s size=%zu force=%d (running=%s, differs=%d)",
-             s_manifest.version.c_str(), s_manifest.size, s_manifest.force,
+    ESP_LOGI(TAG, "manifest: version=%s size=%zu chunk_size=%zu force=%d (running=%s, differs=%d)",
+             s_manifest.version.c_str(), s_manifest.size, s_manifest.chunk_size, s_manifest.force,
              esp_app_get_description()->version, s_manifest.differs_from_running);
 }
 
-// One broker-streamed image segment. Runs in the esp-mqtt event task; the flash write
-// intentionally blocks it (TCP receive-window backpressure IS the flow control).
-static void handle_image_segment(const char *data, size_t data_len, size_t offset, size_t total)
+// One retained chunk message. Runs in the esp-mqtt event task; blocking on the flash write
+// here is fine — the chunk is already fully received, and the next one only starts after
+// the session task's next subscribe.
+static void handle_image_chunk(size_t index, const char *data, size_t data_len,
+                               size_t offset, size_t total)
 {
     if (!s_session_active.load())
-        return;  // late segments after an abort (unsubscribe races the in-flight stream)
+        return;  // stale delivery after an abort
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    const size_t expected_len = std::min(s_partial_manifest.chunk_size,
+                                         s_partial_manifest.size - s_next_chunk * s_partial_manifest.chunk_size);
     bool fail = false;
-    if (offset == 0 && total != s_expected_size) {
-        ESP_LOGE(TAG, "image size %zu != manifest size %zu", total, s_expected_size);
+    if (offset != 0 || total != data_len) {
+        // A chunk that fits the RX buffer arrives as exactly one event; anything else means
+        // the staging's chunk_size exceeds this build's buffer — a config error, not a link
+        // hiccup, so fail loudly rather than let esp-mqtt segment it (see file comment).
+        ESP_LOGE(TAG, "chunk %zu spans events (len %zu of %zu at offset %zu) — chunk_size too "
+                      "big for RX buffer", index, data_len, total, offset);
         fail = true;
-    } else if (offset != s_received.load()) {
-        // esp-mqtt segments arrive strictly in order; a gap means we lost sync (e.g. a
-        // second retained publish raced the download). Restarting beats corrupt flash.
-        ESP_LOGE(TAG, "segment offset %zu != received %zu — out of sync", offset, s_received.load());
+    } else if (index != s_next_chunk) {
+        // Strict ordering: chunks are subscribed one at a time, so anything else is a stale
+        // retained delivery racing a re-staging. Ignore rather than fail — the expected
+        // chunk may still arrive.
+        ESP_LOGW(TAG, "ignoring unexpected chunk %zu (waiting for %zu)", index, s_next_chunk);
+    } else if (data_len != expected_len) {
+        ESP_LOGE(TAG, "chunk %zu is %zu bytes, expected %zu — staging/manifest mismatch",
+                 index, data_len, expected_len);
         fail = true;
     } else if (const esp_err_t err = esp_ota_write(s_ota_handle, data, data_len); err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_ota_write failed at %zu: 0x%x", offset, err);
+        ESP_LOGE(TAG, "esp_ota_write failed at chunk %zu: 0x%x", index, err);
         fail = true;
     } else if (psa_hash_update(&s_sha_op, reinterpret_cast<const uint8_t *>(data), data_len)
                != PSA_SUCCESS) {
-        ESP_LOGE(TAG, "psa_hash_update failed at %zu", offset);
+        ESP_LOGE(TAG, "psa_hash_update failed at chunk %zu", index);
         fail = true;
     } else {
-        s_received.store(offset + data_len);
+        s_next_chunk = index + 1;
+        s_received.fetch_add(data_len);
+        xSemaphoreGive(s_mutex);
+        xEventGroupSetBits(s_eg, OTA_BIT_CHUNK);
+        return;
     }
     xSemaphoreGive(s_mutex);
-
     if (fail)
         xEventGroupSetBits(s_eg, OTA_BIT_FAIL);
-    else if (s_received.load() == total)
-        xEventGroupSetBits(s_eg, OTA_BIT_DONE);
+}
+
+// Discard a kept partial download (bad image, or a different image was staged).
+// Caller must hold s_mutex.
+static void discard_partial_locked()
+{
+    if (s_ota_handle != 0) {
+        esp_ota_abort(s_ota_handle);
+        s_ota_handle = 0;
+    }
+    psa_hash_abort(&s_sha_op);  // safe on an already-terminated operation
+    s_partial_valid = false;
+    s_next_chunk = 0;
+    s_received.store(0);
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
@@ -222,11 +266,11 @@ void ota_updater_init(std::string_view device_id, const NetworkLink *link)
     const auto full = [&](std::string_view suffix) {
         return std::format("{}/{}", device_id, suffix);
     };
-    s_topic_manifest  = full(OTA_SUFFIX_MANIFEST);
-    s_topic_image     = full(OTA_SUFFIX_IMAGE);
-    s_topic_install   = full(OTA_SUFFIX_INSTALL);
-    s_topic_installed = full(OTA_SUFFIX_INSTALLED);
-    s_topic_status    = full(OTA_SUFFIX_STATUS);
+    s_topic_manifest     = full(OTA_SUFFIX_MANIFEST);
+    s_topic_image_prefix = full(OTA_SUFFIX_IMAGE_PREFIX);
+    s_topic_install      = full(OTA_SUFFIX_INSTALL);
+    s_topic_installed    = full(OTA_SUFFIX_INSTALLED);
+    s_topic_status       = full(OTA_SUFFIX_STATUS);
     if (!s_mutex)
         s_mutex = xSemaphoreCreateMutex();
     if (!s_eg)
@@ -234,7 +278,6 @@ void ota_updater_init(std::string_view device_id, const NetworkLink *link)
 }
 
 const char *ota_topic_manifest()  { return s_topic_manifest.c_str(); }
-const char *ota_topic_image()     { return s_topic_image.c_str(); }
 const char *ota_topic_install()   { return s_topic_install.c_str(); }
 const char *ota_topic_installed() { return s_topic_installed.c_str(); }
 const char *ota_topic_status()    { return s_topic_status.c_str(); }
@@ -243,27 +286,26 @@ void ota_on_mqtt_data(const char *topic, size_t topic_len,
                       const char *data, size_t data_len,
                       size_t offset, size_t total)
 {
-    if (topic_len > 0) {
-        if (topic_is(topic, topic_len, s_topic_image)) {
-            s_last_topic_was_image = true;
-            handle_image_segment(data, data_len, offset, total);
-            return;
-        }
-        s_last_topic_was_image = false;
-        if (topic_is(topic, topic_len, s_topic_manifest)) {
-            handle_manifest(data, data_len, total);
-        } else if (topic_is(topic, topic_len, s_topic_install)) {
-            // Any non-empty retained payload counts as an install request; the empty
-            // payload we publish after success is the MQTT "delete retained" idiom.
-            s_install_requested.store(data_len > 0);
-            ESP_LOGI(TAG, "install flag: %s", data_len > 0 ? "SET" : "cleared");
-        }
+    if (topic_len == 0)
+        return;  // continuation of an oversized message — none of ours is allowed to be one
+
+    const std::string_view t(topic, topic_len);
+    if (t.starts_with(s_topic_image_prefix)) {
+        const std::string_view index_str = t.substr(s_topic_image_prefix.size());
+        size_t index = 0;
+        if (std::from_chars(index_str.data(), index_str.data() + index_str.size(), index).ec
+            == std::errc{})
+            handle_image_chunk(index, data, data_len, offset, total);
         return;
     }
-
-    // Continuation segment (no topic): belongs to the last topic'd message.
-    if (s_last_topic_was_image)
-        handle_image_segment(data, data_len, offset, total);
+    if (topic_is(topic, topic_len, s_topic_manifest)) {
+        handle_manifest(data, data_len, total);
+    } else if (topic_is(topic, topic_len, s_topic_install)) {
+        // Any non-empty retained payload counts as an install request; the empty
+        // payload we publish after success is the MQTT "delete retained" idiom.
+        s_install_requested.store(data_len > 0);
+        ESP_LOGI(TAG, "install flag: %s", data_len > 0 ? "SET" : "cleared");
+    }
 }
 
 void ota_on_mqtt_error()
@@ -278,7 +320,7 @@ bool ota_update_due()
 {
     if (!s_install_requested.load())
         return false;
-    if (s_attempts_this_boot.load() >= OTA_MAX_ATTEMPTS_PER_BOOT)
+    if (s_no_progress_attempts.load() >= OTA_MAX_NO_PROGRESS_ATTEMPTS)
         return false;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -305,117 +347,138 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
         return;  // deliberately NOT an attempt: retried once the battery recovers
     }
 
-    const int attempt = s_attempts_this_boot.fetch_add(1) + 1;
-    s_ota_partition = esp_ota_get_next_update_partition(nullptr);
-    if (!s_ota_partition || s_ota_partition->size < manifest.size) {
-        publish_status(client, std::format(
-            "{{\"state\":\"error\",\"reason\":\"image {} bytes exceeds slot\"}}", manifest.size));
-        return;
-    }
+    const size_t total_chunks = (manifest.size + manifest.chunk_size - 1) / manifest.chunk_size;
 
-    ESP_LOGI(TAG, "starting OTA %s -> %s (%zu bytes, attempt %d/%d) into %s",
-             esp_app_get_description()->version, manifest.version.c_str(),
-             manifest.size, attempt, OTA_MAX_ATTEMPTS_PER_BOOT, s_ota_partition->label);
+    // ── fresh start or resume ─────────────────────────────────────────────────
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_partial_valid && !manifest.sameImage(s_partial_manifest)) {
+        ESP_LOGI(TAG, "staged image changed — discarding partial download (%zu chunks)", s_next_chunk);
+        discard_partial_locked();
+    }
+    if (!s_partial_valid) {
+        s_ota_partition = esp_ota_get_next_update_partition(nullptr);
+        if (!s_ota_partition || s_ota_partition->size < manifest.size) {
+            xSemaphoreGive(s_mutex);
+            publish_status(client, std::format(
+                "{{\"state\":\"error\",\"reason\":\"image {} bytes exceeds slot\"}}", manifest.size));
+            s_no_progress_attempts.fetch_add(1);
+            return;
+        }
+        // OTA_WITH_SEQUENTIAL_WRITES erases flash incrementally as chunks arrive instead of
+        // blocking here for a multi-second whole-partition erase.
+        if (const esp_err_t err = esp_ota_begin(s_ota_partition, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_handle);
+            err != ESP_OK) {
+            s_ota_handle = 0;
+            xSemaphoreGive(s_mutex);
+            publish_status(client, std::format("{{\"state\":\"error\",\"reason\":\"esp_ota_begin 0x{:x}\"}}",
+                                               static_cast<unsigned>(err)));
+            s_no_progress_attempts.fetch_add(1);
+            return;
+        }
+        // psa_crypto_init() is idempotent; the hash op then streams alongside esp_ota_write().
+        s_sha_op = PSA_HASH_OPERATION_INIT;
+        if (psa_crypto_init() != PSA_SUCCESS ||
+            psa_hash_setup(&s_sha_op, PSA_ALG_SHA_256) != PSA_SUCCESS) {
+            discard_partial_locked();
+            xSemaphoreGive(s_mutex);
+            publish_status(client, "{\"state\":\"error\",\"reason\":\"sha256 setup failed\"}");
+            s_no_progress_attempts.fetch_add(1);
+            return;
+        }
+        s_partial_manifest = manifest;
+        s_partial_valid = true;
+        s_next_chunk = 0;
+        s_received.store(0);
+    }
+    const size_t session_start_chunk = s_next_chunk;
+    xSemaphoreGive(s_mutex);
+
+    ESP_LOGI(TAG, "OTA %s -> %s: %zu bytes in %zu chunks of %zu, %s chunk %zu, into %s",
+             esp_app_get_description()->version, manifest.version.c_str(), manifest.size,
+             total_chunks, manifest.chunk_size,
+             session_start_chunk ? "RESUMING at" : "starting at", session_start_chunk,
+             s_ota_partition->label);
     publish_status(client, std::format(
-        "{{\"state\":\"starting\",\"version\":\"{}\",\"size\":{},\"attempt\":{}}}",
-        manifest.version, manifest.size, attempt));
+        "{{\"state\":\"starting\",\"version\":\"{}\",\"size\":{},\"chunks\":{},\"resume_chunk\":{}}}",
+        manifest.version, manifest.size, total_chunks, session_start_chunk));
 
-    // OTA_WITH_SEQUENTIAL_WRITES erases flash incrementally as segments arrive instead of
-    // blocking here for a multi-second whole-partition erase.
-    if (const esp_err_t err = esp_ota_begin(s_ota_partition, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_handle);
-        err != ESP_OK) {
-        publish_status(client, std::format("{{\"state\":\"error\",\"reason\":\"esp_ota_begin 0x{:x}\"}}",
-                                           static_cast<unsigned>(err)));
-        return;
-    }
-    // psa_crypto_init() is idempotent; the hash op then streams alongside esp_ota_write().
-    s_sha_op = PSA_HASH_OPERATION_INIT;
-    if (psa_crypto_init() != PSA_SUCCESS ||
-        psa_hash_setup(&s_sha_op, PSA_ALG_SHA_256) != PSA_SUCCESS) {
-        esp_ota_abort(s_ota_handle);
-        s_ota_handle = 0;
-        publish_status(client, "{\"state\":\"error\",\"reason\":\"sha256 setup failed\"}");
-        return;
-    }
-    s_expected_size = manifest.size;
-    s_received.store(0);
     s_conn_lost.store(false);
-    xEventGroupClearBits(s_eg, OTA_BIT_DONE | OTA_BIT_FAIL);
+    xEventGroupClearBits(s_eg, OTA_BIT_CHUNK | OTA_BIT_FAIL);
     s_session_active.store(true);
 
     // rx-on-when-idle for the download; MUST be undone on every exit path below — a child
     // left rx-on burns ~78 mA until the battery dies.
     s_link->onOtaWindowBegin();
-    // QoS 0: the retained image rides the same TCP stream either way; QoS 1 would only add
-    // a pointless 1.8 MB-message PUBACK dance.
-    esp_mqtt_client_subscribe(client, s_topic_image.c_str(), 0);
 
-    // ── wait for the broker-streamed download to finish ──────────────────────
-    bool ok = false;
-    std::string fail_reason = "transfer failed";
-    const TickType_t session_start = xTaskGetTickCount();
-    size_t last_progress = 0;
-    while (true) {
-        const EventBits_t bits = xEventGroupWaitBits(s_eg, OTA_BIT_DONE | OTA_BIT_FAIL,
+    // ── pull chunks strictly in order ─────────────────────────────────────────
+    bool all_chunks = false;
+    std::string fail_reason;
+    const TickType_t session_start_tick = xTaskGetTickCount();
+    // Status roughly every 10% — between chunk messages the client is idle, so unlike the
+    // single-blob design these actually reach the broker live.
+    const size_t status_every = std::max<size_t>(total_chunks / 10, 1);
+
+    for (size_t chunk = session_start_chunk; chunk < total_chunks; ++chunk) {
+        const std::string topic = std::format("{}{}", s_topic_image_prefix, chunk);
+        // QoS 0: the retained chunk rides an already-reliable TCP stream, and loss just
+        // means the 20 s wait below expires and the session resumes next cycle.
+        if (esp_mqtt_client_subscribe(client, topic.c_str(), 0) < 0) {
+            fail_reason = std::format("subscribe to chunk {} failed", chunk);
+            break;
+        }
+        const EventBits_t bits = xEventGroupWaitBits(s_eg, OTA_BIT_CHUNK | OTA_BIT_FAIL,
                                                      pdTRUE, pdFALSE,
-                                                     pdMS_TO_TICKS(OTA_STALL_TIMEOUT_MS));
+                                                     pdMS_TO_TICKS(OTA_CHUNK_TIMEOUT_MS));
         if (bits & OTA_BIT_FAIL) {
-            if (s_conn_lost.load())
-                fail_reason = std::format("connection lost at offset {}", s_received.load());
+            fail_reason = s_conn_lost.load()
+                ? std::format("connection lost at chunk {}", chunk)
+                : std::format("chunk {} rejected", chunk);
             break;
         }
-        if (bits & OTA_BIT_DONE) {
-            ok = true;
+        if (!(bits & OTA_BIT_CHUNK)) {
+            fail_reason = std::format("chunk {} timed out after {} s", chunk, OTA_CHUNK_TIMEOUT_MS / 1000);
             break;
         }
-        const size_t received = s_received.load();
-        if (received == last_progress) {
-            fail_reason = std::format("no data for {} s at offset {}", OTA_STALL_TIMEOUT_MS / 1000, received);
+        if (chunk + 1 == total_chunks) {
+            all_chunks = true;
             break;
         }
-        if ((xTaskGetTickCount() - session_start) > pdMS_TO_TICKS(OTA_SESSION_CAP_MS)) {
+        if ((chunk + 1) % status_every == 0)
+            publish_status(client, std::format(
+                "{{\"state\":\"downloading\",\"chunk\":{},\"chunks\":{},\"received\":{}}}",
+                chunk + 1, total_chunks, s_received.load()));
+        if ((xTaskGetTickCount() - session_start_tick) > pdMS_TO_TICKS(OTA_SESSION_CAP_MS)) {
             fail_reason = "session cap exceeded";
             break;
         }
-        last_progress = received;
-        publish_status(client, std::format("{{\"state\":\"downloading\",\"received\":{},\"total\":{}}}",
-                                           received, manifest.size));
     }
 
-    // Stop accepting segments BEFORE touching the ota handle: late in-flight segments
-    // (unsubscribe can't recall what the broker already sent) bail out on this flag, and
-    // the mutex below orders us after any segment write already in progress.
     s_session_active.store(false);
-    esp_mqtt_client_unsubscribe(client, s_topic_image.c_str());
 
+    // ── finalize or keep for resume ───────────────────────────────────────────
+    bool ok = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (ok) {
+    if (all_chunks) {
         uint8_t sha[32] = {};
         size_t sha_len = 0;
         if (psa_hash_finish(&s_sha_op, sha, sizeof(sha), &sha_len) != PSA_SUCCESS ||
             sha_len != sizeof(sha) || std::memcmp(sha, manifest.sha256, sizeof(sha)) != 0) {
-            ok = false;
             fail_reason = "sha256 mismatch";
         } else if (const esp_err_t err = esp_ota_end(s_ota_handle); err != ESP_OK) {
             // esp_ota_end validates the image header/magic on top of our hash check.
-            ok = false;
             fail_reason = std::format("esp_ota_end 0x{:x}", static_cast<unsigned>(err));
             s_ota_handle = 0;  // esp_ota_end released it, success or not
         } else {
             s_ota_handle = 0;
-            if (const esp_err_t berr = esp_ota_set_boot_partition(s_ota_partition); berr != ESP_OK) {
-                ok = false;
+            if (const esp_err_t berr = esp_ota_set_boot_partition(s_ota_partition); berr != ESP_OK)
                 fail_reason = std::format("esp_ota_set_boot_partition 0x{:x}", static_cast<unsigned>(berr));
-            }
+            else
+                ok = true;
         }
+        // Complete downloads never resume — good ones reboot, bad ones must restart from 0.
+        discard_partial_locked();
     }
-    if (!ok) {
-        psa_hash_abort(&s_sha_op);  // safe on an already-terminated operation
-        if (s_ota_handle != 0) {
-            esp_ota_abort(s_ota_handle);
-            s_ota_handle = 0;
-        }
-    }
+    const size_t progressed = s_next_chunk - session_start_chunk;
     xSemaphoreGive(s_mutex);
 
     // Back to sleepy link mode in BOTH outcomes — on success the parent should see a clean
@@ -423,9 +486,15 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
     s_link->onOtaWindowEnd();
 
     if (!ok) {
-        publish_status(client, std::format("{{\"state\":\"error\",\"reason\":\"{}\",\"received\":{}}}",
-                                           fail_reason, s_received.load()));
-        ESP_LOGE(TAG, "OTA failed: %s", fail_reason.c_str());
+        // A session that fetched even one chunk is forward progress thanks to resume; only
+        // consecutive dead-on-arrival sessions burn the attempt budget.
+        const int attempts = progressed > 0 ? (s_no_progress_attempts.store(0), 0)
+                                            : s_no_progress_attempts.fetch_add(1) + 1;
+        publish_status(client, std::format(
+            "{{\"state\":\"error\",\"reason\":\"{}\",\"received\":{},\"resume_chunk\":{},\"no_progress_attempts\":{}}}",
+            fail_reason, s_received.load(), s_next_chunk, attempts));
+        ESP_LOGE(TAG, "OTA attempt failed: %s (will %s)", fail_reason.c_str(),
+                 s_partial_valid ? "resume next cycle" : "restart from scratch");
         return;  // retained install flag stays -> retried next cycle (attempt budget applies)
     }
 

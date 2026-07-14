@@ -329,10 +329,13 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
     // wait is explicitly bounded (connect 5 s/15 s, ACK 4 s, sensorstask's 15 s publish cap,
     // OTA's own 30 s no-progress watchdog), and the client is destroyed at cycle end.
     cfg.session.disable_keepalive = true;
-    // RX buffer (default 1024) sized up so the broker-streamed OTA image arrives in fewer,
-    // larger MQTT_EVENT_DATA segments and a sane OTA manifest always fits one event (see
-    // ota_updater.cpp's handle_manifest()). Heap cost only while a per-cycle client lives.
-    cfg.buffer.size              = 4096;
+    // RX buffer sized so a max-size OTA image chunk arrives as ONE MQTT_EVENT_DATA event —
+    // the property the chunked OTA protocol rests on (see ota_updater.h). Out-buffer stays
+    // small separately: the largest outbound message is a ~700 B discovery config, and
+    // leaving out_size 0 would clone the big RX size. Heap cost only while a per-cycle
+    // client lives.
+    cfg.buffer.size              = OTA_MQTT_RX_BUFFER_SIZE;
+    cfg.buffer.out_size          = 2048;
 
     if (s_cfg.use_tls) {
         // Broker is always dialed by literal IP, never a hostname (see MqttConfig::

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Stage an MQTT OTA update for the openthread-sleepy-sensor firmware.
 
-The device downloads the image as ONE retained MQTT message (broker-streamed; see
-main/ota_updater.h for the topic contract), so this script's only job is to park two
-retained messages on the broker and exit — Home Assistant's Update entity handles the
+The image is staged as N retained CHUNK messages (`<id>/ota/image/<n>`), each small enough
+for the device's MQTT RX buffer — the device pulls them in order and resumes a broken
+download mid-way (see main/ota_updater.h for the protocol and why chunking is required).
+Nothing needs to stay running after staging — Home Assistant's Update entity handles the
 approve/install step from there:
 
-    tools/ota_push.py build/openthread-sleepy-sensor.bin --device esp32-OT-sensor-0011223344556677
+    tools/ota_push.py build/openthread-sleepy-sensor.bin --device esp32-OT-MQTT-sensor-0011223344556677
 
 Options:
     --install   also set the retained install flag (bench workflow: no HA click needed)
@@ -33,6 +34,9 @@ import paho.mqtt.client as mqtt
 
 APP_DESC_OFFSET = 0x20  # esp_image_header_t (24) + first esp_image_segment_header_t (8)
 APP_DESC_MAGIC = 0xABCD5432
+# Must not exceed the firmware's OTA_MAX_CHUNK_SIZE (main/ota_updater.h) — the device
+# rejects manifests with a larger chunk_size because a chunk must fit its MQTT RX buffer.
+DEFAULT_CHUNK_SIZE = 8192
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -78,13 +82,41 @@ def connect(secrets: dict[str, str]) -> mqtt.Client:
     return client
 
 
-def publish_retained(client: mqtt.Client, topic: str, payload, label: str) -> None:
+def publish_retained(client: mqtt.Client, topic: str, payload, label: str,
+                     quiet: bool = False) -> None:
     info = client.publish(topic, payload, qos=1, retain=True)
     info.wait_for_publish(timeout=60)
     if not info.is_published():
         sys.exit(f"publishing {label} to {topic} timed out")
-    size = len(payload) if payload is not None else 0
-    print(f"  staged {label}: {topic} ({size} bytes, retained)")
+    if not quiet:
+        size = len(payload) if payload is not None else 0
+        print(f"  staged {label}: {topic} ({size} bytes, retained)")
+
+
+def collect_retained_ota_topics(client: mqtt.Client, device: str, wait_s: float = 3.0) -> set[str]:
+    """Every retained <device>/ota/* topic currently on the broker (image chunks included)."""
+    topics: set[str] = set()
+
+    def on_message(_c, _u, msg):
+        if msg.retain and msg.payload:
+            topics.add(msg.topic)
+
+    client.on_message = on_message
+    client.subscribe(f"{device}/ota/#", qos=0)
+    time.sleep(wait_s)
+    client.unsubscribe(f"{device}/ota/#")
+    client.on_message = None
+    return topics
+
+
+def clear_stale(client: mqtt.Client, device: str, keep: set[str]) -> None:
+    """Delete retained OTA messages not in `keep` — old chunks past a new image's count,
+    the pre-chunking single-blob topic, manifests from other stagings, and so on."""
+    for topic in sorted(collect_retained_ota_topics(client, device) - keep):
+        if topic.endswith("/ota/installed") or topic.endswith("/ota/status"):
+            continue  # device-owned topics, not staging artifacts
+        publish_retained(client, topic, None, f"(cleared) {topic}", quiet=True)
+        print(f"  cleared stale retained: {topic}")
 
 
 def main() -> None:
@@ -98,6 +130,9 @@ def main() -> None:
                          "'MQTT device_id:' line, or the HA device page)")
     ap.add_argument("--secrets", type=Path, default=PROJECT_ROOT / "secrets.yaml",
                     help="secrets.yaml to read the broker address/credentials from")
+    ap.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
+                    help=f"chunk payload bytes (default {DEFAULT_CHUNK_SIZE}; must not exceed "
+                         "the firmware's OTA_MAX_CHUNK_SIZE)")
     ap.add_argument("--install", action="store_true",
                     help="also set the retained install flag (skip the HA Install click)")
     ap.add_argument("--force", action="store_true",
@@ -105,32 +140,42 @@ def main() -> None:
     ap.add_argument("--watch", action="store_true",
                     help="stay connected and print <id>/ota/status + installed-version updates")
     ap.add_argument("--clear", action="store_true",
-                    help="delete all retained OTA messages for the device and exit")
+                    help="delete all retained OTA staging messages for the device and exit")
     args = ap.parse_args()
 
     secrets = read_secrets(args.secrets)
     t = {name: f"{args.device}/ota/{name}" for name in
-         ("manifest", "image", "install", "installed", "status")}
+         ("manifest", "install", "installed", "status")}
+    chunk_topic = lambda n: f"{args.device}/ota/image/{n}"  # noqa: E731
 
     client = connect(secrets)
     try:
         if args.clear:
-            for name in ("manifest", "image", "install"):
-                publish_retained(client, t[name], None, f"(cleared) {name}")
-            print("retained OTA messages cleared")
+            clear_stale(client, args.device, keep=set())
+            print("retained OTA staging messages cleared")
             return
 
         image = args.image.read_bytes()
         version = read_app_version(image)
+        chunks = [image[i:i + args.chunk_size] for i in range(0, len(image), args.chunk_size)]
         manifest = json.dumps({
             "version": version,
             "size": len(image),
             "sha256": hashlib.sha256(image).hexdigest(),
+            "chunk_size": args.chunk_size,
             "force": args.force,
         })
-        print(f"staging {args.image.name}: version {version}, {len(image)} bytes, "
-              f"for device {args.device}")
-        publish_retained(client, t["image"], image, "image")
+        print(f"staging {args.image.name}: version {version}, {len(image)} bytes "
+              f"in {len(chunks)} chunks of {args.chunk_size}, for device {args.device}")
+
+        # Order matters: chunks first, manifest last — a device waking mid-staging must not
+        # see a manifest whose chunks aren't all retained yet. Stale leftovers (a previous
+        # image's extra chunks, the old single-blob topic) are cleared before that.
+        clear_stale(client, args.device,
+                    keep={chunk_topic(n) for n in range(len(chunks))} | {t["install"]})
+        for n, chunk in enumerate(chunks):
+            publish_retained(client, chunk_topic(n), chunk, f"chunk {n}", quiet=True)
+        print(f"  staged {len(chunks)} chunk messages ({chunk_topic(0)} … {chunk_topic(len(chunks) - 1)})")
         publish_retained(client, t["manifest"], manifest, "manifest")
         if args.install:
             publish_retained(client, t["install"], "install", "install flag")
