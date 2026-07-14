@@ -1,7 +1,11 @@
-# Custom partition table: ESP32-C6FH4 has 4 MB flash, so give the app a 2 MB
-# factory partition (the default single-app layout caps it at 1 MB, which the
-# std::format-using firmware overflows). nvs/phy_init keep the IDF default offsets.
+# Dual-slot OTA layout for the ESP32-C6FH4's 4 MB flash. nvs/phy_init keep the IDF default
+# offsets (the cached Thread dataset in nvs survives the migration from the old single-factory
+# layout). No factory partition: USB flashing writes ota_0, MQTT OTA alternates slots via
+# otadata. 2x 1984K is the largest symmetric pair that fits 4 MB with these offsets; the
+# ~1.8 MB app leaves ~160K headroom per slot (esp_delta_ota is the escape hatch if outgrown).
 # Name,     Type, SubType, Offset,   Size, Flags
 nvs,        data, nvs,     0x9000,   24K,
 phy_init,   data, phy,     0xf000,   4K,
-factory,    app,  factory, 0x10000,  2M,
+otadata,    data, ota,     0x10000,  8K,
+ota_0,      app,  ota_0,   0x20000,  1984K,
+ota_1,      app,  ota_1,   0x210000, 1984K,

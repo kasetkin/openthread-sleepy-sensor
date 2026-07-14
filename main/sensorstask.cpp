@@ -6,11 +6,32 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
+#include <esp_ota_ops.h>
 #include <esp_system.h>
 
 #include "common_utils.h"
 #include "mqtt_sender.h"
+#include "ota_updater.h"
 #include "lp_sensor_core.h"
+
+// First broker-ACKed publish after an OTA reboot proves the new image out and cancels the
+// bootloader's pending rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE). If this never runs,
+// the REBOOT_AFTER_FAILS supervisor below restarts a still-PENDING_VERIFY image and the
+// bootloader falls back to the previous slot — the supervisor doubles as the rollback watchdog.
+static void markAppValidOnFirstConfirmedPublish()
+{
+    static bool s_checked = false;
+    if (s_checked)
+        return;
+    s_checked = true;
+
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI("sensors-task", "OTA image confirmed by successful publish — rollback cancelled");
+    }
+}
 
 SensorsTask::SensorsTask(SensorsTaskSettings settings):
     m_settings{settings},
@@ -140,8 +161,14 @@ void SensorsTask::executeTask()
                         // Only ack on CONFIRMED delivery -- an attempted-but-failed publish
                         // must leave LP's baseline untouched, so the still-undelivered value
                         // keeps being flagged next cycle instead of silently getting dropped.
-                        if (publishedOk)
+                        if (publishedOk) {
                             lp_sensor_core_ack_delivered(state.cal_temp_c, state.cal_hum_pct);
+                            markAppValidOnFirstConfirmedPublish();
+                        }
+                    } else if (ota_session_in_progress()) {
+                        // An OTA download legitimately owns the publish task for minutes;
+                        // this is not a stall (see the cycleOk exemption below).
+                        ESP_LOGI(TAG, "OTA download in progress — leaving the publish window open");
                     } else {
                         ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
                     }
@@ -159,7 +186,10 @@ void SensorsTask::executeTask()
         // "Delivered, or nothing new to deliver" both count as a healthy cycle -- mirrors the
         // original HP-only code's (publishedOk || skipSameValuesCycle) reboot-supervisor gate.
         // Not attaching at all is never healthy, even if LP would have had nothing new to say.
-        const bool cycleOk = publishedOk || (attached && !shouldWake);
+        // An in-flight OTA download also counts as healthy: it blocks the publish path for
+        // minutes by design, and letting REBOOT_AFTER_FAILS fire mid-download would reboot
+        // (and with rollback enabled, roll back) a perfectly good update in progress.
+        const bool cycleOk = publishedOk || (attached && !shouldWake) || ota_session_in_progress();
 
         // Honest local indicator: 1 blink = data reached the broker, 5 = should have
         // published but didn't. No LED at all for "LP had nothing new" -- that's the most

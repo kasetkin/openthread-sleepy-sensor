@@ -63,6 +63,26 @@ static void set_poll_period(uint32_t ms)
     esp_openthread_lock_release();
 }
 
+// OTA-download link boost: a sleepy child only receives downlink in response to its data
+// polls, which caps a ~1.8 MB firmware stream at the poll cadence. Flipping mRxOnWhenIdle
+// makes the parent forward frames as they arrive (the child renegotiates via MLE Child
+// Update), turning the download into a normal always-listening TCP stream. Only the
+// rx-on bit changes — still an MTD with minimal network data, so restoring is symmetric
+// and doesn't depend on remembering prior state. esp_openthread's PM lock keeps the CPU
+// awake while the radio is rx-on, which is exactly what a continuous download needs.
+static void set_rx_on_when_idle(bool rx_on)
+{
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otLinkModeConfig link_mode = otThreadGetLinkMode(esp_openthread_get_instance());
+    link_mode.mRxOnWhenIdle = rx_on;
+    const otError err = otThreadSetLinkMode(esp_openthread_get_instance(), link_mode);
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE)
+        ESP_LOGE(TAG, "otThreadSetLinkMode(rx_on=%d) failed: %d", rx_on, err);
+    else
+        ESP_LOGI(TAG, "OT link mode: rx-on-when-idle %s", rx_on ? "ON (OTA window)" : "off (sleepy)");
+}
+
 static void setNat64Prefix(const uint8_t *p12)
 {
     std::copy_n(p12, 12, s_nat64_prefix);
@@ -306,6 +326,10 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.waitForBrokerReachable = waitForBrokerReachable;
     link.onPublishWindowBegin = []() { set_poll_period(POLL_FAST_MS); };
     link.onPublishWindowEnd = []() { set_poll_period(POLL_SLOW_MS); };
+    // Poll period needs no save/restore around the rx-on stretch: it's ignored while
+    // rx-on, and the enclosing publish window's begin/end hooks own it either side.
+    link.onOtaWindowBegin = []() { set_rx_on_when_idle(true); };
+    link.onOtaWindowEnd = []() { set_rx_on_when_idle(false); };
     link.refresh = refresh_nat64_prefix;
     return link;
 }

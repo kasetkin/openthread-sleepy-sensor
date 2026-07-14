@@ -9,11 +9,14 @@
 #include <type_traits>
 #include <utility>
 
+#include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "mqtt_client.h"
+
+#include "ota_updater.h"
 
 static const char *TAG = "mqtt-sender";
 
@@ -35,9 +38,10 @@ static constexpr uint32_t BROKER_REACHABLE_WAIT_MS = 5000;
 // missing one value (humidity disabled, battery ADC failure) must not permanently skip that
 // sensor's discovery -- it goes out on the first later cycle that carries the value.
 enum DiscoveryBit : uint8_t {
-    DISC_TEMP = 1 << 0,
-    DISC_HUM  = 1 << 1,
-    DISC_BATT = 1 << 2,  // covers the Battery + Voltage pair -- always published together
+    DISC_TEMP   = 1 << 0,
+    DISC_HUM    = 1 << 1,
+    DISC_BATT   = 1 << 2,  // covers the Battery + Voltage pair -- always published together
+    DISC_UPDATE = 1 << 3,  // HA `update` entity config + retained installed-version -- always published together
 };
 
 static MqttConfig s_cfg;
@@ -105,7 +109,7 @@ static constexpr std::string_view DISCOVERY_FMT =
     "\"value_template\":\"{{{{value_json.{}}}}}\","
     "\"unit_of_measurement\":\"{}\","
     "\"unique_id\":\"{}_{}\","
-    "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\"}}"
+    "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\",\"sw_version\":\"{}\"}}"
     "}}";
 
 // DISCOVERY_FMT plus "entity_category":"diagnostic" -- deliberately the same placeholders in the
@@ -121,12 +125,33 @@ static constexpr std::string_view DISCOVERY_DIAG_FMT =
     "\"value_template\":\"{{{{value_json.{}}}}}\","
     "\"unit_of_measurement\":\"{}\","
     "\"unique_id\":\"{}_{}\","
-    "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\"}}"
+    "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\",\"sw_version\":\"{}\"}}"
+    "}}";
+
+// HA MQTT `update` entity: gives the device an "Install" button + version pair in HA.
+// installed_version comes from the retained <id>/ota/installed topic (plain version string),
+// latest_version straight from the retained OTA manifest, and HA's Install click publishes
+// a RETAINED command (retain:true below) so the sleeping device can't miss it — see
+// ota_updater.h for the topic contract. device_class "firmware" files it with the device's
+// firmware section; the device block matches the sensors' so all entities share one HA device.
+static constexpr std::string_view UPDATE_DISCOVERY_FMT =
+    "{{"
+    "\"name\":\"Firmware\","
+    "\"device_class\":\"firmware\","
+    "\"state_topic\":\"{}\","
+    "\"latest_version_topic\":\"{}\","
+    "\"latest_version_template\":\"{{{{ value_json.version }}}}\","
+    "\"command_topic\":\"{}\","
+    "\"payload_install\":\"install\","
+    "\"retain\":true,"
+    "\"unique_id\":\"{}_fw\","
+    "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\",\"sw_version\":\"{}\"}}"
     "}}";
 
 // The other format strings used below, named (like DISCOVERY_FMT above) so their compile-time
 // .size() can size the fixed buffers that follow instead of hand-counting characters.
 static constexpr std::string_view DISCOVERY_TOPIC_FMT = "homeassistant/sensor/{}/{}/config";
+static constexpr std::string_view UPDATE_DISCOVERY_TOPIC_FMT = "homeassistant/update/{}/firmware/config";
 static constexpr std::string_view STATE_TOPIC_FMT      = "{}/state";
 static constexpr std::string_view STATE_FMT_BOTH  = "{{\"t\":{:.3g},\"h\":{:.3g}}}";
 static constexpr std::string_view STATE_FMT_TEMP  = "{{\"t\":{:.3g}}}";
@@ -165,10 +190,20 @@ static constexpr size_t MAX_KEY_LEN          = sizeof("t") - 1;  // "h"/"b"/"v" 
 // lemma above only applies to literal string lengths, not to how wide a formatted number can get.
 static constexpr size_t MAX_FORMATTED_FLOAT_LEN = 24;
 
+// Widest of the ota/* topic strings ever interpolated into UPDATE_DISCOVERY_FMT below
+// ("<device_id>/" + suffix; the three used there are manifest/install/installed).
+static constexpr size_t MAX_OTA_TOPIC_LEN = MAX_DEVICE_ID_LEN + 1 /* '/' */ +
+    std::max({OTA_SUFFIX_MANIFEST.size(), OTA_SUFFIX_INSTALL.size(), OTA_SUFFIX_INSTALLED.size()});
+// esp_app_desc_t::version is a fixed char[32] including its NUL.
+static constexpr size_t MAX_SW_VERSION_LEN = sizeof(esp_app_desc_t::version) - 1;
+
 static constexpr size_t MAX_DISCOVERY_TOPIC_LEN =
     DISCOVERY_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN + MAX_DEVICE_CLASS_LEN;
+static constexpr size_t MAX_UPDATE_DISCOVERY_TOPIC_LEN =
+    UPDATE_DISCOVERY_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 static constexpr size_t MAX_STATE_TOPIC_LEN = STATE_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
-static constexpr size_t TOPIC_BUF = std::max(MAX_DISCOVERY_TOPIC_LEN, MAX_STATE_TOPIC_LEN) + 1;  // +1 NUL
+static constexpr size_t TOPIC_BUF = std::max({MAX_DISCOVERY_TOPIC_LEN, MAX_UPDATE_DISCOVERY_TOPIC_LEN,
+                                              MAX_STATE_TOPIC_LEN}) + 1;  // +1 NUL
 
 // device_id is substituted 3x in DISCOVERY_FMT above (state_topic, unique_id, device.identifiers)
 // -- verified against the actual format call's argument list, not just eyeballed, after an
@@ -176,7 +211,13 @@ static constexpr size_t TOPIC_BUF = std::max(MAX_DISCOVERY_TOPIC_LEN, MAX_STATE_
 // DISCOVERY_DIAG_FMT has the identical placeholder list, so max() of the two sizes covers both.
 static constexpr size_t DISCOVERY_PAYLOAD_BUF = std::max(DISCOVERY_FMT.size(), DISCOVERY_DIAG_FMT.size())
     + MAX_NAME_LEN + MAX_DEVICE_CLASS_LEN + 3 * MAX_DEVICE_ID_LEN + 2 * MAX_KEY_LEN
-    + MAX_UNIT_LEN + MAX_DEVICE_NAME_LEN + 1;  // +1 NUL
+    + MAX_UNIT_LEN + MAX_DEVICE_NAME_LEN + MAX_SW_VERSION_LEN + 1;  // +1 NUL
+
+// UPDATE_DISCOVERY_FMT's argument list: three ota/* topics (state/latest/command), then
+// device_id twice (unique_id, identifiers), device name, sw_version — same lemma as above.
+static constexpr size_t UPDATE_DISCOVERY_PAYLOAD_BUF = UPDATE_DISCOVERY_FMT.size()
+    + 3 * MAX_OTA_TOPIC_LEN + 2 * MAX_DEVICE_ID_LEN + MAX_DEVICE_NAME_LEN
+    + MAX_SW_VERSION_LEN + 1;  // +1 NUL
 
 // convertVoltageToPercent() clamps to 0..100, so "100" is the widest "b" can ever print.
 static constexpr size_t MAX_BATTERY_PCT_LEN = sizeof("100") - 1;
@@ -237,6 +278,18 @@ static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
         if (ctx->received_acks.fetch_add(1) + 1 >= ctx->expected_acks.load())
             xEventGroupSetBits(ctx->eg, BIT_ALL_ACKED);
         break;
+    case MQTT_EVENT_DATA: {
+        // Inbound traffic exists solely for OTA (retained manifest/install replies, and the
+        // broker-streamed image during a download session) — route it all to ota_updater,
+        // which demuxes by topic. Blocking in there (flash writes) is deliberate: it stalls
+        // this task's socket reads so TCP backpressure paces the broker.
+        const auto *ev = static_cast<esp_mqtt_event_handle_t>(event_data);
+        ota_on_mqtt_data(ev->topic, static_cast<size_t>(ev->topic_len),
+                         ev->data, static_cast<size_t>(ev->data_len),
+                         static_cast<size_t>(ev->current_data_offset),
+                         static_cast<size_t>(ev->total_data_len));
+        break;
+    }
     case MQTT_EVENT_ERROR: {
         const auto *err = static_cast<esp_mqtt_event_handle_t>(event_data)->error_handle;
         if (err) {
@@ -260,6 +313,10 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
     cfg.credentials.username     = s_cfg.username.c_str();
     cfg.credentials.authentication.password = s_cfg.password.c_str();
     cfg.session.keepalive        = 10;
+    // RX buffer (default 1024) sized up so the broker-streamed OTA image arrives in fewer,
+    // larger MQTT_EVENT_DATA segments and a sane OTA manifest always fits one event (see
+    // ota_updater.cpp's handle_manifest()). Heap cost only while a per-cycle client lives.
+    cfg.buffer.size              = 4096;
 
     if (s_cfg.use_tls) {
         // Broker is always dialed by literal IP, never a hostname (see MqttConfig::
@@ -305,25 +362,50 @@ static void publish_discovery(esp_mqtt_client_handle_t client, std::string_view 
     const size_t topicLen = format_into(topicBuf, DISCOVERY_TOPIC_FMT, device_id, device_class);
 
     std::array<char, DISCOVERY_PAYLOAD_BUF> payloadBuf;
+    const char *sw_version = esp_app_get_description()->version;
     const size_t payloadLen = diagnostic
         ? format_into(payloadBuf, DISCOVERY_DIAG_FMT,
               name, device_class,
               device_id, key,
               unit,
               device_id, key,
-              device_id, device_name)
+              device_id, device_name, sw_version)
         : format_into(payloadBuf, DISCOVERY_FMT,
               name, device_class,
               device_id, key,
               unit,
               device_id, key,
-              device_id, device_name);
+              device_id, device_name, sw_version);
 
     if (topicLen == 0 || payloadLen == 0)
         return;  // format_into() already logged the truncation
 
     esp_mqtt_client_publish(client, topicBuf.data(), payloadBuf.data(),
                             static_cast<int>(payloadLen), 1, 1);
+}
+
+// Publishes the HA `update` entity's discovery config plus the retained installed-version
+// message it reads its state from — always together (see DISC_UPDATE), so HA never sees a
+// version-less update entity. Two QoS-1 messages; callers must account for both ACKs.
+static void publish_update_discovery(esp_mqtt_client_handle_t client, std::string_view device_id,
+                                     std::string_view device_name)
+{
+    std::array<char, TOPIC_BUF> topicBuf;
+    const size_t topicLen = format_into(topicBuf, UPDATE_DISCOVERY_TOPIC_FMT, device_id);
+
+    std::array<char, UPDATE_DISCOVERY_PAYLOAD_BUF> payloadBuf;
+    const char *sw_version = esp_app_get_description()->version;
+    const size_t payloadLen = format_into(payloadBuf, UPDATE_DISCOVERY_FMT,
+        ota_topic_installed(), ota_topic_manifest(), ota_topic_install(),
+        device_id, device_id, device_name, sw_version);
+
+    if (topicLen == 0 || payloadLen == 0)
+        return;  // format_into() already logged the truncation
+
+    esp_mqtt_client_publish(client, topicBuf.data(), payloadBuf.data(),
+                            static_cast<int>(payloadLen), 1, 1);
+    // len 0 => esp-mqtt uses strlen(); retained so HA has installed_version across restarts.
+    esp_mqtt_client_publish(client, ota_topic_installed(), sw_version, 0, 1, 1);
 }
 
 // ── publish task — owns the client lifecycle ──────────────────────────────────
@@ -393,25 +475,38 @@ static bool run_publish_cycle(const PublishParams &params)
     if (bits & BIT_CONNECTED) {
         const std::string_view dev = s_cfg.device_id;
         const std::string_view dev_name = s_cfg.device_name;
+
+        // OTA check rides the publish window: subscribing now means the broker's retained
+        // manifest/install replies (if it holds any) arrive while we're waiting for the
+        // publish ACKs below — near-zero added awake time on the common no-update cycle.
+        // QoS 0: retained delivery over an already-reliable TCP link. See ota_updater.h.
+        esp_mqtt_client_subscribe(client.get(), ota_topic_manifest(), 0);
+        esp_mqtt_client_subscribe(client.get(), ota_topic_install(), 0);
+
         // Battery is deliberately absent from hasAny: it only ever rides along on a
         // temperature/humidity publish (see mqtt_send_sensor_data()'s doc comment), so it can
         // neither trigger a cycle nor carry one alone.
         const bool hasAny = hasTemp || hasHumid;
 
         // Discovery configs still owed this boot for the values present in THIS cycle.
+        // DISC_UPDATE (the HA update entity + installed-version pair) isn't tied to any
+        // sensor value, so it's owed on whichever publishing cycle comes first.
         const auto discoveryWant = static_cast<uint8_t>((hasTemp ? DISC_TEMP : 0)
                                                       | (hasHumid ? DISC_HUM : 0)
-                                                      | (hasBatt ? DISC_BATT : 0));
+                                                      | (hasBatt ? DISC_BATT : 0)
+                                                      | DISC_UPDATE);
         const auto discoveryNeed = hasAny
             ? static_cast<uint8_t>(discoveryWant & ~s_discovery_sent_mask.load()) : uint8_t{0};
 
         // Expected ACKs must match what we actually publish below: one state message plus one
-        // discovery message per still-owed sensor (two for DISC_BATT: Battery and Voltage).
-        // A fixed count assuming every discovery is sent would leave BIT_ALL_ACKED forever
-        // unset on any cycle that sends fewer, wrongly failing the cycle.
+        // discovery message per still-owed sensor (two for DISC_BATT: Battery and Voltage;
+        // two for DISC_UPDATE: update config and installed-version). A fixed count assuming
+        // every discovery is sent would leave BIT_ALL_ACKED forever unset on any cycle that
+        // sends fewer, wrongly failing the cycle.
         const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
                                  + ((discoveryNeed & DISC_HUM) ? 1 : 0)
-                                 + ((discoveryNeed & DISC_BATT) ? 2 : 0);
+                                 + ((discoveryNeed & DISC_BATT) ? 2 : 0)
+                                 + ((discoveryNeed & DISC_UPDATE) ? 2 : 0);
         const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
         // Set counters BEFORE publishing so the handler never races ahead
@@ -427,6 +522,8 @@ static bool run_publish_cycle(const PublishParams &params)
             publish_discovery(client.get(), dev, dev_name, "Battery", "battery", "%", "b", true);
             publish_discovery(client.get(), dev, dev_name, "Voltage", "voltage", "V", "v", true);
         }
+        if (discoveryNeed & DISC_UPDATE)
+            publish_update_discovery(client.get(), dev, dev_name);
 
         if (hasAny) {
             std::array<char, STATE_BUF> stateBuf;
@@ -465,6 +562,13 @@ static bool run_publish_cycle(const PublishParams &params)
         } else {
             ESP_LOGW(TAG, "no sensor values to publish this cycle");
         }
+
+        // A staged update only starts from a fully healthy cycle (connected AND state ACKed),
+        // so a flaky link fails fast above instead of kicking off a doomed ~1.8 MB download.
+        // On success this reboots into the new image and never returns; on failure/deferral
+        // it has already restored the sleepy link mode and we just tear down as usual.
+        if (ok && ota_update_due())
+            ota_run_session(client.get(), params.battery_percent);
     } else {
         ESP_LOGE(TAG, "MQTT connection failed, skipping cycle");
     }
@@ -504,6 +608,7 @@ void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link)
     s_cfg = cfg;
     s_link = link;
     s_tls_ca_cert_pem = wrap_pem_certificate(cfg.tls_ca_cert_b64);  // "" if tls_ca_cert_b64 is empty
+    ota_updater_init(s_cfg.device_id, link);  // builds the <device_id>/ota/* topic strings
     if (!s_idle_eg) {
         s_idle_eg = xEventGroupCreate();
         if (s_idle_eg)

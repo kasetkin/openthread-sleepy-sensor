@@ -50,6 +50,15 @@ struct NetworkLink
     std::function<void()> onPublishWindowBegin;
     std::function<void()> onPublishWindowEnd;
 
+    // OTA-download hooks (OT: temporarily rx-on-when-idle so the parent forwards the
+    // firmware stream continuously instead of per data poll — the difference between a
+    // ~3-6 min and a ~15 min transfer; Wi-Fi: no-op). onOtaWindowEnd MUST run on every
+    // abort path: a child left rx-on burns ~78 mA RX until the battery dies. Nested
+    // inside a publish window (begin after onPublishWindowBegin, end before
+    // onPublishWindowEnd), so the poll period it restores to is the window's fast one.
+    std::function<void()> onOtaWindowBegin;
+    std::function<void()> onOtaWindowEnd;
+
     // Recovery after a failed publish (OT: re-scan NAT64 route; Wi-Fi: reconnect kick).
     std::function<void()> refresh;
 };

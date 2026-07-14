@@ -64,6 +64,37 @@ If you additionally want to pin your own CA or a self-signed leaf certificate ra
 trust the full public CA bundle, set `mqtt_tls_ca_cert` in `secrets.yaml` to its base64 body
 (no `-----BEGIN/END-----` markers, no embedded newlines).
 
+## OTA firmware updates over MQTT
+
+Firmware can be updated over the air with MQTT as the only transport — no HTTP server, works
+identically over Thread and Wi-Fi. The image is staged on the broker as **one retained MQTT
+message** which the broker streams to the device (esp-mqtt delivers it as sequential
+`MQTT_EVENT_DATA` segments fed straight into `esp_ota_write()`; TCP receive-window
+backpressure is the flow control — no chunk protocol, no live host during the download).
+
+Workflow:
+
+1. **Stage** (build machine): `tools/ota_push.py --device <device_id>` publishes the retained
+   manifest + image (version is read from the .bin's `esp_app_desc_t`; the device id is
+   printed in the boot log as `MQTT device_id:`).
+2. **Install** (Home Assistant): the device advertises an MQTT `update` entity, so HA shows
+   "Update available" with an **Install** button; the click publishes a retained install
+   command the sleeping device picks up on its next wake. (Bench shortcut: `--install`.)
+3. **Download**: the device verifies version/battery (≥30 % unless the manifest says
+   `"force":true`), temporarily switches its Thread link to **rx-on-when-idle** so the
+   download isn't throttled by the sleepy data-poll cadence (~3–6 min for a ~1.8 MB image
+   instead of 15+), checks SHA-256, flips the boot partition and reboots.
+4. **Confirm or roll back**: the new image boots as `PENDING_VERIFY`
+   (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). Its first broker-ACKed publish marks it valid;
+   if that never happens, the existing failed-cycles reboot supervisor restarts the device
+   and the bootloader falls back to the previous slot automatically.
+
+Topics live under `<device_id>/ota/*` — see [ota_updater.h](main/ota_updater.h) for the
+contract. The flash layout is two 1984 K app slots (`ota_0`/`ota_1` + `otadata`,
+[partitions.csv](partitions.csv)); migrating a device from the old single-`factory` layout
+requires one final USB flash. `tools/ota_push.py --clear` removes the retained image from the
+broker once every device is updated (harmless to leave; it is ~1.8 MB of broker storage).
+
 ## CPU frequency / power
 
 The HP core runs at **160 MHz** (the ESP32-C6 maximum). It is deliberately **not** capped to

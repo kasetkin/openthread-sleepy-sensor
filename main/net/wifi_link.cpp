@@ -164,6 +164,8 @@ NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
     link.waitForBrokerReachable = waitForBrokerReachable;
     link.onPublishWindowBegin = noop;
     link.onPublishWindowEnd = noop;
+    link.onOtaWindowBegin = noop;   // Wi-Fi STA is already always-RX during the awake window
+    link.onOtaWindowEnd = noop;
     link.refresh = refresh;
     return link;
 }
