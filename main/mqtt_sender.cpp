@@ -297,9 +297,16 @@ static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
                      err->error_type, err->esp_tls_last_esp_err, err->esp_transport_sock_errno,
                      err->esp_tls_stack_err, err->esp_tls_cert_verify_flags);
         }
+        ota_on_mqtt_error();  // abort an in-flight download promptly (no-op otherwise)
         xEventGroupSetBits(ctx->eg, BIT_ERROR);
         break;
     }
+    case MQTT_EVENT_DISCONNECTED:
+        // Mid-cycle drop (broker restart, link loss). The publish path's own bounded waits
+        // handle it; an in-flight OTA download must abort NOW rather than idle out its
+        // 30 s no-progress watchdog against a connection that no longer exists.
+        ota_on_mqtt_error();
+        break;
     default:
         break;
     }
@@ -312,7 +319,16 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
     cfg.broker.address.uri       = uri;
     cfg.credentials.username     = s_cfg.username.c_str();
     cfg.credentials.authentication.password = s_cfg.password.c_str();
-    cfg.session.keepalive        = 10;
+    // Keepalive OFF, deliberately. The OTA image arrives as ONE multi-minute MQTT message;
+    // esp-mqtt pings keepalive/2 after the last control packet and hard-aborts when the
+    // PINGRESP misses the deadline (process_keepalive() in mqtt_client.c) — but the broker's
+    // PINGRESP is queued behind megabytes of in-flight image on an ordered TCP stream, and
+    // esp-mqtt parses one message at a time besides, so ANY finite keepalive shorter than the
+    // whole transfer kills the download partway (hardware-observed: 3 silent "starting"-then-
+    // dead attempts). Liveness never rested on keepalive anyway: this per-cycle client's every
+    // wait is explicitly bounded (connect 5 s/15 s, ACK 4 s, sensorstask's 15 s publish cap,
+    // OTA's own 30 s no-progress watchdog), and the client is destroyed at cycle end.
+    cfg.session.disable_keepalive = true;
     // RX buffer (default 1024) sized up so the broker-streamed OTA image arrives in fewer,
     // larger MQTT_EVENT_DATA segments and a sane OTA manifest always fits one event (see
     // ota_updater.cpp's handle_manifest()). Heap cost only while a per-cycle client lives.

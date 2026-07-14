@@ -46,6 +46,11 @@ void ota_on_mqtt_data(const char *topic, size_t topic_len,
                       const char *data, size_t data_len,
                       size_t offset, size_t total);
 
+// Route MQTT_EVENT_ERROR / MQTT_EVENT_DISCONNECTED here (esp-mqtt event-handler context).
+// Aborts an active download session immediately with a "connection lost" verdict instead of
+// letting it idle out the 30 s no-progress watchdog; no-op when no session is running.
+void ota_on_mqtt_error();
+
 // True once a retained manifest with a version different from the running image AND a
 // retained install request have both been seen this cycle (and the per-boot attempt budget
 // is not exhausted). Cleared implicitly by rebooting into the new image.

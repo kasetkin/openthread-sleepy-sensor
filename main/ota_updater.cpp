@@ -55,6 +55,7 @@ static EventGroupHandle_t s_eg = nullptr;
 
 static std::atomic<bool>   s_install_requested{false};
 static std::atomic<bool>   s_session_active{false};
+static std::atomic<bool>   s_conn_lost{false};   // set by ota_on_mqtt_error() during a session
 static std::atomic<size_t> s_received{0};
 static std::atomic<int>    s_attempts_this_boot{0};
 
@@ -75,13 +76,16 @@ static bool topic_is(const char *topic, size_t topic_len, const std::string &ful
     return topic_len == full.size() && std::memcmp(topic, full.data(), topic_len) == 0;
 }
 
-// Non-retained, QoS 0 — purely informational; loss is acceptable.
+// Non-retained, QoS 0 — purely informational; loss is acceptable but not invisible: a
+// failed enqueue (dead connection) is logged so the serial trail explains a silent broker.
 static void publish_status(esp_mqtt_client_handle_t client, const std::string &json)
 {
+    int msg_id = -1;
     if (client)
-        esp_mqtt_client_publish(client, s_topic_status.c_str(), json.c_str(),
-                                static_cast<int>(json.size()), 0, 0);
-    ESP_LOGI(TAG, "status: %s", json.c_str());
+        msg_id = esp_mqtt_client_publish(client, s_topic_status.c_str(), json.c_str(),
+                                         static_cast<int>(json.size()), 0, 0);
+    ESP_LOGI(TAG, "status%s: %s", msg_id < 0 ? " (NOT delivered — connection down)" : "",
+             json.c_str());
 }
 
 static bool parse_sha256_hex(std::string_view hex, uint8_t out[32])
@@ -262,6 +266,14 @@ void ota_on_mqtt_data(const char *topic, size_t topic_len,
         handle_image_segment(data, data_len, offset, total);
 }
 
+void ota_on_mqtt_error()
+{
+    if (!s_session_active.load())
+        return;
+    s_conn_lost.store(true);
+    xEventGroupSetBits(s_eg, OTA_BIT_FAIL);
+}
+
 bool ota_update_due()
 {
     if (!s_install_requested.load())
@@ -327,6 +339,7 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
     }
     s_expected_size = manifest.size;
     s_received.store(0);
+    s_conn_lost.store(false);
     xEventGroupClearBits(s_eg, OTA_BIT_DONE | OTA_BIT_FAIL);
     s_session_active.store(true);
 
@@ -346,8 +359,11 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
         const EventBits_t bits = xEventGroupWaitBits(s_eg, OTA_BIT_DONE | OTA_BIT_FAIL,
                                                      pdTRUE, pdFALSE,
                                                      pdMS_TO_TICKS(OTA_STALL_TIMEOUT_MS));
-        if (bits & OTA_BIT_FAIL)
+        if (bits & OTA_BIT_FAIL) {
+            if (s_conn_lost.load())
+                fail_reason = std::format("connection lost at offset {}", s_received.load());
             break;
+        }
         if (bits & OTA_BIT_DONE) {
             ok = true;
             break;
