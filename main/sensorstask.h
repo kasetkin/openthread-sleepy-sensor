@@ -6,6 +6,8 @@
 #include <functional>
 #include <cstdint>
 #include <expected>
+#include <array>
+#include <algorithm>
 #include <esp_adc/adc_oneshot.h>
 #include <esp_adc/adc_cali.h>
 #include <esp_adc/adc_cali_scheme.h>
@@ -20,11 +22,97 @@ public:
     std::optional<float> envHumidity;
     std::optional<float> barometricPressure;
 
-    static constexpr double MAX_VOLTAGE = 4090.0; // mV — fully charged Li-ion (measured)
-    static constexpr double MIN_VOLTAGE = 3200.0; // mV — empty (0 %)
+    /// 0 % / 100 % anchors for the CURRENT pack (LiitoKala NCR18650B), applied to the
+    /// pack-independent BATTERY_CURVE below at conversion time; after a battery swap only these
+    /// two numbers change, never the curve. Planned to become MQTT-runtime settings.
+    /// MIN: 0 % must land while the XIAO's LDO is still near regulation -- at ~3.2 V battery the
+    /// 3.3 V rail already sits at the C6's 3.0 V floor and a TX-burst sag risks brownout; the
+    /// board has no over-discharge cutoff, and the knee below 3.4 V holds only ~2-3 % capacity.
+    /// MAX: measured resting full charge (4.124 V settled, minus ~10 mV publish-window load sag).
+    /// Deliberately NOT the 4.20 V charger CV -- that voltage exists only on the charger, and
+    /// anchoring there would cap the gauge at ~92 % forever once the surface charge settles
+    /// (Meshtastic's 4190 mV default accepts that tradeoff; we calibrate to the pack instead).
+    static constexpr int MIN_VOLTAGE = 3300; // mV → 0 %
+    static constexpr int MAX_VOLTAGE = 4120; // mV → 100 %
 
-    static int convertVoltageToPercent(int batteryVoltageMilliV);
+    static constexpr int convertVoltageToPercent(int batteryVoltageMilliV,
+                                                 int minMv = MIN_VOLTAGE, int maxMv = MAX_VOLTAGE);
+
+private:
+    struct BatteryCurvePoint
+    {
+        int mv;
+        int pct;
+    };
+
+    /// Etalon (reference) resting-voltage discharge curve of a textbook 4.20 V/cell 1S Li-ion --
+    /// the commonly published OCV↔SoC table. Pack-INDEPENDENT: never edit this for a specific
+    /// battery; per-pack calibration lives only in the MIN_VOLTAGE/MAX_VOLTAGE anchors, which
+    /// re-normalize this curve's shape in convertVoltageToPercent().
+    static constexpr std::array<BatteryCurvePoint, 21> BATTERY_CURVE{{
+        {3270,   0}, {3610,   5}, {3690,  10}, {3710,  15}, {3730,  20}, {3750,  25},
+        {3770,  30}, {3790,  35}, {3800,  40}, {3820,  45}, {3840,  50}, {3850,  55},
+        {3870,  60}, {3910,  65}, {3950,  70}, {3980,  75}, {4020,  80}, {4080,  85},
+        {4110,  90}, {4150,  95}, {4200, 100},
+    }};
+    // Interpolation below requires both columns increasing; the endpoint asserts pin the curve to
+    // the standard 3.27-4.20 V reference span so a "helpful" pack-specific edit fails the build.
+    static_assert(std::ranges::is_sorted(BATTERY_CURVE, {}, &BatteryCurvePoint::mv));
+    static_assert(std::ranges::is_sorted(BATTERY_CURVE, {}, &BatteryCurvePoint::pct));
+    static_assert(BATTERY_CURVE.front().mv == 3270 && BATTERY_CURVE.front().pct == 0);
+    static_assert(BATTERY_CURVE.back().mv == 4200 && BATTERY_CURVE.back().pct == 100);
+
+    static constexpr double etalonSoc(int mv);
 };
+
+/// SoC of the reference 4.20 V cell at this voltage, in [0.0, 100.0] -- fractional precision is
+/// needed by the anchor normalization in convertVoltageToPercent().
+constexpr double SensorsValues::etalonSoc(const int mv)
+{
+    if (mv <= BATTERY_CURVE.front().mv)
+        return BATTERY_CURVE.front().pct;
+    if (mv >= BATTERY_CURVE.back().mv)
+        return BATTERY_CURVE.back().pct;
+
+    // First curve point with mv >= input; the clamps above guarantee it and its predecessor exist.
+    const auto hi = std::ranges::lower_bound(BATTERY_CURVE, mv, {}, &BatteryCurvePoint::mv);
+    const auto lo = hi - 1;
+    return lo->pct + static_cast<double>(mv - lo->mv) * (hi->pct - lo->pct) / (hi->mv - lo->mv);
+}
+
+constexpr int SensorsValues::convertVoltageToPercent(const int batteryVoltageMilliV,
+                                                     const int minMv, const int maxMv)
+{
+    // Misconfiguration guards rather than asserts: min/max will eventually arrive from a runtime
+    // MQTT setting, so a degenerate or inverted range must degrade safely, not crash.
+    if (maxMv <= minMv)
+        return 0;
+    const double socMin = etalonSoc(minMv);
+    const double socMax = etalonSoc(maxMv);
+    if (socMax <= socMin)  // both anchors clamped onto the same etalon endpoint
+        return 0;
+
+    // The etalon curve contributes only the SHAPE; the anchors set the scale (minMv → 0 %,
+    // maxMv → 100 %). Inputs outside [minMv, maxMv] land outside [0, 100] and are clamped.
+    const double normalized = (etalonSoc(batteryVoltageMilliV) - socMin) / (socMax - socMin) * 100.0;
+    return static_cast<int>(std::clamp(normalized, 0.0, 100.0) + 0.5);
+}
+
+// Compile-time unit tests: the function is pure and there is no on-target test runner, so every
+// build verifies the clamping, interpolation and anchor normalization directly.
+static_assert(SensorsValues::convertVoltageToPercent(3000) == 0);    // below min anchor -> clamped
+static_assert(SensorsValues::convertVoltageToPercent(3300) == 0);    // exact min anchor
+static_assert(SensorsValues::convertVoltageToPercent(3610) == 5);    // knee region
+static_assert(SensorsValues::convertVoltageToPercent(3840) == 55);   // plateau
+static_assert(SensorsValues::convertVoltageToPercent(4022) == 88);   // value seen in 2026-07-13 hardware log
+static_assert(SensorsValues::convertVoltageToPercent(4110) == 99);
+static_assert(SensorsValues::convertVoltageToPercent(4120) == 100);  // exact max anchor
+static_assert(SensorsValues::convertVoltageToPercent(4200) == 100);  // above max anchor -> clamped
+// Anchor parameters: defaults wired through, custom anchors honored, degenerate range guarded.
+static_assert(SensorsValues::convertVoltageToPercent(3840)
+              == SensorsValues::convertVoltageToPercent(3840, SensorsValues::MIN_VOLTAGE, SensorsValues::MAX_VOLTAGE));
+static_assert(SensorsValues::convertVoltageToPercent(4090, 3300, 4090) == 100);
+static_assert(SensorsValues::convertVoltageToPercent(3700, 3300, 3300) == 0);
 
 struct SensorsTaskSettings
 {
@@ -34,8 +122,14 @@ struct SensorsTaskSettings
     /// worth publishing; this is just the ceiling on how stale published data can get if LP
     /// never flags a change.
     uint32_t cycleDurationSec = 60;
-    /// should HP core read battery Voltage via ADC GPIO pin
+    /// should HP core read battery voltage via the ADC GPIO pin right before each publish
     bool readVoltageViaAdc = false;
+    /// Measured voltage-divider resistors in Ohms (battery+ → ADC pin, and ADC pin → battery−).
+    /// Defaults are the resistors soldered on this board; override via calibration.txt
+    /// (battery_divider_r_vbat_ohm / battery_divider_r_gnd_ohm) after rewiring — e.g. for the
+    /// planned high-impedance (2×200 kΩ) drain-reduction experiment.
+    double batteryDividerRVbatOhm = 5021.0;
+    double batteryDividerRGndOhm  = 5035.0;
 };
 
 class SensorsTask
@@ -78,12 +172,11 @@ private:
 
     /// Voltage section
     static constexpr gpio_num_t VOLTAGE_PIN = GPIO_NUM_2;
-    static constexpr double RESISTOR_GND_2_SENSOR = 5035;
-    static constexpr double RESISTOR_SENSOR_2_VBAT = 5021;
-    static constexpr double voltageDividerCoefficient = (RESISTOR_GND_2_SENSOR + RESISTOR_SENSOR_2_VBAT) / RESISTOR_GND_2_SENSOR;
     static constexpr size_t ADC_READS_COUNT = 10;
 
     const SensorsTaskSettings m_settings;
+    /// battery_mV = pin_mV × this; derived once from the configured divider resistors
+    const double m_voltageDividerCoefficient;
 
     SensorsReadyEvent m_readyEvent;
     AttachGate m_attachGate;
@@ -91,6 +184,8 @@ private:
 
     adc_oneshot_unit_handle_t adc1_handle = nullptr;
     adc_cali_handle_t adc1_cali_chan0_handle = nullptr;
+    /// derived from VOLTAGE_PIN in initAdc() so the pin constant stays the single source of truth
+    adc_channel_t m_adcChannel = ADC_CHANNEL_2;
 
     /// consecutive cycles with no successful publish; drives the reboot supervisor (see REBOOT_AFTER_FAILS)
     uint32_t m_consecutiveFailures = 0;

@@ -76,6 +76,18 @@ inline std::optional<uint32_t> parse_as_uint32(std::string_view content, std::st
     return value;
 }
 
+// See parse_as_float()'s comment -- same missing/malformed-vs-legitimate-value distinction.
+// Accepts only the literal strings "true" and "false".
+inline std::optional<bool> parse_as_bool(std::string_view content, std::string_view key)
+{
+    const std::string s = yaml_get_string(content, key);
+    if (s == "true")
+        return true;
+    if (s == "false")
+        return false;
+    return std::nullopt;
+}
+
 inline uint8_t hex_nibble(char c)
 {
     if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');

@@ -94,6 +94,15 @@ static uint32_t parse_as_uint32_or(std::string_view content, std::string_view ke
     return def;
 }
 
+static bool parse_as_bool_or(std::string_view content, std::string_view key, bool def)
+{
+    if (const auto v = parse_as_bool(content, key))
+        return *v;
+    ESP_LOGW("main", "calibration.txt missing/invalid '%.*s', falling back to %s",
+             static_cast<int>(key.size()), key.data(), def ? "true" : "false");
+    return def;
+}
+
 extern "C" void app_main(void)
 {
     esp_err_t ret;
@@ -231,17 +240,27 @@ extern "C" void app_main(void)
     // just a backstop ceiling, not the primary cadence.
     const SensorsTaskSettings sSettings {
         .cycleDurationSec = parse_as_uint32_or(calibration_txt(), "cycle_duration_sec",
-                                                  SensorsTaskSettings{}.cycleDurationSec)
+                                                  SensorsTaskSettings{}.cycleDurationSec),
+        .readVoltageViaAdc = parse_as_bool_or(calibration_txt(), "read_battery_via_adc",
+                                                  SensorsTaskSettings{}.readVoltageViaAdc),
+        .batteryDividerRVbatOhm = parse_as_float_or(calibration_txt(), "battery_divider_r_vbat_ohm",
+                                                  static_cast<float>(SensorsTaskSettings{}.batteryDividerRVbatOhm)),
+        .batteryDividerRGndOhm = parse_as_float_or(calibration_txt(), "battery_divider_r_gnd_ohm",
+                                                  static_cast<float>(SensorsTaskSettings{}.batteryDividerRGndOhm)),
     };
 
-    ESP_LOGI("main", "sensor settings: cycle_duration_sec=%lu",
-             static_cast<unsigned long>(sSettings.cycleDurationSec));
+    ESP_LOGI("main", "sensor settings: cycle_duration_sec=%lu read_battery_via_adc=%d "
+                     "battery_divider=%.0f/%.0f Ohm",
+             static_cast<unsigned long>(sSettings.cycleDurationSec),
+             static_cast<int>(sSettings.readVoltageViaAdc),
+             sSettings.batteryDividerRVbatOhm, sSettings.batteryDividerRGndOhm);
 
     sensorTask = std::make_shared<SensorsTask>(sSettings);
 
     sensorTask->configureReadyEvent([](const SensorsValues &values) static
     {
-        mqtt_send_sensor_data(values.envTemperature, values.envHumidity);
+        mqtt_send_sensor_data(values.envTemperature, values.envHumidity,
+                              values.batteryPercent, values.batteryVoltageMilliV);
     });
 
     // Gate each sensor cycle on the network link being ready (OT: Thread CHILD role) so the

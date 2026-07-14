@@ -5,3 +5,15 @@
 # Leave at "0.0" for no correction.
 rh_offset: "0.0"
 temp_offset: "0.0"
+
+# Battery measurement. When "true", the HP core reads the battery voltage on GPIO2 (through the
+# resistor divider below) right before each publish and adds it to the MQTT state message;
+# readings never trigger a publish by themselves. Only the literal strings "true"/"false" are
+# accepted; a missing key means "false". Boards without the divider should leave this off --
+# a floating pin would publish garbage battery values.
+read_battery_via_adc: "false"
+# Measured divider resistor values in Ohms (battery+ -> ADC pin, and ADC pin -> battery-),
+# used to scale the ADC pin voltage back to the battery voltage. Measure the actual soldered
+# resistors with a multimeter for best accuracy.
+battery_divider_r_vbat_ohm: "5100"
+battery_divider_r_gnd_ohm: "5100"

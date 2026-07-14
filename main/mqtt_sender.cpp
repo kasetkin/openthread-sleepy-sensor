@@ -30,9 +30,19 @@ static constexpr EventBits_t BIT_IDLE = BIT0;
 // route can land slightly late; a few seconds covers the gap.
 static constexpr uint32_t BROKER_REACHABLE_WAIT_MS = 5000;
 
+// Which sensors' HA-discovery configs have been confirmed sent this boot. Per-sensor bits, not
+// one bool: each cycle publishes configs only for the values actually present, so a first cycle
+// missing one value (humidity disabled, battery ADC failure) must not permanently skip that
+// sensor's discovery -- it goes out on the first later cycle that carries the value.
+enum DiscoveryBit : uint8_t {
+    DISC_TEMP = 1 << 0,
+    DISC_HUM  = 1 << 1,
+    DISC_BATT = 1 << 2,  // covers the Battery + Voltage pair -- always published together
+};
+
 static MqttConfig s_cfg;
 static const NetworkLink *s_link = nullptr;       // set in mqtt_sender_init(); backs the transport
-static std::atomic<bool> s_discovery_sent{false};
+static std::atomic<uint8_t> s_discovery_sent_mask{0};
 static std::atomic<bool> s_task_running{false};
 static std::atomic<bool> s_last_ok{false};        // true iff the most recent finished cycle connected AND was ACKed
 static EventGroupHandle_t s_idle_eg = nullptr;    // created in mqtt_sender_init(); starts idle
@@ -98,6 +108,22 @@ static constexpr std::string_view DISCOVERY_FMT =
     "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\"}}"
     "}}";
 
+// DISCOVERY_FMT plus "entity_category":"diagnostic" -- deliberately the same placeholders in the
+// same order, so publish_discovery() feeds either variant from one argument list. Used for the
+// battery/voltage sensors so HA files them under the device's Diagnostic section instead of
+// alongside the primary temperature/humidity readings.
+static constexpr std::string_view DISCOVERY_DIAG_FMT =
+    "{{"
+    "\"name\":\"{}\","
+    "\"device_class\":\"{}\","
+    "\"entity_category\":\"diagnostic\","
+    "\"state_topic\":\"{}/state\","
+    "\"value_template\":\"{{{{value_json.{}}}}}\","
+    "\"unit_of_measurement\":\"{}\","
+    "\"unique_id\":\"{}_{}\","
+    "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\"}}"
+    "}}";
+
 // The other format strings used below, named (like DISCOVERY_FMT above) so their compile-time
 // .size() can size the fixed buffers that follow instead of hand-counting characters.
 static constexpr std::string_view DISCOVERY_TOPIC_FMT = "homeassistant/sensor/{}/{}/config";
@@ -105,6 +131,10 @@ static constexpr std::string_view STATE_TOPIC_FMT      = "{}/state";
 static constexpr std::string_view STATE_FMT_BOTH  = "{{\"t\":{:.3g},\"h\":{:.3g}}}";
 static constexpr std::string_view STATE_FMT_TEMP  = "{{\"t\":{:.3g}}}";
 static constexpr std::string_view STATE_FMT_HUMID = "{{\"h\":{:.3g}}}";
+// Appended over the base state JSON's closing '}' when battery data is present (percent, then
+// volts) -- re-closes the object, so the result stays valid JSON. Kept as a suffix instead of
+// battery variants of the three STATE_FMT_* strings above: that would double them to six.
+static constexpr std::string_view STATE_BATT_SUFFIX_FMT = ",\"b\":{},\"v\":{:.3f}}}";
 
 // ── fixed-capacity string building — no heap allocation ────────────────────────
 // Every buffer size below is derived, not hand-picked, using one lemma: for a std::format string
@@ -120,12 +150,14 @@ static constexpr std::string_view STATE_FMT_HUMID = "{{\"h\":{:.3g}}}";
 // to one of the format strings above.
 static constexpr size_t MAX_DEVICE_ID_LEN   = MQTT_MAX_DEVICE_ID_LEN;    // mqtt_sender.h
 static constexpr size_t MAX_DEVICE_NAME_LEN = MQTT_MAX_DEVICE_NAME_LEN;  // mqtt_sender.h
-// Longest of "Temperature"/"Humidity", "temperature"/"humidity", "°C"/"%", "t"/"h" -- the only
-// values ever passed, at the two publish_discovery() call sites below.
-static constexpr size_t MAX_NAME_LEN         = std::max(sizeof("Temperature"), sizeof("Humidity")) - 1;
-static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max(sizeof("temperature"), sizeof("humidity")) - 1;
-static constexpr size_t MAX_UNIT_LEN         = std::max(sizeof("°C"), sizeof("%")) - 1;
-static constexpr size_t MAX_KEY_LEN          = sizeof("t") - 1;  // "h" is the same length
+// Longest of the name/device_class/unit/key literals ever passed, at the four
+// publish_discovery() call sites below (Temperature/Humidity/Battery/Voltage).
+static constexpr size_t MAX_NAME_LEN         = std::max({sizeof("Temperature"), sizeof("Humidity"),
+                                                         sizeof("Battery"), sizeof("Voltage")}) - 1;
+static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max({sizeof("temperature"), sizeof("humidity"),
+                                                         sizeof("battery"), sizeof("voltage")}) - 1;
+static constexpr size_t MAX_UNIT_LEN         = std::max({sizeof("°C"), sizeof("%"), sizeof("V")}) - 1;
+static constexpr size_t MAX_KEY_LEN          = sizeof("t") - 1;  // "h"/"b"/"v" are the same length
 // {:.3g} (3 significant digits) always needs fewer characters than a full round-trip float --
 // reusing common_utils.h's appendNum() bound (sign + up to 17 sig.digits + '.' + 'e' + sign + 3
 // exp.digits = 24 chars) rather than deriving a tighter one specific to 3 sig figs. This one
@@ -141,15 +173,21 @@ static constexpr size_t TOPIC_BUF = std::max(MAX_DISCOVERY_TOPIC_LEN, MAX_STATE_
 // device_id is substituted 3x in DISCOVERY_FMT above (state_topic, unique_id, device.identifiers)
 // -- verified against the actual format call's argument list, not just eyeballed, after an
 // earlier draft of this constant used 2x and format_to_n() silently truncated in a stress test.
-static constexpr size_t DISCOVERY_PAYLOAD_BUF = DISCOVERY_FMT.size()
+// DISCOVERY_DIAG_FMT has the identical placeholder list, so max() of the two sizes covers both.
+static constexpr size_t DISCOVERY_PAYLOAD_BUF = std::max(DISCOVERY_FMT.size(), DISCOVERY_DIAG_FMT.size())
     + MAX_NAME_LEN + MAX_DEVICE_CLASS_LEN + 3 * MAX_DEVICE_ID_LEN + 2 * MAX_KEY_LEN
     + MAX_UNIT_LEN + MAX_DEVICE_NAME_LEN + 1;  // +1 NUL
 
+// convertVoltageToPercent() clamps to 0..100, so "100" is the widest "b" can ever print.
+static constexpr size_t MAX_BATTERY_PCT_LEN = sizeof("100") - 1;
+
+// The battery suffix overwrites the base JSON's closing '}' (net -1), so simply adding its full
+// worst-case length on top of the base keeps this a safe upper bound per the lemma above.
 static constexpr size_t STATE_BUF = std::max({
     STATE_FMT_BOTH.size()  + 2 * MAX_FORMATTED_FLOAT_LEN,
     STATE_FMT_TEMP.size()  + MAX_FORMATTED_FLOAT_LEN,
     STATE_FMT_HUMID.size() + MAX_FORMATTED_FLOAT_LEN,
-}) + 1;  // +1 NUL
+}) + STATE_BATT_SUFFIX_FMT.size() + MAX_BATTERY_PCT_LEN + MAX_FORMATTED_FLOAT_LEN + 1;  // +1 NUL
 
 // Formats into a fixed-capacity std::array via std::format_to_n (no heap allocation) and
 // NUL-terminates the result. Returns the formatted length, or 0 (logged) if `buf` was too small
@@ -167,6 +205,23 @@ static size_t format_into(std::array<char, N> &buf, std::format_string<Args...> 
     }
     buf[len] = '\0';
     return len;
+}
+
+// format_into()'s append variant: formats starting at buf[offset] (overwriting whatever is
+// there), NUL-terminates, and returns the new total length -- or 0 (logged) on truncation,
+// matching format_into()'s contract so callers share the same "> 0" success check.
+template <size_t N, typename... Args>
+static size_t format_append(std::array<char, N> &buf, size_t offset, std::format_string<Args...> fmt, Args &&...args)
+{
+    const auto res = std::format_to_n(buf.data() + offset, N - 1 - offset, fmt, std::forward<Args>(args)...);
+    const size_t len = static_cast<size_t>(res.size);
+    if (len > N - 1 - offset) {
+        ESP_LOGE(TAG, "appended string truncated (%zu > %zu chars) -- buffer too small for this input",
+                 len, N - 1 - offset);
+        return 0;
+    }
+    buf[offset + len] = '\0';
+    return offset + len;
 }
 
 // ── event handler — ONLY sets event group bits, never touches the client ──────
@@ -236,24 +291,33 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
     return client;
 }
 
-// Builds and publishes one HA MQTT-discovery config message (temperature or humidity) into
-// fixed-size stack buffers — see format_into()'s doc comment. `device_class` doubles as the
-// topic's path segment ("temperature"/"humidity"), matching what the original hand-written
-// topic strings used. `key` is the JSON field name used in state messages ("t"/"h").
+// Builds and publishes one HA MQTT-discovery config message into fixed-size stack buffers — see
+// format_into()'s doc comment. `device_class` doubles as the topic's path segment
+// ("temperature"/"humidity"/"battery"/"voltage"), matching what the original hand-written topic
+// strings used. `key` is the JSON field name used in state messages ("t"/"h"/"b"/"v").
+// `diagnostic` selects DISCOVERY_DIAG_FMT, which files the entity under HA's Diagnostic section.
 static void publish_discovery(esp_mqtt_client_handle_t client, std::string_view device_id,
                                std::string_view device_name, const char *name,
-                               const char *device_class, const char *unit, const char *key)
+                               const char *device_class, const char *unit, const char *key,
+                               bool diagnostic)
 {
     std::array<char, TOPIC_BUF> topicBuf;
     const size_t topicLen = format_into(topicBuf, DISCOVERY_TOPIC_FMT, device_id, device_class);
 
     std::array<char, DISCOVERY_PAYLOAD_BUF> payloadBuf;
-    const size_t payloadLen = format_into(payloadBuf, DISCOVERY_FMT,
-        name, device_class,
-        device_id, key,
-        unit,
-        device_id, key,
-        device_id, device_name);
+    const size_t payloadLen = diagnostic
+        ? format_into(payloadBuf, DISCOVERY_DIAG_FMT,
+              name, device_class,
+              device_id, key,
+              unit,
+              device_id, key,
+              device_id, device_name)
+        : format_into(payloadBuf, DISCOVERY_FMT,
+              name, device_class,
+              device_id, key,
+              unit,
+              device_id, key,
+              device_id, device_name);
 
     if (topicLen == 0 || payloadLen == 0)
         return;  // format_into() already logged the truncation
@@ -267,6 +331,8 @@ struct PublishParams
 {
 	std::optional<float> temperature;
 	std::optional<float> humidity;
+	std::optional<int>   battery_percent;
+	std::optional<int>   battery_millivolts;
 };
 
 // Runs one connect -> publish -> disconnect cycle and reports whether the state message was
@@ -278,12 +344,15 @@ struct PublishParams
 // never run merely because it was called). Declaring eg/client directly in mqtt_publish_task()
 // and trusting them to clean up right before its final vTaskDelete(nullptr) would silently leak
 // the event group and MQTT client handle every single publish cycle.
-static bool run_publish_cycle(std::optional<float> temperature, std::optional<float> humidity)
+static bool run_publish_cycle(const PublishParams &params)
 {
-    const bool hasTemp = temperature.has_value();
-    const bool hasHumid = humidity.has_value();
-    const float temp = temperature.value_or(0.0f);
-    const float hum  = humidity.value_or(0.0f);
+    const bool hasTemp = params.temperature.has_value();
+    const bool hasHumid = params.humidity.has_value();
+    // Both-or-neither: a lone battery value (shouldn't happen -- sensorstask always sets the
+    // pair) is ignored rather than published half-formed.
+    const bool hasBatt = params.battery_percent.has_value() && params.battery_millivolts.has_value();
+    const float temp = params.temperature.value_or(0.0f);
+    const float hum  = params.humidity.value_or(0.0f);
 
     // Declaration order matters: destruction runs in reverse, and client's teardown (below)
     // still needs ctx.eg (a borrowed copy of eg's handle) to be valid, so eg must outlive it.
@@ -324,14 +393,25 @@ static bool run_publish_cycle(std::optional<float> temperature, std::optional<fl
     if (bits & BIT_CONNECTED) {
         const std::string_view dev = s_cfg.device_id;
         const std::string_view dev_name = s_cfg.device_name;
+        // Battery is deliberately absent from hasAny: it only ever rides along on a
+        // temperature/humidity publish (see mqtt_send_sensor_data()'s doc comment), so it can
+        // neither trigger a cycle nor carry one alone.
         const bool hasAny = hasTemp || hasHumid;
-        const bool need_discovery = !s_discovery_sent.load() && hasAny;
+
+        // Discovery configs still owed this boot for the values present in THIS cycle.
+        const auto discoveryWant = static_cast<uint8_t>((hasTemp ? DISC_TEMP : 0)
+                                                      | (hasHumid ? DISC_HUM : 0)
+                                                      | (hasBatt ? DISC_BATT : 0));
+        const auto discoveryNeed = hasAny
+            ? static_cast<uint8_t>(discoveryWant & ~s_discovery_sent_mask.load()) : uint8_t{0};
 
         // Expected ACKs must match what we actually publish below: one state message plus one
-        // discovery message per present value.  A fixed "+2" assumes both T and H discovery are
-        // sent; with humidity disabled only T is sent, so BIT_ALL_ACKED would never set and the
-        // first cycle would be wrongly counted as a failure.
-        const int discovery_msgs = need_discovery ? ((hasTemp ? 1 : 0) + (hasHumid ? 1 : 0)) : 0;
+        // discovery message per still-owed sensor (two for DISC_BATT: Battery and Voltage).
+        // A fixed count assuming every discovery is sent would leave BIT_ALL_ACKED forever
+        // unset on any cycle that sends fewer, wrongly failing the cycle.
+        const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
+                                 + ((discoveryNeed & DISC_HUM) ? 1 : 0)
+                                 + ((discoveryNeed & DISC_BATT) ? 2 : 0);
         const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
         // Set counters BEFORE publishing so the handler never races ahead
@@ -339,20 +419,31 @@ static bool run_publish_cycle(std::optional<float> temperature, std::optional<fl
         ctx.received_acks.store(0);
         xEventGroupClearBits(eg.get(), BIT_ALL_ACKED);
 
-        if (need_discovery) {
-            if (hasTemp)
-                publish_discovery(client.get(), dev, dev_name, "Temperature", "temperature", "°C", "t");
-            if (hasHumid)
-                publish_discovery(client.get(), dev, dev_name, "Humidity", "humidity", "%", "h");
+        if (discoveryNeed & DISC_TEMP)
+            publish_discovery(client.get(), dev, dev_name, "Temperature", "temperature", "°C", "t", false);
+        if (discoveryNeed & DISC_HUM)
+            publish_discovery(client.get(), dev, dev_name, "Humidity", "humidity", "%", "h", false);
+        if (discoveryNeed & DISC_BATT) {
+            publish_discovery(client.get(), dev, dev_name, "Battery", "battery", "%", "b", true);
+            publish_discovery(client.get(), dev, dev_name, "Voltage", "voltage", "V", "v", true);
         }
 
         if (hasAny) {
             std::array<char, STATE_BUF> stateBuf;
-            const size_t stateLen = hasTemp && hasHumid
+            size_t stateLen = hasTemp && hasHumid
                 ? format_into(stateBuf, STATE_FMT_BOTH, temp, hum)
                 : hasTemp
                     ? format_into(stateBuf, STATE_FMT_TEMP, temp)
                     : format_into(stateBuf, STATE_FMT_HUMID, hum);  // hasHumid
+
+            // Battery rides along: overwrite the base JSON's closing '}' with the suffix, which
+            // re-closes the object. On a cycle without battery data (ADC failure, or the feature
+            // off) the keys are simply absent -- HA keeps the entities' previous values.
+            if (stateLen > 0 && hasBatt) {
+                stateLen = format_append(stateBuf, stateLen - 1, STATE_BATT_SUFFIX_FMT,
+                                         *params.battery_percent,
+                                         static_cast<float>(*params.battery_millivolts) / 1000.0f);
+            }
 
             std::array<char, TOPIC_BUF> stateTopicBuf;
             const size_t stateTopicLen = format_into(stateTopicBuf, STATE_TOPIC_FMT, dev);
@@ -366,7 +457,10 @@ static bool run_publish_cycle(std::optional<float> temperature, std::optional<fl
                 // so we stop fast-polling (and sleep) promptly instead of idling the radio.
                 ok = (xEventGroupWaitBits(eg.get(), BIT_ALL_ACKED, pdFALSE, pdTRUE,
                                           pdMS_TO_TICKS(4000)) & BIT_ALL_ACKED) != 0;
-                s_discovery_sent.store(true);
+                // Mark discovery sent only on a confirmed cycle: on a failed one the configs may
+                // never have reached the broker, and the next successful cycle resends them.
+                if (ok)
+                    s_discovery_sent_mask.fetch_or(discoveryNeed);
             }
         } else {
             ESP_LOGW(TAG, "no sensor values to publish this cycle");
@@ -383,7 +477,7 @@ static bool run_publish_cycle(std::optional<float> temperature, std::optional<fl
 
 static void mqtt_publish_task(void *arg)
 {
-    std::optional<float> temperature, humidity;
+    PublishParams paramsCopy;
     {
         // Reconstructs ownership of the heap block mqtt_send_sensor_data() handed across the
         // xTaskCreate() void* boundary. Freed at the end of THIS inner block, deliberately not
@@ -391,11 +485,10 @@ static void mqtt_publish_task(void *arg)
         // -- see run_publish_cycle()'s doc comment for why that wouldn't work (vTaskDelete(nullptr)
         // below never unwinds the stack).
         const std::unique_ptr<PublishParams> params(static_cast<PublishParams *>(arg));
-        temperature = params->temperature;
-        humidity = params->humidity;
+        paramsCopy = *params;
     }
 
-    const bool ok = run_publish_cycle(temperature, humidity);
+    const bool ok = run_publish_cycle(paramsCopy);
 
     s_last_ok.store(ok);  // published before BIT_IDLE is set below
     s_task_running.store(false);
@@ -418,7 +511,8 @@ void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link)
     }
 }
 
-void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity)
+void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity,
+                           std::optional<int> battery_percent, std::optional<int> battery_millivolts)
 {
     if (s_task_running.exchange(true)) {
         ESP_LOGW(TAG, "previous publish cycle still running, skipping");
@@ -428,7 +522,8 @@ void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float
     if (s_idle_eg)
     	xEventGroupClearBits(s_idle_eg, BIT_IDLE);  // mark busy until the task exits
 
-    std::unique_ptr<PublishParams> params(new PublishParams{temperature, humidity});
+    std::unique_ptr<PublishParams> params(new PublishParams{temperature, humidity,
+                                                            battery_percent, battery_millivolts});
     if (xTaskCreate(mqtt_publish_task, "mqtt_pub", 12288, params.get(), 5, nullptr) != pdPASS) {
         ESP_LOGE(TAG, "failed to create mqtt_pub task");
         s_task_running.store(false);

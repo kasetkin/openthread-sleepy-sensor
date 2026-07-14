@@ -13,16 +13,11 @@
 #include "lp_sensor_core.h"
 
 SensorsTask::SensorsTask(SensorsTaskSettings settings):
-    m_settings{settings}
+    m_settings{settings},
+    m_voltageDividerCoefficient{(settings.batteryDividerRGndOhm + settings.batteryDividerRVbatOhm)
+                                / settings.batteryDividerRGndOhm}
 {
 
-}
-
-int SensorsValues::convertVoltageToPercent(int batteryVoltageMilliV)
-{
-    constexpr double VOLTAGE_DELTA = MAX_VOLTAGE - MIN_VOLTAGE;
-    const double value = (batteryVoltageMilliV - MIN_VOLTAGE) / VOLTAGE_DELTA * 100.0f;
-    return static_cast<int>(std::clamp(value, 0.0, 100.0));
 }
 
 void SensorsTask::configureReadyEvent(SensorsReadyEvent readyEvent)
@@ -102,6 +97,30 @@ void SensorsTask::executeTask()
                 SensorsValues v{};
                 v.envTemperature = state.cal_temp_c;
                 v.envHumidity = state.cal_hum_pct;
+
+                // Battery is a passenger on this already-decided publish -- it is read here, and
+                // only here, so it can never wake HP or trigger a send by itself. Create -> read
+                // -> delete strictly inside this awake window: with
+                // CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP, adc_oneshot_new_unit() pins the
+                // MODEM+TOP power domains ON across light sleep until adc_oneshot_del_unit(), so
+                // holding the unit while blocked in lp_sensor_core_wait_for_wake() would silently
+                // raise sleep current every cycle. Any failure degrades to publishing without the
+                // battery fields (HA then keeps the entities' previous values).
+                if (m_settings.readVoltageViaAdc) {
+                    if (initAdc() == ESP_OK) {
+                        if (const auto milliVolts = readBatteryVoltageMilliV()) {
+                            v.batteryVoltageMilliV = *milliVolts;
+                            v.batteryPercent = SensorsValues::convertVoltageToPercent(*milliVolts);
+                            ESP_LOGI(TAG, "battery: %d mV (%d%%)", *milliVolts, *v.batteryPercent);
+                        } else {
+                            ESP_LOGW(TAG, "battery ADC read failed (err=0x%x), publishing without battery",
+                                     milliVolts.error());
+                        }
+                        deinitAdc();
+                    } else {
+                        ESP_LOGW(TAG, "battery ADC init failed, publishing without battery");
+                    }
+                }
 
                 ESP_LOGI(TAG, "publishing LP-flagged value: %.2fC / %.2f%%RH",
                          static_cast<double>(state.cal_temp_c), static_cast<double>(state.cal_hum_pct));
@@ -199,7 +218,7 @@ bool SensorsTask::adc_calibration_init(adc_unit_t unit, adc_channel_t channel, a
 
 #if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
     if (!calibrated) {
-        ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
+        ESP_LOGD(TAG, "calibration scheme version is Curve Fitting");
         adc_cali_curve_fitting_config_t cali_config = {
             .unit_id = unit,
             .chan = channel,
@@ -215,7 +234,7 @@ bool SensorsTask::adc_calibration_init(adc_unit_t unit, adc_channel_t channel, a
 
 #if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
     if (!calibrated) {
-        ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
+        ESP_LOGI(TAG, "calibration scheme version is Line Fitting");
         adc_cali_line_fitting_config_t cali_config = {
             .unit_id = unit,
             .atten = atten,
@@ -230,7 +249,7 @@ bool SensorsTask::adc_calibration_init(adc_unit_t unit, adc_channel_t channel, a
 
     *out_handle = handle;
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Calibration Success");
+        ESP_LOGD(TAG, "Calibration Success");
     } else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated) {
         ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
     } else {
@@ -242,33 +261,54 @@ bool SensorsTask::adc_calibration_init(adc_unit_t unit, adc_channel_t channel, a
 
 esp_err_t SensorsTask::initAdc()
 {
-    /// should be the same in init config and calibretion!!!
-    const adc_atten_t ADC_ATTENUATION = ADC_ATTEN_DB_6;
+    static const char * TAG = "ADC-init";
+
+    // Must be the same in the channel config and the calibration init. The divider midpoint
+    // peaks at the ~4.2 V charger rail / m_voltageDividerCoefficient ≈ 2.1 V, so 12 dB is the
+    // only attenuation whose range covers it -- 6 dB tops out around 1.7 V on the C6 and would
+    // clip whenever the battery sits above ~3.5 V.
+    const adc_atten_t ADC_ATTENUATION = ADC_ATTEN_DB_12;
+
+    // Channel follows VOLTAGE_PIN so the pin constant stays the single source of truth.
+    adc_unit_t unit = ADC_UNIT_1;
+    if (const esp_err_t err = adc_oneshot_io_to_channel(VOLTAGE_PIN, &unit, &m_adcChannel);
+        err != ESP_OK || unit != ADC_UNIT_1) {
+        ESP_LOGW(TAG, "GPIO%d is not an ADC1 pin (err=0x%x)", VOLTAGE_PIN, err);
+        return err != ESP_OK ? err : ESP_FAIL;
+    }
+
+    // No ESP_ERROR_CHECK here: a battery-measurement failure must degrade to "publish without
+    // battery fields" (the caller logs and moves on), never abort the whole sensor node.
 
     //-------------ADC1 Init---------------//
-    adc_oneshot_unit_init_cfg_t init_config1 = {
+    const adc_oneshot_unit_init_cfg_t init_config1 = {
         .unit_id = ADC_UNIT_1,
         .clk_src = ADC_DIGI_CLK_SRC_XTAL,
         .ulp_mode = ADC_ULP_MODE_DISABLE
     };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+    if (const esp_err_t err = adc_oneshot_new_unit(&init_config1, &adc1_handle); err != ESP_OK) {
+        ESP_LOGW(TAG, "adc_oneshot_new_unit failed: 0x%x", err);
+        adc1_handle = nullptr;
+        return err;
+    }
 
     //-------------ADC1 Config---------------//
-    adc_oneshot_chan_cfg_t config = {
+    const adc_oneshot_chan_cfg_t config = {
         .atten = ADC_ATTENUATION,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_2, &config));
+    if (const esp_err_t err = adc_oneshot_config_channel(adc1_handle, m_adcChannel, &config); err != ESP_OK) {
+        ESP_LOGW(TAG, "adc_oneshot_config_channel failed: 0x%x", err);
+        deinitAdc();
+        return err;
+    }
 
     //-------------ADC1 Calibration Init---------------//
-
-    bool do_calibration1_chan0 = adc_calibration_init(ADC_UNIT_1, ADC_CHANNEL_2, ADC_ATTENUATION, &adc1_cali_chan0_handle);
-    if (do_calibration1_chan0)
-        return ESP_OK;
-
-    adc_oneshot_del_unit(adc1_handle);
-    adc1_handle = nullptr;
-    return ESP_FAIL;
+    if (!adc_calibration_init(ADC_UNIT_1, m_adcChannel, ADC_ATTENUATION, &adc1_cali_chan0_handle)) {
+        deinitAdc();
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 void SensorsTask::deinitAdc()
@@ -285,23 +325,16 @@ void SensorsTask::deinitAdc()
 
 std::expected<int, esp_err_t> SensorsTask::readBatteryVoltageMilliV()
 {
-// #ifdef HAS_PMU
-//     if (pmu_found && PMU) {
-//         const int batteryPercent = PMU->getBatteryPercent(); /// 0 .. 100
-//         const uint16_t batteryVoltage = PMU->getBattVoltage(); /// millivolt
-//         message =
-//             std::string("BATVOLT;") + std::to_string(batteryVoltage)
-//             + std::string(";BATPERC;") + std::to_string(batteryPercent)
-//             + std::string(";");
-//     }
-// #endif
     static const char * TAG = "ADC-measure";
 
     int adc_raw = 0;
     int voltage = 0;
-    int32_t voltage_mean = 0;
+    int voltage_first = 0;
+    int voltage_min = 0;
+    int voltage_max = 0;
+    int32_t voltage_sum = 0;
     for (size_t i = 0; i < ADC_READS_COUNT; ++i) {
-        if (const esp_err_t adcReadError = adc_oneshot_read(adc1_handle, ADC_CHANNEL_2, &adc_raw);
+        if (const esp_err_t adcReadError = adc_oneshot_read(adc1_handle, m_adcChannel, &adc_raw);
             adcReadError != ESP_OK) {
             ESP_LOGE(TAG, "ADC reading error %d", adcReadError);
             return std::unexpected(adcReadError);
@@ -312,14 +345,21 @@ std::expected<int, esp_err_t> SensorsTask::readBatteryVoltageMilliV()
             ESP_LOGE(TAG, "ADC calibration error %d, raw value is %d", calibrationErr, adc_raw);
             return std::unexpected(calibrationErr);
         }
-        // ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1, ADC_CHANNEL_2, adc_raw);
-        // ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1, ADC_CHANNEL_2, voltage);
-        voltage_mean += voltage;
+        if (i == 0)
+            voltage_first = voltage_min = voltage_max = voltage;
+        voltage_min = std::min(voltage_min, voltage);
+        voltage_max = std::max(voltage_max, voltage);
+        voltage_sum += voltage;
     }
 
-    const int scaledVoltage = voltage_mean / ADC_READS_COUNT;
-    ESP_LOGI(TAG, "ADC pin voltage: %d ", scaledVoltage);
+    // A first-sample-low / rising-across-burst pattern here means the SAR sampling cap is being
+    // starved by the divider's source impedance -- the diagnostic to watch when trying larger
+    // (lower-drain) divider resistors; see calibration.txt's battery_divider_r_*_ohm keys.
+    ESP_LOGD(TAG, "burst spread: min=%d max=%d first=%d last=%d mV",
+             voltage_min, voltage_max, voltage_first, voltage);
 
-    const double realVoltage = voltageDividerCoefficient * scaledVoltage;
-    return static_cast<int>(realVoltage);
+    const int pinVoltage = voltage_sum / static_cast<int32_t>(ADC_READS_COUNT);
+    ESP_LOGD(TAG, "ADC pin voltage: %d mV", pinVoltage);
+
+    return static_cast<int>(m_voltageDividerCoefficient * pinVoltage);
 }

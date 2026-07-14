@@ -5,4 +5,7 @@ temp_min_change: "0.1"
 max_skip_cycles: "10"
 cycle_duration_sec: "15"
 lp_poll_interval_sec: "15"
+read_battery_via_adc: "true"
+battery_divider_r_vbat_ohm: "200200"
+battery_divider_r_gnd_ohm: "201700"
 

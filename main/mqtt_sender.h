@@ -41,7 +41,13 @@ void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link);
 
 // Trigger a connect → publish discovery + state → disconnect cycle.
 // Safe to call from any task; non-blocking (the MQTT event loop does the work).
-void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity);
+// battery_percent/battery_millivolts ride along on a temperature/humidity publish (extra "b"/"v"
+// state-JSON fields plus their one-time discovery configs) and never trigger a cycle by
+// themselves: if both temperature and humidity are empty, nothing is published regardless of
+// battery. Pass both battery values or neither -- a lone one is ignored.
+void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity,
+                           std::optional<int> battery_percent = std::nullopt,
+                           std::optional<int> battery_millivolts = std::nullopt);
 
 // True while a publish cycle started by mqtt_send_sensor_data() is still in flight.
 // Lets a caller tell "a publish is happening" apart from "nothing was sent this cycle".

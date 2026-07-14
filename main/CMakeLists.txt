@@ -11,9 +11,8 @@ set(srcs
 
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS "." "net"
-                       PRIV_REQUIRES nvs_flash esp_timer esp_driver_gpio esp_driver_uart esp_driver_usb_serial_jtag esp_event openthread espressif__mqtt esp_wifi esp_netif esp_coex mbedtls lp_sensor_core
+                       PRIV_REQUIRES nvs_flash esp_timer esp_adc esp_driver_gpio esp_driver_uart esp_driver_usb_serial_jtag esp_event openthread espressif__mqtt esp_wifi esp_netif esp_coex mbedtls lp_sensor_core
                        EMBED_TXTFILES ../secrets.yaml ../calibration.txt
                        WHOLE_ARCHIVE)
-#  esp_adc -- maybe for battery reading
 set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD 26)
 set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD_REQUIRED ON)
