@@ -53,7 +53,12 @@ static std::string s_ot_tlv_hex;
 
 // Poll periods: fast during the MQTT publish window so TCP ACKs arrive promptly; slow
 // the rest of the time — also the initial/steady-state SED poll period — to maximise sleep.
+// OTA gets its own, much faster period: an OTA image chunk (~8 KB ≈ 7 TCP segments of
+// parent-buffered downlink) must flow with gaps well under esp-mqtt's ~1 s mid-message
+// no-progress abort, and the nominal period bounds the first-frame latency of every burst
+// (frame-pending chaining keeps subsequent polls back-to-back on its own).
 static constexpr uint32_t POLL_FAST_MS = 500;
+static constexpr uint32_t POLL_OTA_MS  = 50;
 static constexpr uint32_t POLL_SLOW_MS = 70000;
 
 static void set_poll_period(uint32_t ms)
@@ -63,25 +68,15 @@ static void set_poll_period(uint32_t ms)
     esp_openthread_lock_release();
 }
 
-// OTA-download link boost: a sleepy child only receives downlink in response to its data
-// polls, which caps a ~1.8 MB firmware stream at the poll cadence. Flipping mRxOnWhenIdle
-// makes the parent forward frames as they arrive (the child renegotiates via MLE Child
-// Update), turning the download into a normal always-listening TCP stream. Only the
-// rx-on bit changes — still an MTD with minimal network data, so restoring is symmetric
-// and doesn't depend on remembering prior state. esp_openthread's PM lock keeps the CPU
-// awake while the radio is rx-on, which is exactly what a continuous download needs.
-static void set_rx_on_when_idle(bool rx_on)
-{
-    esp_openthread_lock_acquire(portMAX_DELAY);
-    otLinkModeConfig link_mode = otThreadGetLinkMode(esp_openthread_get_instance());
-    link_mode.mRxOnWhenIdle = rx_on;
-    const otError err = otThreadSetLinkMode(esp_openthread_get_instance(), link_mode);
-    esp_openthread_lock_release();
-    if (err != OT_ERROR_NONE)
-        ESP_LOGE(TAG, "otThreadSetLinkMode(rx_on=%d) failed: %d", rx_on, err);
-    else
-        ESP_LOGI(TAG, "OT link mode: rx-on-when-idle %s", rx_on ? "ON (OTA window)" : "off (sleepy)");
-}
+// OTA-download link boost. Deliberately just a faster data-poll cadence, NOT
+// rx-on-when-idle: flipping mRxOnWhenIdle mid-attach was tried and hardware-observed to
+// black-hole downlink right after the switch (the child stops polling immediately while
+// the parent still queues frames for a "sleepy" child until the MLE mode renegotiation —
+// and its CSL scheduling — fully lands), which trips esp-mqtt's ~1 s mid-message
+// no-progress abort on the very first chunk, every time. Fast polling is the same
+// mechanism every ordinary publish window uses, so there is no mode change to renegotiate
+// and no new radio state to trust; frame-pending chaining keeps the effective chunk
+// throughput far above the nominal period anyway.
 
 static void setNat64Prefix(const uint8_t *p12)
 {
@@ -326,10 +321,12 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.waitForBrokerReachable = waitForBrokerReachable;
     link.onPublishWindowBegin = []() { set_poll_period(POLL_FAST_MS); };
     link.onPublishWindowEnd = []() { set_poll_period(POLL_SLOW_MS); };
-    // Poll period needs no save/restore around the rx-on stretch: it's ignored while
-    // rx-on, and the enclosing publish window's begin/end hooks own it either side.
-    link.onOtaWindowBegin = []() { set_rx_on_when_idle(true); };
-    link.onOtaWindowEnd = []() { set_rx_on_when_idle(false); };
+    // Nested inside a publish window, so the end hook restores the window's fast poll;
+    // the window's own end hook then drops back to slow.
+    link.onOtaWindowBegin = []() { ESP_LOGI(TAG, "OTA window: poll %lu ms", (unsigned long)POLL_OTA_MS);
+                                   set_poll_period(POLL_OTA_MS); };
+    link.onOtaWindowEnd = []() { ESP_LOGI(TAG, "OTA window end: poll %lu ms", (unsigned long)POLL_FAST_MS);
+                                 set_poll_period(POLL_FAST_MS); };
     link.refresh = refresh_nat64_prefix;
     return link;
 }

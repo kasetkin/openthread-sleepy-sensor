@@ -27,10 +27,12 @@ static constexpr int OTA_MIN_BATTERY_PERCENT = 30;
 // progress); only consecutive attempts with ZERO progress count against this budget, so a
 // bad/missing staging can't drain the battery in a retry loop.
 static constexpr int OTA_MAX_NO_PROGRESS_ATTEMPTS = 3;
-// Per-chunk wait: subscribe -> SUBACK -> retained chunk normally lands in ~1-2 s over Thread.
+// Per-chunk wait: subscribe -> SUBACK -> retained chunk normally lands in a few seconds
+// over the fast-polled Thread link.
 static constexpr uint32_t OTA_CHUNK_TIMEOUT_MS = 20'000;
 // Whole-session cap; hitting it just ends the attempt (resume continues next cycle).
-static constexpr uint32_t OTA_SESSION_CAP_MS = 20 * 60'000;
+// Generous: 232 poll-driven chunks can legitimately take 10-20 min end to end.
+static constexpr uint32_t OTA_SESSION_CAP_MS = 30 * 60'000;
 
 static constexpr EventBits_t OTA_BIT_CHUNK = BIT0;  // expected chunk verified + written
 static constexpr EventBits_t OTA_BIT_FAIL  = BIT1;
@@ -406,8 +408,9 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
     xEventGroupClearBits(s_eg, OTA_BIT_CHUNK | OTA_BIT_FAIL);
     s_session_active.store(true);
 
-    // rx-on-when-idle for the download; MUST be undone on every exit path below — a child
-    // left rx-on burns ~78 mA until the battery dies.
+    // Fast-poll link boost for the download; MUST be undone on every exit path below — a
+    // child left at the OTA poll rate burns the battery orders of magnitude faster than
+    // its steady-state cadence.
     s_link->onOtaWindowBegin();
 
     // ── pull chunks strictly in order ─────────────────────────────────────────

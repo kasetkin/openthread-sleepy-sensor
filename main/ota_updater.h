@@ -47,7 +47,7 @@ inline constexpr size_t OTA_MAX_CHUNK_SIZE = 8192;
 inline constexpr size_t OTA_MQTT_RX_BUFFER_SIZE = OTA_MAX_CHUNK_SIZE + 512;
 
 // Call once from mqtt_sender_init(). Builds the full topic strings from device_id and keeps
-// `link` for the OTA-window (rx-on-when-idle) hooks; both must outlive every publish cycle.
+// `link` for the OTA-window (fast-poll link boost) hooks; both must outlive every publish cycle.
 void ota_updater_init(std::string_view device_id, const NetworkLink *link);
 
 // Full topic accessors (NUL-terminated, stable storage after ota_updater_init()).

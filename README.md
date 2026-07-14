@@ -67,10 +67,14 @@ trust the full public CA bundle, set `mqtt_tls_ca_cert` in `secrets.yaml` to its
 ## OTA firmware updates over MQTT
 
 Firmware can be updated over the air with MQTT as the only transport — no HTTP server, works
-identically over Thread and Wi-Fi. The image is staged on the broker as **one retained MQTT
-message** which the broker streams to the device (esp-mqtt delivers it as sequential
-`MQTT_EVENT_DATA` segments fed straight into `esp_ota_write()`; TCP receive-window
-backpressure is the flow control — no chunk protocol, no live host during the download).
+identically over Thread and Wi-Fi. The image is staged on the broker as **N retained chunk
+messages** (`<id>/ota/image/<n>`, 8 KB each) which the device pulls strictly in order,
+writing each straight into `esp_ota_write()`; a broken download **resumes** from the first
+missing chunk on the next wake cycle. Chunking is a correctness requirement, not an
+optimisation: esp-mqtt cannot survive a multi-second radio stall while receiving a message
+larger than its RX buffer (its parser desyncs mid-message — observed on hardware over
+Thread), while a chunk that fits the buffer is delivered atomically. Retained staging means
+**no live host during the download** — the stager exits after publishing.
 
 Workflow:
 
@@ -81,9 +85,11 @@ Workflow:
    "Update available" with an **Install** button; the click publishes a retained install
    command the sleeping device picks up on its next wake. (Bench shortcut: `--install`.)
 3. **Download**: the device verifies version/battery (≥30 % unless the manifest says
-   `"force":true`), temporarily switches its Thread link to **rx-on-when-idle** so the
-   download isn't throttled by the sleepy data-poll cadence (~3–6 min for a ~1.8 MB image
-   instead of 15+), checks SHA-256, flips the boot partition and reboots.
+   `"force":true`), drops its Thread data-poll period to 50 ms for the session (staying a
+   sleepy child — switching to rx-on-when-idle was tried and black-holes downlink during
+   the mode renegotiation), pulls the chunks in order, checks SHA-256, flips the boot
+   partition and reboots. Expect roughly 10–20 min for a ~1.9 MB image; interruptions
+   resume rather than restart.
 4. **Confirm or roll back**: the new image boots as `PENDING_VERIFY`
    (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). Its first broker-ACKed publish marks it valid;
    if that never happens, the existing failed-cycles reboot supervisor restarts the device

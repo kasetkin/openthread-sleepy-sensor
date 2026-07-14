@@ -50,12 +50,13 @@ struct NetworkLink
     std::function<void()> onPublishWindowBegin;
     std::function<void()> onPublishWindowEnd;
 
-    // OTA-download hooks (OT: temporarily rx-on-when-idle so the parent forwards the
-    // firmware stream continuously instead of per data poll — the difference between a
-    // ~3-6 min and a ~15 min transfer; Wi-Fi: no-op). onOtaWindowEnd MUST run on every
-    // abort path: a child left rx-on burns ~78 mA RX until the battery dies. Nested
-    // inside a publish window (begin after onPublishWindowBegin, end before
-    // onPublishWindowEnd), so the poll period it restores to is the window's fast one.
+    // OTA-download hooks (OT: a much faster data-poll period so parent-buffered image
+    // chunks flow without tripping esp-mqtt's ~1 s mid-message stall abort; Wi-Fi: no-op).
+    // Deliberately NOT rx-on-when-idle — see openthread_link.cpp for the hardware-observed
+    // downlink black hole that mode switch causes. onOtaWindowEnd MUST run on every abort
+    // path: a child left at a 50 ms poll burns the battery ~1000x faster than the slow
+    // period. Nested inside a publish window (begin after onPublishWindowBegin, end before
+    // onPublishWindowEnd), so the period it restores to is the window's fast one.
     std::function<void()> onOtaWindowBegin;
     std::function<void()> onOtaWindowEnd;
 
