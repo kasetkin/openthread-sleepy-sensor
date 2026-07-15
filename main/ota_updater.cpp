@@ -6,6 +6,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -73,7 +74,10 @@ static std::atomic<int>    s_no_progress_attempts{0};
 // from the first missing chunk. All guarded by s_mutex while a session is active.
 static bool                    s_partial_valid = false;  // handles below hold a resumable partial download
 static Manifest                s_partial_manifest;       // identity of that partial download
-static size_t                  s_next_chunk = 0;         // first chunk not yet written
+// First chunk not yet written. Atomic (though writes happen under s_mutex) because the
+// session task polls it lock-free to count completions — with pipelined subscriptions two
+// chunks can finish between two waits, which a single event-group bit cannot convey.
+static std::atomic<size_t>     s_next_chunk{0};
 static std::atomic<size_t>     s_received{0};            // bytes written so far
 static esp_ota_handle_t        s_ota_handle = 0;
 static const esp_partition_t  *s_ota_partition = nullptr;
@@ -85,14 +89,21 @@ static bool topic_is(const char *topic, size_t topic_len, const std::string &ful
     return topic_len == full.size() && std::memcmp(topic, full.data(), topic_len) == 0;
 }
 
+// The last status that could not be delivered (published into a just-dead connection —
+// typically the "error/connection lost" one); replayed on the next session's fresh client
+// so the broker-side watcher sees aborts live instead of unexplained resume_chunk jumps.
+static std::string s_undelivered_status;
+
 // Non-retained, QoS 0 — purely informational; loss is acceptable but not invisible: a
-// failed enqueue (dead connection) is logged so the serial trail explains a silent broker.
+// failed enqueue (dead connection) is logged and latched for replay (see above).
 static void publish_status(esp_mqtt_client_handle_t client, const std::string &json)
 {
     int msg_id = -1;
     if (client)
         msg_id = esp_mqtt_client_publish(client, s_topic_status.c_str(), json.c_str(),
                                          static_cast<int>(json.size()), 0, 0);
+    if (msg_id < 0)
+        s_undelivered_status = json;
     ESP_LOGI(TAG, "status%s: %s", msg_id < 0 ? " (NOT delivered — connection down)" : "",
              json.c_str());
 }
@@ -209,7 +220,7 @@ static void handle_image_chunk(size_t index, const char *data, size_t data_len,
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     const size_t expected_len = std::min(s_partial_manifest.chunk_size,
-                                         s_partial_manifest.size - s_next_chunk * s_partial_manifest.chunk_size);
+                                         s_partial_manifest.size - s_next_chunk.load() * s_partial_manifest.chunk_size);
     bool fail = false;
     if (offset != 0 || total != data_len) {
         // A chunk that fits the RX buffer arrives as exactly one event; anything else means
@@ -218,11 +229,11 @@ static void handle_image_chunk(size_t index, const char *data, size_t data_len,
         ESP_LOGE(TAG, "chunk %zu spans events (len %zu of %zu at offset %zu) — chunk_size too "
                       "big for RX buffer", index, data_len, total, offset);
         fail = true;
-    } else if (index != s_next_chunk) {
+    } else if (index != s_next_chunk.load()) {
         // Strict ordering: chunks are subscribed one at a time, so anything else is a stale
         // retained delivery racing a re-staging. Ignore rather than fail — the expected
         // chunk may still arrive.
-        ESP_LOGW(TAG, "ignoring unexpected chunk %zu (waiting for %zu)", index, s_next_chunk);
+        ESP_LOGW(TAG, "ignoring unexpected chunk %zu (waiting for %zu)", index, s_next_chunk.load());
     } else if (data_len != expected_len) {
         ESP_LOGE(TAG, "chunk %zu is %zu bytes, expected %zu — staging/manifest mismatch",
                  index, data_len, expected_len);
@@ -235,7 +246,7 @@ static void handle_image_chunk(size_t index, const char *data, size_t data_len,
         ESP_LOGE(TAG, "psa_hash_update failed at chunk %zu", index);
         fail = true;
     } else {
-        s_next_chunk = index + 1;
+        s_next_chunk.store(index + 1);
         s_received.fetch_add(data_len);
         xSemaphoreGive(s_mutex);
         xEventGroupSetBits(s_eg, OTA_BIT_CHUNK);
@@ -256,7 +267,7 @@ static void discard_partial_locked()
     }
     psa_hash_abort(&s_sha_op);  // safe on an already-terminated operation
     s_partial_valid = false;
-    s_next_chunk = 0;
+    s_next_chunk.store(0);
     s_received.store(0);
 }
 
@@ -336,8 +347,23 @@ bool ota_session_in_progress()
     return s_session_active.load();
 }
 
+bool ota_session_ended_by_connection_loss()
+{
+    return s_conn_lost.load();
+}
+
 void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery_percent)
 {
+    // Reset FIRST, before any early return below: mqtt_sender's in-cycle reconnect loop
+    // keys off ota_session_ended_by_connection_loss(), and a stale true from the previous
+    // session would turn a battery deferral into an endless reconnect/defer spin.
+    s_conn_lost.store(false);
+
+    // A status that died with the previous connection gets a second chance on this fresh
+    // one (moved out first so a repeat failure just re-latches it without self-assignment).
+    if (!s_undelivered_status.empty())
+        publish_status(client, std::exchange(s_undelivered_status, {}));
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     const Manifest manifest = s_manifest;  // stable per-session copy
     xSemaphoreGive(s_mutex);
@@ -354,7 +380,7 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
     // ── fresh start or resume ─────────────────────────────────────────────────
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (s_partial_valid && !manifest.sameImage(s_partial_manifest)) {
-        ESP_LOGI(TAG, "staged image changed — discarding partial download (%zu chunks)", s_next_chunk);
+        ESP_LOGI(TAG, "staged image changed — discarding partial download (%zu chunks)", s_next_chunk.load());
         discard_partial_locked();
     }
     if (!s_partial_valid) {
@@ -389,10 +415,10 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
         }
         s_partial_manifest = manifest;
         s_partial_valid = true;
-        s_next_chunk = 0;
+        s_next_chunk.store(0);
         s_received.store(0);
     }
-    const size_t session_start_chunk = s_next_chunk;
+    const size_t session_start_chunk = s_next_chunk.load();
     xSemaphoreGive(s_mutex);
 
     ESP_LOGI(TAG, "OTA %s -> %s: %zu bytes in %zu chunks of %zu, %s chunk %zu, into %s",
@@ -404,7 +430,6 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
         "{{\"state\":\"starting\",\"version\":\"{}\",\"size\":{},\"chunks\":{},\"resume_chunk\":{}}}",
         manifest.version, manifest.size, total_chunks, session_start_chunk));
 
-    s_conn_lost.store(false);
     xEventGroupClearBits(s_eg, OTA_BIT_CHUNK | OTA_BIT_FAIL);
     s_session_active.store(true);
 
@@ -413,7 +438,15 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
     // its steady-state cadence.
     s_link->onOtaWindowBegin();
 
-    // ── pull chunks strictly in order ─────────────────────────────────────────
+    // ── pull chunks strictly in order, subscribes pipelined ──────────────────
+    // A 2-deep subscription window keeps the next chunk queued at the broker/parent while
+    // the current one is being received and flashed — v4's fully serial
+    // subscribe→deliver→write round trip measured ~2.5 s/chunk; overlapping the subscribe
+    // leg leaves roughly just the delivery time. Retained messages are delivered in
+    // per-connection subscribe order, so handle_image_chunk()'s strict in-order check is
+    // unaffected. QoS 0 everywhere: the chunks ride an already-reliable TCP stream, and a
+    // loss just means the 20 s wait below expires and the session resumes.
+    static constexpr size_t SUBSCRIBE_PIPELINE = 2;
     bool all_chunks = false;
     std::string fail_reason;
     const TickType_t session_start_tick = xTaskGetTickCount();
@@ -421,40 +454,59 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
     // single-blob design these actually reach the broker live.
     const size_t status_every = std::max<size_t>(total_chunks / 10, 1);
 
-    for (size_t chunk = session_start_chunk; chunk < total_chunks; ++chunk) {
+    const auto subscribe_chunk = [&](size_t chunk) {
         const std::string topic = std::format("{}{}", s_topic_image_prefix, chunk);
-        // QoS 0: the retained chunk rides an already-reliable TCP stream, and loss just
-        // means the 20 s wait below expires and the session resumes next cycle.
-        if (esp_mqtt_client_subscribe(client, topic.c_str(), 0) < 0) {
-            fail_reason = std::format("subscribe to chunk {} failed", chunk);
-            break;
-        }
+        if (esp_mqtt_client_subscribe(client, topic.c_str(), 0) >= 0)
+            return true;
+        fail_reason = std::format("subscribe to chunk {} failed", chunk);
+        return false;
+    };
+
+    // Prime the window…
+    bool subscribed_ok = true;
+    for (size_t k = session_start_chunk;
+         subscribed_ok && k < std::min(session_start_chunk + SUBSCRIBE_PIPELINE, total_chunks); ++k)
+        subscribed_ok = subscribe_chunk(k);
+
+    // Progress is counted via s_next_chunk, NOT one event-bit wait per chunk: with the
+    // pipeline, two chunks can complete between waits, and a binary event bit would swallow
+    // the second completion and manufacture a bogus 20 s timeout.
+    size_t done = session_start_chunk;
+    while (subscribed_ok && done < total_chunks) {
         const EventBits_t bits = xEventGroupWaitBits(s_eg, OTA_BIT_CHUNK | OTA_BIT_FAIL,
                                                      pdTRUE, pdFALSE,
                                                      pdMS_TO_TICKS(OTA_CHUNK_TIMEOUT_MS));
         if (bits & OTA_BIT_FAIL) {
             fail_reason = s_conn_lost.load()
-                ? std::format("connection lost at chunk {}", chunk)
-                : std::format("chunk {} rejected", chunk);
+                ? std::format("connection lost at chunk {}", done)
+                : std::format("chunk {} rejected", done);
             break;
         }
-        if (!(bits & OTA_BIT_CHUNK)) {
-            fail_reason = std::format("chunk {} timed out after {} s", chunk, OTA_CHUNK_TIMEOUT_MS / 1000);
-            break;
+        const size_t now_done = s_next_chunk.load();
+        if (now_done == done) {
+            if (!(bits & OTA_BIT_CHUNK)) {
+                fail_reason = std::format("chunk {} timed out after {} s", done, OTA_CHUNK_TIMEOUT_MS / 1000);
+                break;
+            }
+            continue;  // completion already accounted by a previous iteration
         }
-        if (chunk + 1 == total_chunks) {
-            all_chunks = true;
-            break;
+        // …keep the window SUBSCRIBE_PIPELINE deep for every newly completed chunk.
+        for (size_t c = done; subscribed_ok && c < now_done; ++c) {
+            if (c + SUBSCRIBE_PIPELINE < total_chunks)
+                subscribed_ok = subscribe_chunk(c + SUBSCRIBE_PIPELINE);
+            if (subscribed_ok && (c + 1) % status_every == 0 && c + 1 < total_chunks)
+                publish_status(client, std::format(
+                    "{{\"state\":\"downloading\",\"chunk\":{},\"chunks\":{},\"received\":{}}}",
+                    c + 1, total_chunks, s_received.load()));
         }
-        if ((chunk + 1) % status_every == 0)
-            publish_status(client, std::format(
-                "{{\"state\":\"downloading\",\"chunk\":{},\"chunks\":{},\"received\":{}}}",
-                chunk + 1, total_chunks, s_received.load()));
-        if ((xTaskGetTickCount() - session_start_tick) > pdMS_TO_TICKS(OTA_SESSION_CAP_MS)) {
+        done = now_done;
+        if (done < total_chunks &&
+            (xTaskGetTickCount() - session_start_tick) > pdMS_TO_TICKS(OTA_SESSION_CAP_MS)) {
             fail_reason = "session cap exceeded";
             break;
         }
     }
+    all_chunks = (done == total_chunks);
 
     s_session_active.store(false);
 
@@ -481,7 +533,7 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
         // Complete downloads never resume — good ones reboot, bad ones must restart from 0.
         discard_partial_locked();
     }
-    const size_t progressed = s_next_chunk - session_start_chunk;
+    const size_t progressed = s_next_chunk.load() - session_start_chunk;
     xSemaphoreGive(s_mutex);
 
     // Back to sleepy link mode in BOTH outcomes — on success the parent should see a clean
@@ -495,7 +547,7 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
                                             : s_no_progress_attempts.fetch_add(1) + 1;
         publish_status(client, std::format(
             "{{\"state\":\"error\",\"reason\":\"{}\",\"received\":{},\"resume_chunk\":{},\"no_progress_attempts\":{}}}",
-            fail_reason, s_received.load(), s_next_chunk, attempts));
+            fail_reason, s_received.load(), s_next_chunk.load(), attempts));
         ESP_LOGE(TAG, "OTA attempt failed: %s (will %s)", fail_reason.c_str(),
                  s_partial_valid ? "resume next cycle" : "restart from scratch");
         return;  // retained install flag stays -> retried next cycle (attempt budget applies)

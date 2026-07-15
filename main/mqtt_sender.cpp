@@ -427,6 +427,40 @@ static void publish_update_discovery(esp_mqtt_client_handle_t client, std::strin
     esp_mqtt_client_publish(client, ota_topic_installed(), sw_version, 0, 1, 1);
 }
 
+// Runs the OTA session when one is due, then — the v5 stability core — reconnects and
+// resumes IN THIS CYCLE for as long as sessions keep dying by connection loss while making
+// progress. v4 ended the cycle on the first abort, so every ~1 s radio hiccup cost the
+// 0.5-3 min wait for the next LP-flagged publish cycle (~half the measured 17.6 min total).
+// Replaces the caller's client on reconnect; the caller's normal teardown then destroys
+// whichever client is current. On success ota_run_session() reboots and never returns.
+static void run_ota_if_due(MqttClientPtr &client, MqttCtx &ctx, std::optional<int> battery_percent)
+{
+    if (!ota_update_due())
+        return;
+    ota_run_session(client.get(), battery_percent);
+
+    // Loop only on CONNECTION loss: a battery deferral, config error or silent chunk
+    // timeout leaves the connection alive — reconnecting can't help those, so they wait
+    // for a later cycle. ota_update_due() also goes false once the no-progress budget is
+    // spent, bounding this loop alongside the session's own 30 min cap.
+    while (ota_update_due() && ota_session_ended_by_connection_loss()) {
+        ESP_LOGI(TAG, "OTA interrupted by connection loss — reconnecting in-cycle to resume");
+        client.reset();  // stop+destroy the dead client first
+        const std::string uri = s_link->brokerUri(s_cfg.broker_address, s_cfg.port, s_cfg.use_tls);
+        if (uri.empty())
+            return;
+        client.reset(start_client(uri.c_str(), ctx));
+        const EventBits_t bits = xEventGroupWaitBits(ctx.eg, BIT_CONNECTED | BIT_ERROR,
+                                                     pdFALSE, pdFALSE,
+                                                     pdMS_TO_TICKS(s_cfg.use_tls ? 15000 : 5000));
+        if (!(bits & BIT_CONNECTED)) {
+            ESP_LOGW(TAG, "OTA reconnect failed — resuming on a later cycle");
+            return;
+        }
+        ota_run_session(client.get(), battery_percent);
+    }
+}
+
 // ── publish task — owns the client lifecycle ──────────────────────────────────
 struct PublishParams
 {
@@ -579,15 +613,18 @@ static bool run_publish_cycle(const PublishParams &params)
                     s_discovery_sent_mask.fetch_or(discoveryNeed);
             }
         } else {
-            ESP_LOGW(TAG, "no sensor values to publish this cycle");
+            // Not a warning any more: with a pending update, sensorstask deliberately fires
+            // value-less cycles every backstop wake so the OTA check below runs promptly.
+            ESP_LOGI(TAG, "no sensor values this cycle%s", ota_update_due() ? " (OTA-only cycle)" : "");
         }
 
-        // A staged update only starts from a fully healthy cycle (connected AND state ACKed),
-        // so a flaky link fails fast above instead of kicking off a doomed ~1.8 MB download.
-        // On success this reboots into the new image and never returns; on failure/deferral
-        // it has already restored the sleepy link mode and we just tear down as usual.
-        if (ok && ota_update_due())
-            ota_run_session(client.get(), params.battery_percent);
+        // A staged update only starts from a healthy cycle: for a data-carrying cycle that
+        // means connected AND state ACKed (a flaky link fails fast above instead of kicking
+        // off a doomed download); an OTA-only cycle carries nothing to ACK, so CONNECTED is
+        // the bar. On success this reboots and never returns; on failure it has restored
+        // the sleepy link mode (and possibly replaced `client`) before normal teardown.
+        if (ok || !hasAny)
+            run_ota_if_due(client, ctx, params.battery_percent);
     } else {
         ESP_LOGE(TAG, "MQTT connection failed, skipping cycle");
     }

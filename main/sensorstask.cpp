@@ -114,37 +114,53 @@ void SensorsTask::executeTask()
 
             shouldWake = state.should_wake_hp != 0;
 
-            if (shouldWake) {
+            if (ota_session_in_progress()) {
+                // An OTA download owns the radio and the publish path — skip ALL sensor work
+                // this wake: no ADC power-domain (MODEM/TOP) churn mid-download, no doomed
+                // publish attempt, no log spam. LP's baseline stays unacked, so a flagged
+                // value simply publishes after the OTA ends (or after the reboot it leads to).
+                ESP_LOGI(TAG, "OTA download in progress — skipping sensor work this wake");
+            } else if (shouldWake || ota_update_due()) {
+                // Either LP flagged data, or a staged update is pending — the latter turns
+                // every backstop wake into an "OTA-only" cycle (empty values, no ADC read):
+                // waiting for LP's change detector cost up to ~3 min of dead time per
+                // interrupted OTA session in the v4 hardware test.
+                const bool otaOnly = !shouldWake;
                 SensorsValues v{};
-                v.envTemperature = state.cal_temp_c;
-                v.envHumidity = state.cal_hum_pct;
+                if (otaOnly) {
+                    ESP_LOGI(TAG, "firmware update pending — starting an OTA-only publish cycle");
+                } else {
+                    v.envTemperature = state.cal_temp_c;
+                    v.envHumidity = state.cal_hum_pct;
 
-                // Battery is a passenger on this already-decided publish -- it is read here, and
-                // only here, so it can never wake HP or trigger a send by itself. Create -> read
-                // -> delete strictly inside this awake window: with
-                // CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP, adc_oneshot_new_unit() pins the
-                // MODEM+TOP power domains ON across light sleep until adc_oneshot_del_unit(), so
-                // holding the unit while blocked in lp_sensor_core_wait_for_wake() would silently
-                // raise sleep current every cycle. Any failure degrades to publishing without the
-                // battery fields (HA then keeps the entities' previous values).
-                if (m_settings.readVoltageViaAdc) {
-                    if (initAdc() == ESP_OK) {
-                        if (const auto milliVolts = readBatteryVoltageMilliV()) {
-                            v.batteryVoltageMilliV = *milliVolts;
-                            v.batteryPercent = SensorsValues::convertVoltageToPercent(*milliVolts);
-                            ESP_LOGI(TAG, "battery: %d mV (%d%%)", *milliVolts, *v.batteryPercent);
+                    // Battery is a passenger on this already-decided publish -- it is read here,
+                    // and only here, so it can never wake HP or trigger a send by itself. Create ->
+                    // read -> delete strictly inside this awake window: with
+                    // CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP, adc_oneshot_new_unit() pins
+                    // the MODEM+TOP power domains ON across light sleep until
+                    // adc_oneshot_del_unit(), so holding the unit while blocked in
+                    // lp_sensor_core_wait_for_wake() would silently raise sleep current every
+                    // cycle. Any failure degrades to publishing without the battery fields (HA
+                    // then keeps the entities' previous values).
+                    if (m_settings.readVoltageViaAdc) {
+                        if (initAdc() == ESP_OK) {
+                            if (const auto milliVolts = readBatteryVoltageMilliV()) {
+                                v.batteryVoltageMilliV = *milliVolts;
+                                v.batteryPercent = SensorsValues::convertVoltageToPercent(*milliVolts);
+                                ESP_LOGI(TAG, "battery: %d mV (%d%%)", *milliVolts, *v.batteryPercent);
+                            } else {
+                                ESP_LOGW(TAG, "battery ADC read failed (err=0x%x), publishing without battery",
+                                         milliVolts.error());
+                            }
+                            deinitAdc();
                         } else {
-                            ESP_LOGW(TAG, "battery ADC read failed (err=0x%x), publishing without battery",
-                                     milliVolts.error());
+                            ESP_LOGW(TAG, "battery ADC init failed, publishing without battery");
                         }
-                        deinitAdc();
-                    } else {
-                        ESP_LOGW(TAG, "battery ADC init failed, publishing without battery");
                     }
-                }
 
-                ESP_LOGI(TAG, "publishing LP-flagged value: %.2fC / %.2f%%RH",
-                         static_cast<double>(state.cal_temp_c), static_cast<double>(state.cal_hum_pct));
+                    ESP_LOGI(TAG, "publishing LP-flagged value: %.2fC / %.2f%%RH",
+                             static_cast<double>(state.cal_temp_c), static_cast<double>(state.cal_hum_pct));
+                }
 
                 if (m_readyEvent)
                     m_readyEvent(v);  // triggers an async MQTT publish when attached as CHILD

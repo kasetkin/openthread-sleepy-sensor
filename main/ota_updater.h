@@ -74,8 +74,14 @@ void ota_on_mqtt_error();
 bool ota_update_due();
 
 // True while a download session is running. The sensor task uses this to (a) not count the
-// long-running publish cycle against the reboot supervisor and (b) skip its error blinks.
+// long-running publish cycle against the reboot supervisor, (b) skip its error blinks and
+// (c) skip sensor/ADC work entirely while the download owns the radio.
 bool ota_session_in_progress();
+
+// True when the most recent session ended because the CONNECTION died (vs. a deferral,
+// a config error, or a chunk timeout on a live connection). mqtt_sender uses this to
+// decide whether an immediate in-cycle reconnect+resume is worthwhile.
+bool ota_session_ended_by_connection_loss();
 
 // Run the chunk-pull session on an already-CONNECTED client (mqtt_pub task context). On
 // success this reboots into the new image and never returns. Returns on failure/deferral
