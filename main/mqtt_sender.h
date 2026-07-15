@@ -21,6 +21,11 @@ inline constexpr size_t MQTT_MAC_ADDRESS_BYTES = 8;
 inline constexpr size_t MQTT_MAX_DEVICE_ID_LEN =
     MQTT_MAX_DEVICE_NAME_LEN + 1 /* '-' */ + 2 * MQTT_MAC_ADDRESS_BYTES;
 
+// Longest string main.cpp's resetReasonString() can produce (and main.cpp truncates
+// anything longer, mirroring the device_name bound above) — mqtt_sender.cpp's state-JSON
+// buffer is sized against this, so the two can't silently drift apart.
+inline constexpr size_t MQTT_MAX_RESET_REASON_LEN = sizeof("publish_fail_reboot") - 1;
+
 struct MqttConfig {
     std::string      broker_address; // literal IPv4 or IPv6 address, e.g. "192.168.77.250" or "fd12:3456:789a::10"
     uint16_t         port;       // MQTT port, e.g. 1883
@@ -33,6 +38,14 @@ struct MqttConfig {
     bool             use_tls = false;      // true: mqtts:// with server verification; false: plaintext mqtt://
     std::string      tls_ca_cert_b64;      // optional CA/leaf cert, base64 body only (no PEM markers/newlines);
                                             // empty => trust ESP-IDF's public CA bundle instead. Only used if use_tls.
+    // HA sensors' expire_after (seconds without an update before HA shows "unavailable");
+    // main.cpp derives it as (SensorsTask::REBOOT_AFTER_FAILS + 1) x cycle_duration_sec so
+    // HA only flags the device once its own reboot self-recovery has failed too. 0 omits
+    // the field (entities then never expire, the pre-feature behaviour).
+    uint32_t         expire_after_sec = 0;
+    uint32_t         boot_count = 0;        // lifetime NVS boot counter, published as state key "bc"
+    std::string      reset_reason = "unknown";  // last reboot cause, published as state key "rr";
+                                                 // at most MQTT_MAX_RESET_REASON_LEN chars
 };
 
 // Call once before the sensor task starts. `link` must outlive the sensor task — it

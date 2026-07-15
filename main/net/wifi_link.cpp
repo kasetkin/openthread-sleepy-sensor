@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <format>
+#include <optional>
 #include <string>
 
 #include "esp_err.h"
@@ -151,6 +152,14 @@ static void refresh()
     esp_wifi_connect();
 }
 
+static std::optional<int> readApRssi()
+{
+    wifi_ap_record_t ap = {};
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK)
+        return std::nullopt;
+    return ap.rssi;
+}
+
 NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
 {
     s_wifi_ssid = cfg.wifi_ssid;
@@ -167,5 +176,6 @@ NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
     link.onOtaWindowBegin = noop;   // Wi-Fi STA is already always-RX during the awake window
     link.onOtaWindowEnd = noop;
     link.refresh = refresh;
+    link.readRssiDbm = readApRssi;
     return link;
 }

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <format>
+#include <optional>
 #include <string>
 
 #include "esp_err.h"
@@ -66,6 +67,19 @@ static void set_poll_period(uint32_t ms)
     esp_openthread_lock_acquire(portMAX_DELAY);
     otLinkSetPollPeriod(esp_openthread_get_instance(), ms);
     esp_openthread_lock_release();
+}
+
+// RSSI of the last packet received from the parent — for a SED the parent link is the only
+// one that exists. Called from the MQTT task, so it takes the OT lock like set_poll_period().
+static std::optional<int> read_parent_rssi()
+{
+    int8_t rssi = 0;
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    const otError err = otThreadGetParentLastRssi(esp_openthread_get_instance(), &rssi);
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE)
+        return std::nullopt;
+    return rssi;
 }
 
 // OTA-download link boost. Deliberately just a faster data-poll cadence, NOT
@@ -328,5 +342,6 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.onOtaWindowEnd = []() { ESP_LOGI(TAG, "OTA window end: poll %lu ms", (unsigned long)POLL_FAST_MS);
                                  set_poll_period(POLL_FAST_MS); };
     link.refresh = refresh_nat64_prefix;
+    link.readRssiDbm = read_parent_rssi;
     return link;
 }

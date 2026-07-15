@@ -232,6 +232,7 @@ void SensorsTask::executeTask()
             if (++m_consecutiveFailures >= REBOOT_AFTER_FAILS) {
                 ESP_LOGE(TAG, "%lu consecutive cycles without a successful publish — rebooting to recover",
                          static_cast<unsigned long>(m_consecutiveFailures));
+                markPublishFailReboot();  // next boot reports "publish_fail_reboot", not "sw_reset"
                 esp_restart();
             }
         }

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <ranges>
 #include <string_view>
+#include <esp_attr.h>
 #include <esp_log.h>
 #include <esp_check.h>
 #include <esp_pm.h>
@@ -119,6 +120,24 @@ esp_err_t initNvsFlash()
     }
 
     return ESP_OK;
+}
+
+// RTC (LP) RAM survives a software reset but not a power cycle, and noinit skips the
+// bootloader's zeroing — so after power-on this holds garbage, which is exactly why a
+// magic word is compared rather than a bool.
+static constexpr uint32_t PUBLISH_FAIL_REBOOT_MAGIC = 0x50464252;  // "PFBR"
+RTC_NOINIT_ATTR static uint32_t s_publish_fail_reboot_marker;
+
+void markPublishFailReboot()
+{
+    s_publish_fail_reboot_marker = PUBLISH_FAIL_REBOOT_MAGIC;
+}
+
+bool consumePublishFailRebootMarker()
+{
+    const bool wasSet = (s_publish_fail_reboot_marker == PUBLISH_FAIL_REBOOT_MAGIC);
+    s_publish_fail_reboot_marker = 0;
+    return wasSet;
 }
 
 unsigned long millisFromStart()

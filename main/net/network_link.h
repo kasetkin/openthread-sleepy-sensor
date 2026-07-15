@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include "esp_err.h"
@@ -62,6 +63,11 @@ struct NetworkLink
 
     // Recovery after a failed publish (OT: re-scan NAT64 route; Wi-Fi: reconnect kick).
     std::function<void()> refresh;
+
+    // Uplink signal strength in dBm (OT: RSSI of the last packet from the SED's parent;
+    // Wi-Fi: the associated AP's RSSI), nullopt when unavailable (detached/disconnected).
+    // Called from the MQTT publish window, so the radio is awake and the reading is fresh.
+    std::function<std::optional<int>()> readRssiDbm;
 };
 
 struct NetworkLinkConfig

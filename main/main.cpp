@@ -6,6 +6,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_system.h"
 
 #include "main.h"
 #include "common_utils.h"
@@ -101,6 +102,47 @@ static bool parse_as_bool_or(std::string_view content, std::string_view key, boo
     ESP_LOGW("main", "calibration.txt missing/invalid '%.*s', falling back to %s",
              static_cast<int>(key.size()), key.data(), def ? "true" : "false");
     return def;
+}
+
+// Reads, increments and persists the lifetime boot counter (published as HA's "Boot count"
+// diagnostic). Returns the new value (1 on the first-ever boot), or 0 with a log on NVS
+// failure — a storage problem then shows up in HA as a counter stuck at 0, not silently.
+static uint32_t incrementBootCount()
+{
+    nvs_handle_t nvs;
+    if (nvs_open("app", NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE("main", "boot counter: nvs_open failed");
+        return 0;
+    }
+    uint32_t count = 0;
+    nvs_get_u32(nvs, "boot_count", &count);  // key missing on first boot: count stays 0
+    ++count;
+    if (nvs_set_u32(nvs, "boot_count", count) != ESP_OK || nvs_commit(nvs) != ESP_OK)
+        ESP_LOGE("main", "boot counter: persist failed");
+    nvs_close(nvs);
+    return count;
+}
+
+// Maps esp_reset_reason() to the short string published as HA's "Reset reason" diagnostic.
+// Every literal must fit MQTT_MAX_RESET_REASON_LEN (mqtt_sender.h) — the state-JSON buffer
+// is sized against it. The RTC marker is consumed unconditionally (it must be cleared even
+// on a non-SW reset) and refines ESP_RST_SW: an OTA reboot and the publish-failure
+// supervisor's reboot are both "software reset" to IDF, but only the latter is a failure.
+static const char *resetReasonString()
+{
+    const bool publishFailReboot = consumePublishFailRebootMarker();
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power_on";
+    case ESP_RST_SW:        return publishFailReboot ? "publish_fail_reboot" : "sw_reset";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_INT_WDT:   return "int_wdt";
+    case ESP_RST_TASK_WDT:  return "task_wdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    default:                return "unknown";
+    }
 }
 
 extern "C" void app_main(void)
@@ -221,6 +263,17 @@ extern "C" void app_main(void)
     });
 
     // ── initialise MQTT sender ─────────────────────────────────────────────────
+    // cycle_duration_sec is parsed here, ahead of the sensor settings below that also use
+    // it, because MqttConfig's expire_after_sec is derived from it (see its doc comment).
+    const uint32_t cycle_duration_sec = parse_as_uint32_or(calibration_txt(), "cycle_duration_sec",
+                                                           SensorsTaskSettings{}.cycleDurationSec);
+    const uint32_t boot_count = incrementBootCount();
+    std::string reset_reason = resetReasonString();
+    if (reset_reason.size() > MQTT_MAX_RESET_REASON_LEN)
+        reset_reason.resize(MQTT_MAX_RESET_REASON_LEN);
+    ESP_LOGI("main", "boot #%lu, reset reason: %s",
+             static_cast<unsigned long>(boot_count), reset_reason.c_str());
+
     ESP_LOGI("main", "MQTT device_id: %s", mqtt_name_and_id.c_str());
     mqtt_sender_init(MqttConfig{
         .broker_address = mqtt_broker_address,
@@ -231,6 +284,9 @@ extern "C" void app_main(void)
         .device_name = mqtt_name_and_id,
         .use_tls = mqtt_tls,
         .tls_ca_cert_b64 = mqtt_tls_ca_cert,
+        .expire_after_sec = (SensorsTask::REBOOT_AFTER_FAILS + 1) * cycle_duration_sec,
+        .boot_count = boot_count,
+        .reset_reason = reset_reason,
     }, &s_link);
 
     // ── sensors ───────────────────────────────────────────────────────────────
@@ -239,8 +295,7 @@ extern "C" void app_main(void)
     // sensor bus -- see the migration plan. sensors_task's own cycle_duration_sec is now
     // just a backstop ceiling, not the primary cadence.
     const SensorsTaskSettings sSettings {
-        .cycleDurationSec = parse_as_uint32_or(calibration_txt(), "cycle_duration_sec",
-                                                  SensorsTaskSettings{}.cycleDurationSec),
+        .cycleDurationSec = cycle_duration_sec,
         .readVoltageViaAdc = parse_as_bool_or(calibration_txt(), "read_battery_via_adc",
                                                   SensorsTaskSettings{}.readVoltageViaAdc),
         .batteryDividerRVbatOhm = parse_as_float_or(calibration_txt(), "battery_divider_r_vbat_ohm",

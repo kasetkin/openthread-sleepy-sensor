@@ -141,6 +141,14 @@ public:
     // going shorter than the research's nominal threshold is fine given real brightness margin.
     static constexpr uint32_t LED_BLINK_MS       = 5;
 
+    /// Recovery: reboot after this many consecutive cycles without a successful publish. A transient
+    /// reachability loss (stale NAT64 prefix, broker blip) otherwise persists forever; rebooting
+    /// re-attaches and re-learns the NAT64 route. ~5 cycles ≈ 5 min of no data before recovering.
+    /// Public because main.cpp derives the HA sensors' expire_after from the same constant
+    /// ((this + 1) x cycle_duration_sec), so HA only marks the device unavailable once this
+    /// self-recovery, plus the post-reboot publish cycle, has failed too.
+    static constexpr uint32_t REBOOT_AFTER_FAILS = 5;
+
 
     SensorsTask(SensorsTaskSettings settings);
     SensorsTask(const SensorsTask &) = delete;
@@ -164,11 +172,6 @@ public:
 private:
     /// per-cycle awake budget to (re)attach before sleeping anyway
     static constexpr uint32_t ATTACH_TIMEOUT_MS = 30 * 1000;
-
-    /// Recovery: reboot after this many consecutive cycles without a successful publish. A transient
-    /// reachability loss (stale NAT64 prefix, broker blip) otherwise persists forever; rebooting
-    /// re-attaches and re-learns the NAT64 route. ~5 cycles ≈ 5 min of no data before recovering.
-    static constexpr uint32_t REBOOT_AFTER_FAILS = 5;
 
     /// Voltage section
     static constexpr gpio_num_t VOLTAGE_PIN = GPIO_NUM_2;

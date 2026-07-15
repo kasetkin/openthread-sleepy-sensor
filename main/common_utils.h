@@ -25,6 +25,16 @@ esp_err_t enableAutomaticLightSleep();
 [[nodiscard("NVS unavailable if init failure ignored")]]
 esp_err_t initNvsFlash();
 
+/// Reset-reason refinement pair. IDF reports both an OTA reboot and the publish-failure
+/// supervisor's reboot (sensorstask.cpp) as plain ESP_RST_SW; only the latter is a failure
+/// signal worth surfacing in HA. The supervisor calls markPublishFailReboot() right before
+/// its esp_restart(), leaving a magic word in RTC (LP) RAM — which survives a software
+/// reset — and main.cpp's boot-time reset-reason mapping calls
+/// consumePublishFailRebootMarker() (read-and-clear, so the refinement applies to exactly
+/// one boot) to tell the two apart. Same hint technique esp_reset_reason() itself uses.
+void markPublishFailReboot();
+bool consumePublishFailRebootMarker();
+
 /// for loggertask code migration, because it was written for Arduino
 unsigned long millisFromStart();
 /// emulate code from RTC.h

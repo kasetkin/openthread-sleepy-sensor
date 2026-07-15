@@ -87,9 +87,12 @@ Workflow:
 3. **Download**: the device verifies version/battery (≥30 % unless the manifest says
    `"force":true`), drops its Thread data-poll period to 50 ms for the session (staying a
    sleepy child — switching to rx-on-when-idle was tried and black-holes downlink during
-   the mode renegotiation), pulls the chunks in order, checks SHA-256, flips the boot
-   partition and reboots. Expect roughly 10–20 min for a ~1.9 MB image; interruptions
-   resume rather than restart.
+   the mode renegotiation), pulls the chunks in order with a 2-deep pipelined subscription
+   window, checks SHA-256, flips the boot partition and reboots. Expect roughly **4–8 min**
+   for a ~1.9 MB image. Brief radio stalls that kill the MQTT connection are recovered
+   **within the same wake cycle** (reconnect + resume from the first missing chunk), and
+   while an update is pending every backstop wake runs an OTA-attempt cycle even when the
+   sensors have nothing new to publish.
 4. **Confirm or roll back**: the new image boots as `PENDING_VERIFY`
    (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). Its first broker-ACKed publish marks it valid;
    if that never happens, the existing failed-cycles reboot supervisor restarts the device
