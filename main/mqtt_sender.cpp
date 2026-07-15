@@ -329,6 +329,14 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
     // wait is explicitly bounded (connect 5 s/15 s, ACK 4 s, sensorstask's 15 s publish cap,
     // OTA's own 30 s no-progress watchdog), and the client is destroyed at cycle end.
     cfg.session.disable_keepalive = true;
+    // Outbox retransmission OFF in practice (default is a hair-trigger 1 s). Over TCP a
+    // packet is never lost, only ACKed late — and during an OTA download SUBACKs queue for
+    // seconds behind 8 KB chunk deliveries, so 1 s retransmits duplicated every chunk
+    // SUBSCRIBE, which made the broker re-send each retained chunk again and again until
+    // the duplicates starved the real download (hardware-observed: "ignoring unexpected
+    // chunk" x9 storms and 20 s chunk timeouts). Our own bounded waits (4 s publish-ACK,
+    // 20 s chunk) remain the real failure detectors.
+    cfg.session.message_retransmit_timeout = 30000;
     // RX buffer sized so a max-size OTA image chunk arrives as ONE MQTT_EVENT_DATA event —
     // the property the chunked OTA protocol rests on (see ota_updater.h). Out-buffer stays
     // small separately: the largest outbound message is a ~700 B discovery config, and
