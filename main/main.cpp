@@ -284,7 +284,9 @@ extern "C" void app_main(void)
         .device_name = mqtt_name_and_id,
         .use_tls = mqtt_tls,
         .tls_ca_cert_b64 = mqtt_tls_ca_cert,
-        .expire_after_sec = (SensorsTask::REBOOT_AFTER_FAILS + 1) * cycle_duration_sec,
+        //.expire_after_sec = (SensorsTask::REBOOT_AFTER_FAILS + 1) * cycle_duration_sec,
+        //! \todo fix timings
+        .expire_after_sec = 300,
         .boot_count = boot_count,
         .reset_reason = reset_reason,
     }, &s_link);
