@@ -263,10 +263,14 @@ extern "C" void app_main(void)
     });
 
     // ── initialise MQTT sender ─────────────────────────────────────────────────
-    // cycle_duration_sec is parsed here, ahead of the sensor settings below that also use
-    // it, because MqttConfig's expire_after_sec is derived from it (see its doc comment).
-    const uint32_t cycle_duration_sec = parse_as_uint32_or(calibration_txt(), "cycle_duration_sec",
-                                                           SensorsTaskSettings{}.cycleDurationSec);
+    // The LP cadence pair is parsed here, ahead of the sensor/LP-core settings below that
+    // also use it, because MqttConfig's expire_after_sec is derived from the same two
+    // values (see its doc comment). An lp_poll_interval_sec of 0 would arm the LP timer
+    // with no delay (busy-loop) -- the non-zero fallback default guards that too.
+    const uint32_t lp_poll_interval_sec = parse_as_uint32_or(calibration_txt(), "lp_poll_interval_sec",
+                                                             SensorsTaskSettings{}.lpPollIntervalSec);
+    const uint32_t max_skip_cycles = parse_as_uint32_or(calibration_txt(), "max_skip_cycles",
+                                                        SensorsTaskSettings{}.maxSkipCycles);
     const uint32_t boot_count = incrementBootCount();
     std::string reset_reason = resetReasonString();
     if (reset_reason.size() > MQTT_MAX_RESET_REASON_LEN)
@@ -284,9 +288,7 @@ extern "C" void app_main(void)
         .device_name = mqtt_name_and_id,
         .use_tls = mqtt_tls,
         .tls_ca_cert_b64 = mqtt_tls_ca_cert,
-        //.expire_after_sec = (SensorsTask::REBOOT_AFTER_FAILS + 1) * cycle_duration_sec,
-        //! \todo fix timings
-        .expire_after_sec = 300,
+        .expire_after_sec = 2 * SensorsTask::safeguardWakeSec(lp_poll_interval_sec, max_skip_cycles),
         .boot_count = boot_count,
         .reset_reason = reset_reason,
     }, &s_link);
@@ -294,10 +296,12 @@ extern "C" void app_main(void)
     // ── sensors ───────────────────────────────────────────────────────────────
     // The LP core (components/lp_sensor_core) owns the sensor entirely: I2C, calibration,
     // the skip-threshold publish decision, and heater maintenance. HP never touches the
-    // sensor bus -- see the migration plan. sensors_task's own cycle_duration_sec is now
-    // just a backstop ceiling, not the primary cadence.
+    // sensor bus -- see the migration plan. The sensor task sets no cadence of its own; it
+    // derives its safeguard wake timeout from the same LP cadence pair
+    // (SensorsTask::safeguardWakeSec).
     const SensorsTaskSettings sSettings {
-        .cycleDurationSec = cycle_duration_sec,
+        .lpPollIntervalSec = lp_poll_interval_sec,
+        .maxSkipCycles = max_skip_cycles,
         .readVoltageViaAdc = parse_as_bool_or(calibration_txt(), "read_battery_via_adc",
                                                   SensorsTaskSettings{}.readVoltageViaAdc),
         .batteryDividerRVbatOhm = parse_as_float_or(calibration_txt(), "battery_divider_r_vbat_ohm",
@@ -306,9 +310,12 @@ extern "C" void app_main(void)
                                                   static_cast<float>(SensorsTaskSettings{}.batteryDividerRGndOhm)),
     };
 
-    ESP_LOGI("main", "sensor settings: cycle_duration_sec=%lu read_battery_via_adc=%d "
-                     "battery_divider=%.0f/%.0f Ohm",
-             static_cast<unsigned long>(sSettings.cycleDurationSec),
+    ESP_LOGI("main", "sensor settings: lp_poll_interval_sec=%lu max_skip_cycles=%lu "
+                     "safeguard_wake_sec=%lu read_battery_via_adc=%d battery_divider=%.0f/%.0f Ohm",
+             static_cast<unsigned long>(sSettings.lpPollIntervalSec),
+             static_cast<unsigned long>(sSettings.maxSkipCycles),
+             static_cast<unsigned long>(SensorsTask::safeguardWakeSec(sSettings.lpPollIntervalSec,
+                                                                      sSettings.maxSkipCycles)),
              static_cast<int>(sSettings.readVoltageViaAdc),
              sSettings.batteryDividerRVbatOhm, sSettings.batteryDividerRGndOhm);
 
@@ -341,15 +348,12 @@ extern "C" void app_main(void)
         .temp_min_change_c = parse_as_float_or(calibration_txt(), "temp_min_change", 0.0f),
         .rh_offset_pct = parse_as_float_or(calibration_txt(), "rh_offset", 0.0f),
         .rh_min_change_pct = parse_as_float_or(calibration_txt(), "rh_min_change", 0.0f),
-        .max_skip_cycles = parse_as_uint32_or(calibration_txt(), "max_skip_cycles", 0),
+        // parsed above, ahead of mqtt_sender_init() -- expire_after_sec derives from it
+        .max_skip_cycles = max_skip_cycles,
     };
-    // 0 would arm the LP timer with no delay (busy-loop) -- default to the same 60s the HP
-    // backstop (SensorsTaskSettings::cycle_duration_sec) defaults to if unset.
-    const uint32_t lpPollIntervalSec = parse_as_uint32_or(calibration_txt(), "lp_poll_interval_sec",
-                                                           SensorsTaskSettings{}.cycleDurationSec);
     ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, temp_offset=%.2f temp_min_change=%.2f "
                   "rh_offset=%.2f rh_min_change=%.2f max_skip_cycles=%lu",
-             static_cast<unsigned long>(lpPollIntervalSec),
+             static_cast<unsigned long>(lp_poll_interval_sec),
              static_cast<double>(lpConfig.temp_offset_c), static_cast<double>(lpConfig.temp_min_change_c),
              static_cast<double>(lpConfig.rh_offset_pct), static_cast<double>(lpConfig.rh_min_change_pct),
              static_cast<unsigned long>(lpConfig.max_skip_cycles));
@@ -359,7 +363,7 @@ extern "C" void app_main(void)
         startErrorTask(ErrorTask::ErrorCode::ecSensorsFail);
         return;
     }
-    if (const esp_err_t lpStartErr = lp_sensor_core_start(lpPollIntervalSec * 1'000'000u); lpStartErr != ESP_OK) {
+    if (const esp_err_t lpStartErr = lp_sensor_core_start(lp_poll_interval_sec * 1'000'000u); lpStartErr != ESP_OK) {
         ESP_LOGE(TAG, "lp_sensor_core_start failed: %d", lpStartErr);
         startErrorTask(ErrorTask::ErrorCode::ecSensorsFail);
         return;

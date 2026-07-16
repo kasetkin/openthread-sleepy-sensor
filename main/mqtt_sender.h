@@ -39,9 +39,11 @@ struct MqttConfig {
     std::string      tls_ca_cert_b64;      // optional CA/leaf cert, base64 body only (no PEM markers/newlines);
                                             // empty => trust ESP-IDF's public CA bundle instead. Only used if use_tls.
     // HA sensors' expire_after (seconds without an update before HA shows "unavailable");
-    // main.cpp derives it as (SensorsTask::REBOOT_AFTER_FAILS + 1) x cycle_duration_sec so
-    // HA only flags the device once its own reboot self-recovery has failed too. 0 omits
-    // the field (entities then never expire, the pre-feature behaviour).
+    // main.cpp derives it as 2 x SensorsTask::safeguardWakeSec(lp_poll_interval_sec,
+    // max_skip_cycles). The LP core guarantees a publish at latest every
+    // (max_skip_cycles + 1) polls, so two safeguard windows without data means delivery is
+    // genuinely broken (and the reboot self-recovery typically lands well inside that
+    // budget). 0 omits the field (entities then never expire, the pre-feature behaviour).
     uint32_t         expire_after_sec = 0;
     uint32_t         boot_count = 0;        // lifetime NVS boot counter, published as state key "bc"
     std::string      reset_reason = "unknown";  // last reboot cause, published as state key "rr";

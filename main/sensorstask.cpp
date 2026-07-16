@@ -60,18 +60,31 @@ void SensorsTask::executeTask()
 {
     static const char * TAG = "sensors-task";
 
-    // This task is the sole driver of the HP backstop cadence: wake → read LP's state →
-    // publish (if flagged) → wait-for-idle → block until the next LP-flagged wake or the
-    // cycle_duration_sec backstop, on every iteration. Light sleep itself is fully automatic
-    // (see enableAutomaticLightSleep(), main/common_utils.cpp) -- this task never calls any
-    // sleep API; it just blocks, which is what lets the CPU idle-sleep underneath it. The LP
-    // core (components/lp_sensor_core) can wake this wait early via
-    // ulp_lp_core_wakeup_main_processor() -- see lp_sensor_core_wait_for_wake().
+    // The LP core (components/lp_sensor_core) owns the publish cadence entirely: it
+    // reads/calibrates every lpPollIntervalSec, flags a changed value immediately and an
+    // unchanged one at latest every (maxSkipCycles + 1) polls (its skip budget), and wakes
+    // this task via ulp_lp_core_wakeup_main_processor() -- see
+    // lp_sensor_core_wait_for_wake(). This task just services those wakes: read LP's state
+    // → publish (if flagged) → wait-for-idle → block again. The wait's timeout is purely a
+    // safeguard for the wake mechanism failing (see safeguardWakeSec()). Light sleep itself
+    // is fully automatic (see enableAutomaticLightSleep(), main/common_utils.cpp) -- this
+    // task never calls any sleep API; it just blocks, which is what lets the CPU
+    // idle-sleep underneath it.
+
+    // Why the wait at the bottom of the loop returned. LpWake covers both a real LP wake
+    // and the first pass at boot (a slow boot must never be misread as an LP stall). The
+    // two timeout kinds differ in what they imply: only a full safeguard window without a
+    // single LP poll says the LP core stalled -- the short OTA-retry wait says nothing.
+    enum class WakeReason { LpWake, OtaRetryTimeout, SafeguardTimeout };
+    WakeReason wakeReason = WakeReason::LpWake;
+
     while (true) {
         // Whether data actually reached the broker this cycle. Stays false unless a publish was
         // started AND mqtt_last_publish_succeeded() confirms a connected, ACKed state message.
         bool publishedOk = false;
-        bool shouldWake = false;
+        // A wake that legitimately had nothing to publish -- attached and quiet counts as a
+        // healthy cycle below; anything else without a confirmed publish counts as a failure.
+        bool quietCycle = false;
         // Don't read/publish until attached as CHILD. A plain blocking wait -- under automatic
         // light sleep this is safe to block through: OpenThread's own PM lock
         // (esp_openthread_sleep.c) keeps the CPU awake whenever the radio is actively
@@ -88,8 +101,9 @@ void SensorsTask::executeTask()
 
             // How many real LP timer cycles elapsed since the last HP wake. LP's own ULP
             // timer re-arms itself for lp_poll_interval_sec every invocation (see
-            // components/lp_sensor_core), so this reads exactly 1 on an LP-triggered wake and
-            // something larger on a backstop-timeout wake that lands mid-cycle.
+            // components/lp_sensor_core), so this reads exactly 1 on an LP-triggered wake,
+            // 0 on a wake LP did not produce (a spurious latched wake, or a safeguard
+            // timeout with LP stalled), and larger when several polls passed unflagged.
             const uint32_t heartbeatDelta = state.heartbeat_counter - m_lastSeenHeartbeat;
             ESP_LOGD(TAG, "HP wake: LP heartbeat=%lu (delta %lu since last wake), sensor_ok=%d, should_wake_hp=%d",
                      static_cast<unsigned long>(state.heartbeat_counter),
@@ -112,7 +126,13 @@ void SensorsTask::executeTask()
                 ESP_LOGW(TAG, "LP reports sensor not OK (consec_fail=%lu)",
                          static_cast<unsigned long>(state.consec_fail_count));
 
-            shouldWake = state.should_wake_hp != 0;
+            // A set flag is only actionable if LP has actually run since the last wake we
+            // serviced: LP rewrites should_wake_hp once per poll, so with no LP progress a
+            // set flag is the already-handled leftover of the previous wake. Without this
+            // gate a latched ULP wake request (LP fires while HP is still awake publishing;
+            // the request then pops the next light sleep immediately) re-published
+            // identical values seconds apart -- seen in the ota-logs-5 hardware capture.
+            const bool shouldWake = heartbeatDelta > 0 && state.should_wake_hp != 0;
 
             if (ota_session_in_progress()) {
                 // An OTA download owns the radio and the publish path — skip ALL sensor work
@@ -120,11 +140,24 @@ void SensorsTask::executeTask()
                 // publish attempt, no log spam. LP's baseline stays unacked, so a flagged
                 // value simply publishes after the OTA ends (or after the reboot it leads to).
                 ESP_LOGI(TAG, "OTA download in progress — skipping sensor work this wake");
+                quietCycle = true;
+            } else if (wakeReason == WakeReason::SafeguardTimeout && heartbeatDelta == 0) {
+                // A whole safeguard window without a single LP poll: the LP timer/program
+                // is stalled. (A heater run can't look like this -- heartbeat_counter is
+                // bumped before the multi-minute heater block.) Deliberately NOT quiet, so
+                // the reboot supervisor below eventually restarts the chip, which reloads
+                // and restarts the LP binary -- the only recovery path for a dead LP core.
+                ESP_LOGE(TAG, "no LP progress across a full safeguard window (heartbeat stuck at %lu) — LP core stalled?",
+                         static_cast<unsigned long>(state.heartbeat_counter));
             } else if (shouldWake || ota_update_due()) {
+                if (shouldWake && wakeReason == WakeReason::SafeguardTimeout)
+                    ESP_LOGW(TAG, "LP flagged data but its wake never arrived — recovered by the safeguard timeout");
                 // Either LP flagged data, or a staged update is pending — the latter turns
-                // every backstop wake into an "OTA-only" cycle (empty values, no ADC read):
-                // waiting for LP's change detector cost up to ~3 min of dead time per
-                // interrupted OTA session in the v4 hardware test.
+                // any wake without flagged data into an "OTA-only" cycle (empty values, no
+                // ADC read), and the wait below shortens to one LP poll while an update is
+                // pending so such a cycle starts promptly: waiting for LP's change detector
+                // cost up to ~3 min of dead time per interrupted OTA session in the v4
+                // hardware test.
                 const bool otaOnly = !shouldWake;
                 SensorsValues v{};
                 if (otaOnly) {
@@ -177,8 +210,13 @@ void SensorsTask::executeTask()
                         // Only ack on CONFIRMED delivery -- an attempted-but-failed publish
                         // must leave LP's baseline untouched, so the still-undelivered value
                         // keeps being flagged next cycle instead of silently getting dropped.
+                        // An OTA-only cycle carries no sensor values, so it must not ack
+                        // either: that would shift LP's baseline and re-arm its skip budget
+                        // for a snapshot the broker never saw, postponing the guaranteed
+                        // (maxSkipCycles + 1)-poll forced publish.
                         if (publishedOk) {
-                            lp_sensor_core_ack_delivered(state.cal_temp_c, state.cal_hum_pct);
+                            if (!otaOnly)
+                                lp_sensor_core_ack_delivered(state.cal_temp_c, state.cal_hum_pct);
                             markAppValidOnFirstConfirmedPublish();
                         }
                     } else if (ota_session_in_progress()) {
@@ -192,26 +230,35 @@ void SensorsTask::executeTask()
                     ESP_LOGW(TAG, "mqtt is not working? not sure");
                 }
             } else {
-                // Fires on the majority of wakes in steady state -- ESP_LOGD, not I: a
-                // synchronous UART/USB-JTAG write on every quiet cycle is real, avoidable
-                // awake time. Bump CONFIG_LOG_DEFAULT_LEVEL to see it again for debugging.
-                ESP_LOGD(TAG, "LP has nothing new to report this wake");
+                // Nothing to publish: a spurious latched wake (heartbeatDelta == 0), or LP
+                // alive but with nothing flagged. On a safeguard timeout the latter is the
+                // steady state of a broken sensor (LP deliberately flags only the OK→fail
+                // transition), and HA's expire_after (2 × the safeguard window) is the
+                // honest "no data" signal there -- no reboot, it wouldn't fix I2C. The
+                // common cases stay ESP_LOGD, not I: a synchronous UART/USB-JTAG write on
+                // every quiet cycle is real, avoidable awake time.
+                if (wakeReason == WakeReason::SafeguardTimeout)
+                    ESP_LOGW(TAG, "safeguard timeout: LP alive (%lu polls since last wake) but nothing to publish",
+                             static_cast<unsigned long>(heartbeatDelta));
+                else
+                    ESP_LOGD(TAG, "LP has nothing new to report this wake");
+                quietCycle = true;
             }
         }
 
-        // "Delivered, or nothing new to deliver" both count as a healthy cycle -- mirrors the
-        // original HP-only code's (publishedOk || skipSameValuesCycle) reboot-supervisor gate.
-        // Not attaching at all is never healthy, even if LP would have had nothing new to say.
-        // An in-flight OTA download also counts as healthy: it blocks the publish path for
+        // "Delivered, or legitimately nothing to deliver" both count as a healthy cycle --
+        // mirrors the original HP-only code's (publishedOk || skipSameValuesCycle)
+        // reboot-supervisor gate. Not attaching at all is never healthy, even if LP had
+        // nothing to say; neither is an LP stall (quietCycle stays false there). An
+        // in-flight OTA download also counts as healthy: it blocks the publish path for
         // minutes by design, and letting REBOOT_AFTER_FAILS fire mid-download would reboot
         // (and with rollback enabled, roll back) a perfectly good update in progress.
-        const bool cycleOk = publishedOk || (attached && !shouldWake) || ota_session_in_progress();
+        const bool cycleOk = publishedOk || (attached && quietCycle) || ota_session_in_progress();
 
         // Honest local indicator: 1 blink = data reached the broker, 5 = should have
-        // published but didn't. No LED at all for "LP had nothing new" -- that's the most
-        // common steady-state case (especially with a lengthened backstop) and isn't worth
-        // forced-awake LED time for an unattended deployed sensor; the serial log line above
-        // still covers it for bench debugging.
+        // published but didn't. No LED at all for a quiet cycle -- not worth forced-awake
+        // LED time for an unattended deployed sensor; the serial log lines above still
+        // cover it for bench debugging.
         if (publishedOk) {
             blinkUserLED(LED_BLINK_MS);
         } else if (!cycleOk) {
@@ -221,8 +268,9 @@ void SensorsTask::executeTask()
 
         // Recovery supervisor: count consecutive failed cycles and reboot once they pass the
         // threshold. There is no other path back from a persistent reachability loss — a reboot
-        // re-attaches to Thread and re-learns the NAT64 route. Before that, give a softer nudge:
-        // re-read network data so a merely-stale NAT64 prefix is fixed without a reboot.
+        // re-attaches to Thread and re-learns the NAT64 route — and none from a stalled LP core
+        // either: the reboot reloads and restarts the LP binary. Before that, give a softer
+        // nudge: re-read network data so a merely-stale NAT64 prefix is fixed without a reboot.
         if (cycleOk) {
             m_consecutiveFailures = 0;
         } else {
@@ -237,12 +285,22 @@ void SensorsTask::executeTask()
             }
         }
 
-        // Block until the LP core flags something early (see lp_sensor_core_wait_for_wake())
-        // or the cycle_duration_sec backstop elapses. Whichever fires, loop back and re-read
-        // LP's state. This is a plain blocking wait -- ESP-IDF's automatic tickless-idle light
+        // Block until the LP core flags something (see lp_sensor_core_wait_for_wake()) or
+        // the safeguard timeout says its wake mechanism broke. With a staged OTA update
+        // pending, wait only one LP poll instead: waiting for LP's change detector cost up
+        // to a full skip budget of dead time per interrupted OTA session in the v4 hardware
+        // test, while one poll still bounds the retry loop if the OTA-only cycle keeps
+        // failing. This is a plain blocking wait -- ESP-IDF's automatic tickless-idle light
         // sleep (enableAutomaticLightSleep()) transparently sleeps the CPU underneath it
         // whenever no esp_pm lock (e.g. OpenThread's own radio-state lock) says otherwise.
-        lp_sensor_core_wait_for_wake(m_settings.cycleDurationSec * 1000);
+        const bool otaRetryWait = ota_update_due() && !ota_session_in_progress();
+        const uint32_t waitSec = otaRetryWait
+            ? m_settings.lpPollIntervalSec
+            : safeguardWakeSec(m_settings.lpPollIntervalSec, m_settings.maxSkipCycles);
+        if (lp_sensor_core_wait_for_wake(waitSec * 1000))
+            wakeReason = WakeReason::LpWake;
+        else
+            wakeReason = otaRetryWait ? WakeReason::OtaRetryTimeout : WakeReason::SafeguardTimeout;
     }
 }
 

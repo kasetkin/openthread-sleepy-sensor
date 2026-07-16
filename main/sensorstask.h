@@ -116,12 +116,16 @@ static_assert(SensorsValues::convertVoltageToPercent(3700, 3300, 3300) == 0);
 
 struct SensorsTaskSettings
 {
-    /// HP backstop interval. The LP core (components/lp_sensor_core) now owns the real
-    /// read/calibrate/threshold cadence (see calibration.txt's lp_poll_interval_sec) and
-    /// wakes HP early via ulp_lp_core_wakeup_main_processor() whenever it has something
-    /// worth publishing; this is just the ceiling on how stale published data can get if LP
-    /// never flags a change.
-    uint32_t cycleDurationSec = 60;
+    /// LP sensor-read cadence (calibration.txt's lp_poll_interval_sec). The LP core
+    /// (components/lp_sensor_core) owns the whole read/calibrate/threshold loop and wakes HP
+    /// via ulp_lp_core_wakeup_main_processor() whenever it has something worth publishing;
+    /// HP sets no publish cadence of its own — see SensorsTask::safeguardWakeSec() for the
+    /// only timeout it applies.
+    uint32_t lpPollIntervalSec = 60;
+    /// LP's skip budget (calibration.txt's max_skip_cycles): an unchanged value may be
+    /// skipped at most this many LP polls before LP flags it anyway, so a publish is
+    /// guaranteed at latest every (this + 1) × lpPollIntervalSec after the last ACKed one.
+    uint32_t maxSkipCycles = 0;
     /// should HP core read battery voltage via the ADC GPIO pin right before each publish
     bool readVoltageViaAdc = false;
     /// Measured voltage-divider resistors in Ohms (battery+ → ADC pin, and ADC pin → battery−).
@@ -141,14 +145,16 @@ public:
     // going shorter than the research's nominal threshold is fine given real brightness margin.
     static constexpr uint32_t LED_BLINK_MS       = 5;
 
-    /// Recovery: reboot after this many consecutive cycles without a successful publish. A transient
-    /// reachability loss (stale NAT64 prefix, broker blip) otherwise persists forever; rebooting
-    /// re-attaches and re-learns the NAT64 route. ~5 cycles ≈ 5 min of no data before recovering.
-    /// Public because main.cpp derives the HA sensors' expire_after from the same constant
-    /// ((this + 1) x cycle_duration_sec), so HA only marks the device unavailable once this
-    /// self-recovery, plus the post-reboot publish cycle, has failed too.
-    static constexpr uint32_t REBOOT_AFTER_FAILS = 5;
-
+    /// HP's wait-for-LP-wake timeout. LP guarantees a wake at latest every
+    /// (maxSkip + 1) polls (its skip budget forces a flag once exhausted), so still being
+    /// asleep two polls past that means the ULP wake was lost or the LP core stalled — this
+    /// is a safeguard against that mechanism failing, never a publish cadence. main.cpp
+    /// derives the HA sensors' expire_after as 2 × this, so entities only go unavailable
+    /// after a whole extra safeguard window has passed with nothing delivered either.
+    static constexpr uint32_t safeguardWakeSec(uint32_t pollSec, uint32_t maxSkip)
+    {
+        return (maxSkip + 3) * pollSec;
+    }
 
     SensorsTask(SensorsTaskSettings settings);
     SensorsTask(const SensorsTask &) = delete;
@@ -170,6 +176,13 @@ public:
     void configureRefreshNat64(RefreshNat64 refreshNat64);
 
 private:
+    /// Recovery: reboot after this many consecutive cycles without a successful publish. A transient
+    /// reachability loss (stale NAT64 prefix, broker blip) otherwise persists forever; rebooting
+    /// re-attaches and re-learns the NAT64 route. Also the recovery path for a stalled LP core —
+    /// safeguard-timeout wakes with no LP progress count as failed cycles here, and the reboot
+    /// reloads and restarts the LP binary (lp_sensor_core_init/start run in app_main()).
+    static constexpr uint32_t REBOOT_AFTER_FAILS = 5;
+
     /// per-cycle awake budget to (re)attach before sleeping anyway
     static constexpr uint32_t ATTACH_TIMEOUT_MS = 30 * 1000;
 
