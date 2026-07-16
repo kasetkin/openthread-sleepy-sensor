@@ -95,6 +95,16 @@ static uint32_t parse_as_uint32_or(std::string_view content, std::string_view ke
     return def;
 }
 
+// calibration.txt expresses the heater schedule in wall-clock minutes; the LP program counts
+// poll cycles (see lp_sensor_core_config_t). Ceiling division so any non-zero schedule is at
+// least one cycle; 0 passes through as the "disabled" sentinel.
+static uint32_t minutes_to_lp_cycles(uint32_t minutes, uint32_t poll_sec)
+{
+    if (minutes == 0)
+        return 0;
+    return (minutes * 60u + poll_sec - 1) / poll_sec;
+}
+
 static bool parse_as_bool_or(std::string_view content, std::string_view key, bool def)
 {
     if (const auto v = parse_as_bool(content, key))
@@ -345,18 +355,27 @@ extern "C" void app_main(void)
     // ── LP core sensor ownership ─────────────────────────────────────────────
     const lp_sensor_core_config_t lpConfig {
         .temp_offset_c = parse_as_float_or(calibration_txt(), "temp_offset", 0.0f),
-        .temp_min_change_c = parse_as_float_or(calibration_txt(), "temp_min_change", 0.0f),
+        .temp_min_change_c = parse_as_float_or(calibration_txt(), "temp_min_change", 0.2f),
         .rh_offset_pct = parse_as_float_or(calibration_txt(), "rh_offset", 0.0f),
-        .rh_min_change_pct = parse_as_float_or(calibration_txt(), "rh_min_change", 0.0f),
+        .rh_min_change_pct = parse_as_float_or(calibration_txt(), "rh_min_change", 2.0f),
         // parsed above, ahead of mqtt_sender_init() -- expire_after_sec derives from it
         .max_skip_cycles = max_skip_cycles,
+        .heater_period_cycles = minutes_to_lp_cycles(
+            parse_as_uint32_or(calibration_txt(), "heater_period_minutes", 1440),
+            lp_poll_interval_sec),
+        .high_rh_trigger_cycles = minutes_to_lp_cycles(
+            parse_as_uint32_or(calibration_txt(), "heater_high_rh_trigger_minutes", 60),
+            lp_poll_interval_sec),
     };
     ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, temp_offset=%.2f temp_min_change=%.2f "
-                  "rh_offset=%.2f rh_min_change=%.2f max_skip_cycles=%lu",
+                  "rh_offset=%.2f rh_min_change=%.2f max_skip_cycles=%lu "
+                  "heater_period=%lu cycles high_rh_trigger=%lu cycles",
              static_cast<unsigned long>(lp_poll_interval_sec),
              static_cast<double>(lpConfig.temp_offset_c), static_cast<double>(lpConfig.temp_min_change_c),
              static_cast<double>(lpConfig.rh_offset_pct), static_cast<double>(lpConfig.rh_min_change_pct),
-             static_cast<unsigned long>(lpConfig.max_skip_cycles));
+             static_cast<unsigned long>(lpConfig.max_skip_cycles),
+             static_cast<unsigned long>(lpConfig.heater_period_cycles),
+             static_cast<unsigned long>(lpConfig.high_rh_trigger_cycles));
 
     if (const esp_err_t lpInitErr = lp_sensor_core_init(&lpConfig); lpInitErr != ESP_OK) {
         ESP_LOGE(TAG, "lp_sensor_core_init failed: %d", lpInitErr);

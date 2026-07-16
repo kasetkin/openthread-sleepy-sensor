@@ -11,14 +11,19 @@ extern "C" {
 #endif
 
 // Calibration/threshold config, mirroring calibration.txt's rh_offset/rh_min_change/
-// temp_offset/temp_min_change/max_skip_cycles keys -- written once into LP shared memory
-// by lp_sensor_core_init(), before the LP program ever runs.
+// temp_offset/temp_min_change/max_skip_cycles/heater_* keys -- written once into LP shared
+// memory by lp_sensor_core_init(), before the LP program ever runs.
 typedef struct {
     float    temp_offset_c;
     float    temp_min_change_c;
     float    rh_offset_pct;
     float    rh_min_change_pct;
     uint32_t max_skip_cycles;
+    // Heater schedule in LP poll cycles, 0 = that mechanism disabled. calibration.txt
+    // expresses these in wall-clock minutes (heater_period_minutes /
+    // heater_high_rh_trigger_minutes); main.cpp converts using lp_poll_interval_sec.
+    uint32_t heater_period_cycles;
+    uint32_t high_rh_trigger_cycles;
 } lp_sensor_core_config_t;
 
 // Configures the LP_I2C peripheral (SHT4x is wired to GPIO6/GPIO7, the SoC-fixed LP_I2C

@@ -15,11 +15,12 @@
 // unreachable from LP) -- the shared struct's heater_active/last_heater_* fields are the
 // only trail, readable post-hoc (or, for heater_active, even mid-run -- see below).
 //
-// Bench-validated on hardware with kHeaterPeriodicCycles/kHighRhTriggerCycles temporarily
-// shrunk to 20/6 (both trigger paths fired, producing plausible delta-T rises matching
-// sht4x.c's documented per-pulse figures -- see the migration plan/memory for the capture).
-// Restored to their real values (1440/60, matching sensorstask.h's HEATER_PERIODIC_CYCLES/
-// HIGH_RH_TRIGGER_CYCLES) below now that the mechanism itself is proven.
+// Bench-validated on hardware with the schedule temporarily shrunk to 20/6 cycles (both
+// trigger paths fired, producing plausible delta-T rises matching sht4x.c's documented
+// per-pulse figures -- see the migration plan/memory for the capture). The schedule is
+// runtime config now (calibration.txt's heater_period_minutes /
+// heater_high_rh_trigger_minutes, 0 = off) -- rerun that kind of bench test by setting
+// small minute values there instead of editing constants.
 //
 // Phase 4 content: consume HP's delivery ack (see shared_layout.h's hp_ack_seq comment) so
 // prev_delivered_temp_c/hum_pct only advances once HP confirms a value actually reached the
@@ -59,12 +60,12 @@ constexpr uint32_t kHeaterHighLongDelayUs = 1100000;
 
 constexpr int32_t kI2cTimeoutCycles = 5000;        // matches the reference lp_i2c example
 
-// --- heater scheduling/tuning constants -- port of sensorstask.h's HEATER_*/HIGH_RH_*
-// constexprs. Cycle-count based (not time-based), matching the existing pattern -- see the
-// migration plan's note on keeping these as LP compile-time constants. See the TEMP
-// DIAGNOSTIC note above the file banner re: the two *_CYCLES values.
-constexpr uint32_t kHeaterPeriodicCycles = 1440;  // ~24h at a 60s poll cadence
-constexpr uint32_t kHighRhTriggerCycles = 60;      // ~1h at a 60s poll cadence
+// --- heater tuning constants. The heater SCHEDULE (periodic self-test interval, sustained
+// high-RH duration before creep mitigation) is runtime config now:
+// g_shared.heater_period_cycles / .high_rh_trigger_cycles, written once by
+// lp_sensor_core_init() from calibration.txt's heater_*_minutes keys (0 = that mechanism
+// disabled). Only the physics stays compile-time below: the RH threshold, pulse
+// modes/durations, and cooldown behavior.
 constexpr float kHighRhThreshold = 90.0f;         // %RH
 
 constexpr uint32_t kHeaterDurationMs = 20000;     // max pulse-loop window (cap; SHT4x usually stops after 1 pulse)
@@ -226,8 +227,10 @@ extern "C" int main()
         g_shared.cycles_since_heater++;
         const float precalHum = clampf(humPct + g_shared.rh_offset_pct, 0.0f, 100.0f);
         g_shared.high_rh_cycles = (precalHum > kHighRhThreshold) ? g_shared.high_rh_cycles + 1 : 0;
-        const bool periodicDue = g_shared.cycles_since_heater >= kHeaterPeriodicCycles;
-        const bool humidityDue = g_shared.high_rh_cycles >= kHighRhTriggerCycles;
+        const bool periodicDue = g_shared.heater_period_cycles > 0
+                              && g_shared.cycles_since_heater >= g_shared.heater_period_cycles;
+        const bool humidityDue = g_shared.high_rh_trigger_cycles > 0
+                              && g_shared.high_rh_cycles >= g_shared.high_rh_trigger_cycles;
 
         if (periodicDue || humidityDue) {
             const bool creep = humidityDue;

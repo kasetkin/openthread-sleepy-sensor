@@ -69,6 +69,8 @@ esp_err_t lp_sensor_core_init(const lp_sensor_core_config_t *config)
     shared->rh_offset_pct = config->rh_offset_pct;
     shared->rh_min_change_pct = config->rh_min_change_pct;
     shared->max_skip_cycles = config->max_skip_cycles;
+    shared->heater_period_cycles = config->heater_period_cycles;
+    shared->high_rh_trigger_cycles = config->high_rh_trigger_cycles;
 
     const esp_err_t wakeup_err = esp_sleep_enable_ulp_wakeup();
     if (wakeup_err != ESP_OK)
