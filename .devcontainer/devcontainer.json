@@ -3,7 +3,7 @@
   "image": "espressif/idf:v6.0.1",
   "runArgs": [
     // "--device=/dev/ttyACM0",
-    "--device=/dev/ttyUSB0",
+    // "--device=/dev/ttyUSB0",
     "--group-add=dialout"
   ],
   "remoteEnv": {
