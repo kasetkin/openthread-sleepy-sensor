@@ -11,7 +11,7 @@
 #include "main.h"
 #include "common_utils.h"
 #include "secrets.h"
-#include "calibration.h"
+#include "device_config.h"
 #include "sensorstask.h"
 #include "errortask.h"
 #include "mqtt_sender.h"
@@ -72,8 +72,8 @@ static std::string addOTMacSuffix(std::string_view usernamePrefix)
 }
 
 // parse_as_float()/parse_as_uint32() (secrets.h) return nullopt for a missing or malformed
-// calibration.txt key rather than silently defaulting to 0 -- these two wrappers apply an
-// explicit, loud fallback at the one place (main.cpp) that owns calibration.txt policy.
+// device_config.yaml key rather than silently defaulting to 0 -- these two wrappers apply an
+// explicit, loud fallback at the one place (main.cpp) that owns device_config.yaml policy.
 // Defaults are chosen to fail *safe*, not fail *silent-and-low-power*: e.g. lp_poll_interval_sec
 // defaulting to 0 would turn the LP timer into a busy-loop, and max_skip_cycles defaulting to 0
 // would (correctly, if noisily) publish every cycle rather than silently drop changed readings.
@@ -81,7 +81,7 @@ static float parse_as_float_or(std::string_view content, std::string_view key, f
 {
     if (const auto v = parse_as_float(content, key))
         return *v;
-    ESP_LOGW("main", "calibration.txt missing/invalid '%.*s', falling back to %.3f",
+    ESP_LOGW("main", "device_config.yaml missing/invalid '%.*s', falling back to %.3f",
              static_cast<int>(key.size()), key.data(), static_cast<double>(def));
     return def;
 }
@@ -90,12 +90,12 @@ static uint32_t parse_as_uint32_or(std::string_view content, std::string_view ke
 {
     if (const auto v = parse_as_uint32(content, key))
         return *v;
-    ESP_LOGW("main", "calibration.txt missing/invalid '%.*s', falling back to %lu",
+    ESP_LOGW("main", "device_config.yaml missing/invalid '%.*s', falling back to %lu",
              static_cast<int>(key.size()), key.data(), static_cast<unsigned long>(def));
     return def;
 }
 
-// calibration.txt expresses the heater schedule in wall-clock minutes; the LP program counts
+// device_config.yaml expresses the heater schedule in wall-clock minutes; the LP program counts
 // poll cycles (see lp_sensor_core_config_t). Ceiling division so any non-zero schedule is at
 // least one cycle; 0 passes through as the "disabled" sentinel.
 static uint32_t minutes_to_lp_cycles(uint32_t minutes, uint32_t poll_sec)
@@ -109,7 +109,7 @@ static bool parse_as_bool_or(std::string_view content, std::string_view key, boo
 {
     if (const auto v = parse_as_bool(content, key))
         return *v;
-    ESP_LOGW("main", "calibration.txt missing/invalid '%.*s', falling back to %s",
+    ESP_LOGW("main", "device_config.yaml missing/invalid '%.*s', falling back to %s",
              static_cast<int>(key.size()), key.data(), def ? "true" : "false");
     return def;
 }
@@ -277,9 +277,9 @@ extern "C" void app_main(void)
     // also use it, because MqttConfig's expire_after_sec is derived from the same two
     // values (see its doc comment). An lp_poll_interval_sec of 0 would arm the LP timer
     // with no delay (busy-loop) -- the non-zero fallback default guards that too.
-    const uint32_t lp_poll_interval_sec = parse_as_uint32_or(calibration_txt(), "lp_poll_interval_sec",
+    const uint32_t lp_poll_interval_sec = parse_as_uint32_or(device_config_yaml(), "lp_poll_interval_sec",
                                                              SensorsTaskSettings{}.lpPollIntervalSec);
-    const uint32_t max_skip_cycles = parse_as_uint32_or(calibration_txt(), "max_skip_cycles",
+    const uint32_t max_skip_cycles = parse_as_uint32_or(device_config_yaml(), "max_skip_cycles",
                                                         SensorsTaskSettings{}.maxSkipCycles);
     const uint32_t boot_count = incrementBootCount();
     std::string reset_reason = resetReasonString();
@@ -312,11 +312,11 @@ extern "C" void app_main(void)
     const SensorsTaskSettings sSettings {
         .lpPollIntervalSec = lp_poll_interval_sec,
         .maxSkipCycles = max_skip_cycles,
-        .readVoltageViaAdc = parse_as_bool_or(calibration_txt(), "read_battery_via_adc",
+        .readVoltageViaAdc = parse_as_bool_or(device_config_yaml(), "read_battery_via_adc",
                                                   SensorsTaskSettings{}.readVoltageViaAdc),
-        .batteryDividerRVbatOhm = parse_as_float_or(calibration_txt(), "battery_divider_r_vbat_ohm",
+        .batteryDividerRVbatOhm = parse_as_float_or(device_config_yaml(), "battery_divider_r_vbat_ohm",
                                                   static_cast<float>(SensorsTaskSettings{}.batteryDividerRVbatOhm)),
-        .batteryDividerRGndOhm = parse_as_float_or(calibration_txt(), "battery_divider_r_gnd_ohm",
+        .batteryDividerRGndOhm = parse_as_float_or(device_config_yaml(), "battery_divider_r_gnd_ohm",
                                                   static_cast<float>(SensorsTaskSettings{}.batteryDividerRGndOhm)),
     };
 
@@ -354,17 +354,17 @@ extern "C" void app_main(void)
 
     // ── LP core sensor ownership ─────────────────────────────────────────────
     const lp_sensor_core_config_t lpConfig {
-        .temp_offset_c = parse_as_float_or(calibration_txt(), "temp_offset", 0.0f),
-        .temp_min_change_c = parse_as_float_or(calibration_txt(), "temp_min_change", 0.2f),
-        .rh_offset_pct = parse_as_float_or(calibration_txt(), "rh_offset", 0.0f),
-        .rh_min_change_pct = parse_as_float_or(calibration_txt(), "rh_min_change", 2.0f),
+        .temp_offset_c = parse_as_float_or(device_config_yaml(), "temp_offset", 0.0f),
+        .temp_min_change_c = parse_as_float_or(device_config_yaml(), "temp_min_change", 0.2f),
+        .rh_offset_pct = parse_as_float_or(device_config_yaml(), "rh_offset", 0.0f),
+        .rh_min_change_pct = parse_as_float_or(device_config_yaml(), "rh_min_change", 2.0f),
         // parsed above, ahead of mqtt_sender_init() -- expire_after_sec derives from it
         .max_skip_cycles = max_skip_cycles,
         .heater_period_cycles = minutes_to_lp_cycles(
-            parse_as_uint32_or(calibration_txt(), "heater_period_minutes", 1440),
+            parse_as_uint32_or(device_config_yaml(), "heater_period_minutes", 1440),
             lp_poll_interval_sec),
         .high_rh_trigger_cycles = minutes_to_lp_cycles(
-            parse_as_uint32_or(calibration_txt(), "heater_high_rh_trigger_minutes", 60),
+            parse_as_uint32_or(device_config_yaml(), "heater_high_rh_trigger_minutes", 60),
             lp_poll_interval_sec),
     };
     ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, temp_offset=%.2f temp_min_change=%.2f "

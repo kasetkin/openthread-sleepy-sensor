@@ -128,7 +128,7 @@ static bool parse_sha256_hex(std::string_view hex, uint8_t out[32])
 }
 
 // Minimal flat-JSON field extraction, in the same spirit as the project's secrets.yaml /
-// calibration.txt hand parsers: the manifest's only producer is tools/ota_push.py, so both
+// device_config.yaml hand parsers: the manifest's only producer is tools/ota_push.py, so both
 // ends of the format live in this repo and a general JSON library would be dead weight.
 // (The payload still has to BE JSON on the wire — HA's update entity templates
 // {{ value_json.version }} out of the very same retained message.) Returns the value token

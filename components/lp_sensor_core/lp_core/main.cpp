@@ -18,7 +18,7 @@
 // Bench-validated on hardware with the schedule temporarily shrunk to 20/6 cycles (both
 // trigger paths fired, producing plausible delta-T rises matching sht4x.c's documented
 // per-pulse figures -- see the migration plan/memory for the capture). The schedule is
-// runtime config now (calibration.txt's heater_period_minutes /
+// runtime config now (device_config.yaml's heater_period_minutes /
 // heater_high_rh_trigger_minutes, 0 = off) -- rerun that kind of bench test by setting
 // small minute values there instead of editing constants.
 //
@@ -63,7 +63,7 @@ constexpr int32_t kI2cTimeoutCycles = 5000;        // matches the reference lp_i
 // --- heater tuning constants. The heater SCHEDULE (periodic self-test interval, sustained
 // high-RH duration before creep mitigation) is runtime config now:
 // g_shared.heater_period_cycles / .high_rh_trigger_cycles, written once by
-// lp_sensor_core_init() from calibration.txt's heater_*_minutes keys (0 = that mechanism
+// lp_sensor_core_init() from device_config.yaml's heater_*_minutes keys (0 = that mechanism
 // disabled). Only the physics stays compile-time below: the RH threshold, pulse
 // modes/durations, and cooldown behavior.
 constexpr float kHighRhThreshold = 90.0f;         // %RH

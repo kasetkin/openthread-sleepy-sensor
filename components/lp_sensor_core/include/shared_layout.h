@@ -23,7 +23,7 @@ typedef struct {
     float    rh_offset_pct;
     float    rh_min_change_pct;
     uint32_t max_skip_cycles;
-    // Heater schedule, pre-converted from calibration.txt's minutes to LP poll cycles by
+    // Heater schedule, pre-converted from device_config.yaml's minutes to LP poll cycles by
     // main.cpp (see minutes_to_lp_cycles there). 0 = that mechanism disabled.
     uint32_t heater_period_cycles;   // polls between periodic heater self-tests
     uint32_t high_rh_trigger_cycles; // consecutive >90%RH polls before creep mitigation

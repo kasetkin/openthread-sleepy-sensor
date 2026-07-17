@@ -116,20 +116,20 @@ static_assert(SensorsValues::convertVoltageToPercent(3700, 3300, 3300) == 0);
 
 struct SensorsTaskSettings
 {
-    /// LP sensor-read cadence (calibration.txt's lp_poll_interval_sec). The LP core
+    /// LP sensor-read cadence (device_config.yaml's lp_poll_interval_sec). The LP core
     /// (components/lp_sensor_core) owns the whole read/calibrate/threshold loop and wakes HP
     /// via ulp_lp_core_wakeup_main_processor() whenever it has something worth publishing;
     /// HP sets no publish cadence of its own — see SensorsTask::safeguardWakeSec() for the
     /// only timeout it applies.
     uint32_t lpPollIntervalSec = 20;
-    /// LP's skip budget (calibration.txt's max_skip_cycles): an unchanged value may be
+    /// LP's skip budget (device_config.yaml's max_skip_cycles): an unchanged value may be
     /// skipped at most this many LP polls before LP flags it anyway, so a publish is
     /// guaranteed at latest every (this + 1) × lpPollIntervalSec after the last ACKed one.
     uint32_t maxSkipCycles = 0;
     /// should HP core read battery voltage via the ADC GPIO pin right before each publish
     bool readVoltageViaAdc = false;
     /// Measured voltage-divider resistors in Ohms (battery+ → ADC pin, and ADC pin → battery−).
-    /// Defaults are the resistors soldered on this board; override via calibration.txt
+    /// Defaults are the resistors soldered on this board; override via device_config.yaml
     /// (battery_divider_r_vbat_ohm / battery_divider_r_gnd_ohm) after rewiring — e.g. for the
     /// planned high-impedance (2×200 kΩ) drain-reduction experiment.
     double batteryDividerRVbatOhm = 5021.0;

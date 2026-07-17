@@ -1,5 +1,8 @@
-# Per-device sensor calibration. Added to the raw sensor reading before publishing.
-# Same "key: \"value\"" syntax as secrets.yaml. Embedded at build time (rebuild to change).
+# Per-device configuration: sensor calibration, publish cadence, heater schedule, battery
+# ADC. Same "key: \"value\"" syntax as secrets.yaml. Embedded at build time (rebuild to
+# change). Unlike secrets.yaml this file holds no credentials, so it stays tracked in git.
+
+# Calibration offsets, added to the raw sensor reading before publishing.
 # Derive rh_offset by comparing this sensor against a trusted reference:
 #   rh_offset = reference_RH - measured_RH   (e.g. 47.8 - 67.9 = -20.1)
 # Leave at "0.0" for no correction.

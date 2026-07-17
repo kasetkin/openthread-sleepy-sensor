@@ -49,7 +49,7 @@ inline std::string yaml_get_string(std::string_view content, std::string_view ke
 
 // nullopt if `key` is missing from `content` or its value fails to parse -- distinguishable
 // from a legitimately-configured 0, so a renamed/typo'd/dropped key in a hand-edited
-// calibration.txt doesn't silently masquerade as an intentional zero (see call sites in
+// device_config.yaml doesn't silently masquerade as an intentional zero (see call sites in
 // main.cpp, which log a warning and substitute an explicit default on nullopt).
 inline std::optional<float> parse_as_float(std::string_view content, std::string_view key)
 {

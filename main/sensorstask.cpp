@@ -459,7 +459,7 @@ std::expected<int, esp_err_t> SensorsTask::readBatteryVoltageMilliV()
 
     // A first-sample-low / rising-across-burst pattern here means the SAR sampling cap is being
     // starved by the divider's source impedance -- the diagnostic to watch when trying larger
-    // (lower-drain) divider resistors; see calibration.txt's battery_divider_r_*_ohm keys.
+    // (lower-drain) divider resistors; see device_config.yaml's battery_divider_r_*_ohm keys.
     ESP_LOGD(TAG, "burst spread: min=%d max=%d first=%d last=%d mV",
              voltage_min, voltage_max, voltage_first, voltage);
 

@@ -5,6 +5,13 @@ The node is a Thread sleepy end device (MTD). Each cycle it wakes, reads the SHT
 connects to an MQTT broker to publish, then light-sleeps. The broker is reached over IPv4
 mapped through the Thread Border Router's NAT64 prefix.
 
+Configuration is split by sensitivity across two files embedded at build time: credentials
+and network settings go in `secrets.yaml` (gitignored; see
+[secrets.yaml.example](secrets.yaml.example)), while non-secret per-device tuning —
+calibration offsets, publish cadence, heater schedule, battery-ADC setup — goes in
+[device_config.yaml](device_config.yaml) (see
+[device_config.yaml.example](device_config.yaml.example) for the documented key reference).
+
 ## MQTT transport
 
 MQTT runs **plaintext (`mqtt://`) by default** on port `1883` (override with `mqtt_port` in
