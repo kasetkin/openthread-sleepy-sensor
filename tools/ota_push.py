@@ -16,8 +16,13 @@ Options:
     --clear     remove all retained OTA messages for the device instead of staging
 
 Broker address/port/credentials are read from secrets.yaml (same file the firmware embeds);
-the firmware version is read from the .bin's embedded esp_app_desc_t, so there is no manual
-version bookkeeping — every `git describe`-stamped build is distinguishable.
+the optional ota_push_broker_address / ota_push_broker_port / ota_push_tls keys override
+how THIS tool connects (each falls back to its mqtt_* counterpart when empty/absent) —
+needed when the firmware's broker path isn't routable from the dev machine, e.g. an
+IPv6-over-Thread address dialed on-LAN while the dev machine comes in through an
+internet-facing TLS reverse proxy. The firmware version is read from the .bin's embedded
+esp_app_desc_t, so there is no manual version bookkeeping — every `git describe`-stamped
+build is distinguishable.
 """
 
 import argparse
@@ -68,15 +73,21 @@ def connect(secrets: dict[str, str]) -> mqtt.Client:
     username = secrets.get("mqtt_username", "")
     if username:
         client.username_pw_set(username, secrets.get("mqtt_password", ""))
-    if secrets.get("mqtt_tls") == "true":
+    # This tool often can't reach the broker the way the firmware does — e.g. the firmware
+    # dials an IPv6-over-Thread ULA on the LAN while the dev machine comes in from the
+    # internet through a TLS reverse proxy on another port. The ota_push_* keys override
+    # address/port/TLS for this tool only (empty/absent = use the firmware's mqtt_* value);
+    # both paths end at the same broker.
+    use_tls = (secrets.get("ota_push_tls", "") or secrets.get("mqtt_tls", "false")) == "true"
+    if use_tls:
         # The firmware skips CN checks for its literal-IP broker (see README); do the same.
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         client.tls_set_context(ctx)
-    host = secrets.get("mqtt_broker_address", "")
-    port = int(secrets.get("mqtt_port", "1883"))
+    host = secrets.get("ota_push_broker_address", "") or secrets.get("mqtt_broker_address", "")
+    port = int(secrets.get("ota_push_broker_port", "") or secrets.get("mqtt_port", "1883"))
     if not host:
-        sys.exit("secrets.yaml has no mqtt_broker_address")
+        sys.exit("secrets.yaml has no mqtt_broker_address (nor ota_push_broker_address)")
     client.connect(host, port, keepalive=30)
     client.loop_start()
     return client

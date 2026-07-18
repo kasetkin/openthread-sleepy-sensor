@@ -2,8 +2,10 @@
 Firmware for ESP32-C6 based sensor with low power consumption.
 
 The node is a Thread sleepy end device (MTD). Each cycle it wakes, reads the SHT3x sensor,
-connects to an MQTT broker to publish, then light-sleeps. The broker is reached over IPv4
-mapped through the Thread Border Router's NAT64 prefix.
+connects to an MQTT broker to publish, then light-sleeps. The broker is reached directly
+over IPv6 when `mqtt_broker_address` is an IPv6 literal (use an address the Border Router
+can route — its own OMR-prefix address or the broker host's LAN ULA/GUA, never the
+mesh-local prefix), or over IPv4 mapped through the Border Router's NAT64 prefix.
 
 Configuration is split by sensitivity across two files embedded at build time: credentials
 and network settings go in `secrets.yaml` (gitignored; see
@@ -18,9 +20,10 @@ MQTT runs **plaintext (`mqtt://`) by default** on port `1883` (override with `mq
 `secrets.yaml`; see [secrets.yaml.example](secrets.yaml.example)). An optional
 **MQTT-over-TLS (`mqtts://`) mode** is available via `mqtt_tls: "true"` in `secrets.yaml`
 (reusing `mqtt_port` for the TLS listener — update it alongside `mqtt_tls` when switching
-modes). The broker is reached by a literal IP address either way — IPv4 mapped through the
-Thread Border Router's NAT64 prefix, or a direct IPv4/IPv6 address over Wi-Fi. The device
-authenticates with `mqtt_username` / `mqtt_password` in both modes.
+modes). The broker is reached by a literal IP address either way — over Thread, a direct
+IPv6 address (no NAT64) or an IPv4 address mapped through the Border Router's NAT64
+prefix; over Wi-Fi, a direct IPv4/IPv6 address. The device authenticates with
+`mqtt_username` / `mqtt_password` in both modes.
 
 ### Why plaintext is the default
 
@@ -44,7 +47,8 @@ cost on a sleepy device (see below).
   teardown, and a live connection can't survive light sleep (the TCP task is halted and the
   broker keepalive expires). This is why TLS stays **off by default** for the common LAN-only
   deployment, where it would only be re-protecting an already-encrypted Thread hop.
-- **The broker is reached by literal IP** (NAT64-mapped IPv4, or plain IPv6/IPv4 over Wi-Fi) —
+- **The broker is reached by literal IP** (direct IPv6 or NAT64-mapped IPv4 over Thread,
+  plain IPv6/IPv4 over Wi-Fi) —
   never a DNS hostname (see `MqttConfig::broker_address`'s doc comment in
   [mqtt_sender.h](main/mqtt_sender.h)). This means a certificate's CN/SAN can never be
   validated against the connect address, on either transport. When TLS is enabled, this
