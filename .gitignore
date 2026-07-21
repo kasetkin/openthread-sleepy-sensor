@@ -4,3 +4,4 @@ build/
 secrets.yaml
 /managed_components/
 /logs/
+/tools/__pycache__/
