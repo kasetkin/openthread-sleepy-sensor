@@ -135,15 +135,20 @@ static uint32_t incrementBootCount()
 
 // Maps esp_reset_reason() to the short string published as HA's "Reset reason" diagnostic.
 // Every literal must fit MQTT_MAX_RESET_REASON_LEN (mqtt_sender.h) — the state-JSON buffer
-// is sized against it. The RTC marker is consumed unconditionally (it must be cleared even
-// on a non-SW reset) and refines ESP_RST_SW: an OTA reboot and the publish-failure
-// supervisor's reboot are both "software reset" to IDF, but only the latter is a failure.
+// is sized against it. Both RTC markers are consumed unconditionally (they must be cleared
+// even on a non-SW reset) and refine ESP_RST_SW: a successful OTA reboot, the LP-core-stall
+// supervisor's reboot, and the bad-OTA safety net's reboot are all "software reset" to IDF,
+// but only the latter two are failure signals worth telling apart.
 static const char *resetReasonString()
 {
-    const bool publishFailReboot = consumePublishFailRebootMarker();
+    const bool lpStallReboot = consumeLpStallRebootMarker();
+    const bool otaUnconfirmedReboot = consumeOtaUnconfirmedRebootMarker();
     switch (esp_reset_reason()) {
     case ESP_RST_POWERON:   return "power_on";
-    case ESP_RST_SW:        return publishFailReboot ? "publish_fail_reboot" : "sw_reset";
+    case ESP_RST_SW:
+        if (lpStallReboot)       return "lp_stall_reboot";
+        if (otaUnconfirmedReboot) return "ota_unconfirmed";
+        return "sw_reset";
     case ESP_RST_PANIC:     return "panic";
     case ESP_RST_BROWNOUT:  return "brownout";
     case ESP_RST_INT_WDT:   return "int_wdt";

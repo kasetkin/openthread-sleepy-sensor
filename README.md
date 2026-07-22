@@ -105,15 +105,96 @@ Workflow:
    while an update is pending every backstop wake runs an OTA-attempt cycle even when the
    sensors have nothing new to publish.
 4. **Confirm or roll back**: the new image boots as `PENDING_VERIFY`
-   (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). Its first broker-ACKed publish marks it valid;
-   if that never happens, the existing failed-cycles reboot supervisor restarts the device
-   and the bootloader falls back to the previous slot automatically.
+   (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). Its first broker-ACKed publish marks it valid; if
+   that never happens within `UNCONFIRMED_OTA_REBOOT_AFTER_CYCLES` consecutive unhealthy cycles
+   (see [sensorstask.h](main/sensorstask.h)), a safety-net reboot restarts the device and the
+   bootloader falls back to the previous slot automatically.
 
 Topics live under `<device_id>/ota/*` — see [ota_updater.h](main/ota_updater.h) for the
 contract. The flash layout is two 1984 K app slots (`ota_0`/`ota_1` + `otadata`,
 [partitions.csv](partitions.csv)); migrating a device from the old single-`factory` layout
 requires one final USB flash. `tools/ota_push.py --clear` removes the retained image from the
 broker once every device is updated (harmless to leave; it is ~1.8 MB of broker storage).
+
+## Recovery: when the device reboots, and what survives a blackout
+
+The MQTT broker/Home Assistant is wall-powered; this device isn't, so a grid blackout takes the
+broker down while the sensor keeps running on battery. The device only ever reboots (a full
+Thread/Wi-Fi re-attach) for a confirmed **LP-core stall** — a full safeguard window with zero LP
+heartbeat progress, the one failure that's actually a local firmware wedge a restart can fix.
+Link-down and broker-unreachable cycles retry forever at the normal cadence instead: rebooting
+can't join a network that isn't there, and can't restart a remote broker process either, so
+treating either as reboot-worthy was pure cost (a full re-attach) for no benefit — see
+`SensorsTask::LP_STALL_REBOOT_THRESHOLD`'s doc comment ([sensorstask.h](main/sensorstask.h)) for
+the full reasoning. The separate, narrower `UNCONFIRMED_OTA_REBOOT_AFTER_CYCLES` safety net
+mentioned above still reboots a **freshly-flashed, never-yet-confirmed** image after enough
+consecutive unhealthy cycles of any kind, so a genuinely broken update still rolls back via the
+bootloader — it just no longer fires for an already-trusted image sitting through an ordinary
+outage.
+
+### Blackout data buffering & backfill
+
+Readings that fail to publish live (broker unreachable) are kept in a RAM-only ring buffer
+([history_log.h](main/history_log.h), ~96 KB / 8192 entries — days-to-weeks of coverage at
+typical publish cadence) instead of being silently overwritten by LP's next poll. It's
+deliberately not flash-backed: since a blackout no longer triggers a reboot (above), the buffer
+survives essentially the entire outage in RAM, with no new flash partition and no one-time USB
+reflash needed — this ships over the normal OTA path like everything else.
+
+Once the broker's reachable again, the backlog replays over the same connection as small
+batches on a plain (non-retained) topic:
+
+```
+<device_id>/backfill  ->  [{"ago":<seconds before this message>,"t":<°C>,"h":<%RH>}, ...]
+```
+
+The device has no wall clock (deliberately — see `history_log.h`'s doc comment: avoiding an
+internet/DNS dependency during the exact window that's suspect during a blackout). `"ago"` is
+relative; Home Assistant computes each point's real historical timestamp as
+`(message arrival time − ago)` using its own clock, which is correct again by the time this runs.
+
+HA's built-in entity History graph only ever shows a state at the time it actually arrived —
+there's no supported way to hand it a backdated raw state. Getting backfilled points to show up
+at their *true* time instead needs HA's long-term-statistics import, via a small one-time
+automation (fires automatically on every future replay, not a manual per-outage step):
+
+```yaml
+automation:
+  - alias: "Sensor backfill import"
+    trigger:
+      - platform: mqtt
+        topic: "<device_id>/backfill"   # substitute the real device_id
+    action:
+      - variables:
+          entries: "{{ trigger.payload_json }}"
+          now_ts: "{{ as_timestamp(now()) }}"
+      - repeat:
+          for_each: "{{ entries }}"
+          sequence:
+            - variables:
+                # floor to the 5-minute bucket boundary recorder.import_statistics expects
+                bucket_ts: "{{ (now_ts - repeat.item.ago | int) | int
+                               - ((now_ts - repeat.item.ago | int) | int % 300) }}"
+            - action: recorder.import_statistics
+              data:
+                statistic_id: "sensor.REPLACE_WITH_REAL_ENTITY_ID_temperature"
+                source: recorder
+                unit_of_measurement: "°C"
+                has_mean: true
+                has_sum: false
+                stats:
+                  - start: "{{ as_datetime(bucket_ts) }}"
+                    mean: "{{ repeat.item.t }}"
+            # repeat the same action block against the humidity entity_id / "%" / repeat.item.h
+```
+
+Check this against **Developer Tools → Actions** on your own HA version before trusting it —
+`recorder.import_statistics`'s exact schema has shifted across HA releases, the real
+`statistic_id` depends on how HA slugified this device's discovery-config entity names, and
+this hasn't been validated against a live instance. It also assumes HA's MQTT integration keeps
+its usual persistent broker session (the default), so the few-second gap between "broker's back"
+and "HA's automation is ready" doesn't drop a non-retained backfill batch — true for the common
+co-located Mosquitto add-on setup this project already targets (see "MQTT transport" above).
 
 ## CPU frequency / power
 

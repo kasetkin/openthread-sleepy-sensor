@@ -5,6 +5,7 @@
 #include <atomic>
 #include <format>
 #include <memory>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -17,6 +18,7 @@
 #include "mqtt_client.h"
 
 #include "ota_updater.h"
+#include "history_log.h"
 
 static const char *TAG = "mqtt-sender";
 
@@ -176,6 +178,24 @@ static constexpr std::string_view STATE_BATT_SUFFIX_FMT = ",\"b\":{},\"v\":{:.3f
 static constexpr std::string_view STATE_RSSI_SUFFIX_FMT = ",\"r\":{}}}";
 static constexpr std::string_view STATE_DIAG_SUFFIX_FMT = ",\"bc\":{},\"rr\":\"{}\"}}";
 
+// history_log.h backlog replay -- not part of HA discovery/state, a plain device -> broker
+// event stream an HA-side automation consumes (see README's "Blackout data buffering &
+// backfill" section). "ago" is seconds before this publish that the reading was captured; HA
+// computes the real historical timestamp itself (arrival time - ago), since the device never
+// has a wall clock (see history_log.h's doc comment for why).
+static constexpr std::string_view BACKFILL_TOPIC_FMT = "{}/backfill";
+static constexpr std::string_view BACKFILL_ARRAY_OPEN  = "[";
+static constexpr std::string_view BACKFILL_ENTRY_FIRST_FMT = "{{\"ago\":{},\"t\":{:.3g},\"h\":{:.3g}}}";
+static constexpr std::string_view BACKFILL_ENTRY_REST_FMT  = ",{{\"ago\":{},\"t\":{:.3g},\"h\":{:.3g}}}";
+static constexpr std::string_view BACKFILL_ARRAY_CLOSE = "]";
+// Entries per MQTT message and messages per publish cycle -- bounds a long backlog to drain
+// across several successful cycles instead of costing one cycle unbounded awake time; both
+// tunable like the OTA chunk size above them in spirit. 20 entries keeps BACKFILL_PAYLOAD_BUF
+// (below) comfortably under start_client()'s 2048 B out_size; 5 batches/cycle is generous
+// progress (100 entries) without risking PUBLISH_TIMEOUT_MS (sensorstask.cpp) on a slow link.
+static constexpr size_t BACKFILL_BATCH_SIZE = 20;
+static constexpr int    BACKFILL_MAX_BATCHES_PER_CYCLE = 5;
+
 // ── fixed-capacity string building — no heap allocation ────────────────────────
 // Every buffer size below is derived, not hand-picked, using one lemma: for a std::format string
 // built only from literal text, "{}" placeholders, and "{{"/"}}" escapes, the format string's own
@@ -234,8 +254,9 @@ static constexpr size_t MAX_DISCOVERY_TOPIC_LEN =
 static constexpr size_t MAX_UPDATE_DISCOVERY_TOPIC_LEN =
     UPDATE_DISCOVERY_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 static constexpr size_t MAX_STATE_TOPIC_LEN = STATE_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
+static constexpr size_t MAX_BACKFILL_TOPIC_LEN = BACKFILL_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 static constexpr size_t TOPIC_BUF = std::max({MAX_DISCOVERY_TOPIC_LEN, MAX_UPDATE_DISCOVERY_TOPIC_LEN,
-                                              MAX_STATE_TOPIC_LEN}) + 1;  // +1 NUL
+                                              MAX_STATE_TOPIC_LEN, MAX_BACKFILL_TOPIC_LEN}) + 1;  // +1 NUL
 
 // The lemma applies per part (each part is itself a format string of literals, {} and {{/}}
 // escapes), so the bound for the assembled payload is the sum of every part's size — as if
@@ -277,6 +298,15 @@ static constexpr size_t STATE_BUF = std::max({
    + STATE_RSSI_SUFFIX_FMT.size() + MAX_RSSI_LEN
    + STATE_DIAG_SUFFIX_FMT.size() + MAX_BOOT_COUNT_LEN + MQTT_MAX_RESET_REASON_LEN
    + 1;  // +1 NUL
+
+// Same lemma, applied to one backfill array: BACKFILL_ENTRY_REST_FMT (the wider of the two --
+// leading comma) as every element's bound, ago_sec sized like MAX_EXPIRE_LEN (both a uint32_t
+// seconds count, <=10 digits), times BACKFILL_BATCH_SIZE, plus the array brackets.
+static constexpr size_t MAX_BACKFILL_ENTRY_LEN = BACKFILL_ENTRY_REST_FMT.size()
+    + MAX_EXPIRE_LEN + 2 * MAX_FORMATTED_FLOAT_LEN;
+static constexpr size_t BACKFILL_PAYLOAD_BUF = BACKFILL_ARRAY_OPEN.size()
+    + BACKFILL_BATCH_SIZE * MAX_BACKFILL_ENTRY_LEN + BACKFILL_ARRAY_CLOSE.size()
+    + 1;  // +1 NUL
 
 // Formats into a fixed-capacity std::array via std::format_to_n (no heap allocation) and
 // NUL-terminates the result. Returns the formatted length, or 0 (logged) if `buf` was too small
@@ -494,6 +524,62 @@ static void publish_update_discovery(esp_mqtt_client_handle_t client, std::strin
                             static_cast<int>(payloadLen), 1, 1);
     // len 0 => esp-mqtt uses strlen(); retained so HA has installed_version across restarts.
     esp_mqtt_client_publish(client, ota_topic_installed(), sw_version, 0, 1, 1);
+}
+
+// Streams history_log.h's backlog (readings that failed to publish live during an outage) over
+// the SAME still-open connection, once this cycle's own state publish is confirmed delivered
+// (or there was nothing to publish -- see the caller's gating). Mirrors run_ota_if_due()
+// below's "stay connected, keep working while the radio's already up" shape, but stays simple:
+// unlike OTA there's no reconnect-and-resume here -- a batch that doesn't ACK just stops for
+// this cycle (the log entries are untouched, since history_log_advance() only runs after a
+// confirmed ACK) and picks up again next successful cycle, same as any other still-pending
+// backlog. Bounded to BACKFILL_MAX_BATCHES_PER_CYCLE so a long backlog can't cost one cycle
+// unbounded awake time.
+static void replay_history_if_pending(esp_mqtt_client_handle_t client, std::string_view device_id,
+                                      MqttCtx &ctx, EventGroupHandle_t eg)
+{
+    std::array<char, TOPIC_BUF> topicBuf;
+    const size_t topicLen = format_into(topicBuf, BACKFILL_TOPIC_FMT, device_id);
+    if (topicLen == 0)
+        return;  // format_into() already logged the truncation
+
+    for (int batchNum = 0; batchNum < BACKFILL_MAX_BATCHES_PER_CYCLE && history_log_has_pending(); ++batchNum) {
+        std::array<HistoryLogEntry, BACKFILL_BATCH_SIZE> batch;
+        const std::span<const HistoryLogEntry> replayed = history_log_peek_batch(batch);
+        if (replayed.empty())
+            break;
+
+        std::array<char, BACKFILL_PAYLOAD_BUF> payloadBuf;
+        size_t len = format_into(payloadBuf, BACKFILL_ARRAY_OPEN);
+        for (size_t i = 0; i < replayed.size() && len > 0; ++i) {
+            const HistoryLogEntry &e = replayed[i];
+            len = (i == 0)
+                ? format_append(payloadBuf, len, BACKFILL_ENTRY_FIRST_FMT, e.ago_sec, e.temp_c, e.hum_pct)
+                : format_append(payloadBuf, len, BACKFILL_ENTRY_REST_FMT, e.ago_sec, e.temp_c, e.hum_pct);
+        }
+        if (len > 0)
+            len = format_append(payloadBuf, len, BACKFILL_ARRAY_CLOSE);
+        if (len == 0)
+            break;  // format_into()/format_append() already logged the truncation
+
+        // Fresh ACK wait, same pattern as the state message earlier in this cycle -- one
+        // message, one expected ACK.
+        ctx.expected_acks.store(1);
+        ctx.received_acks.store(0);
+        xEventGroupClearBits(eg, BIT_ALL_ACKED);
+        esp_mqtt_client_publish(client, topicBuf.data(), payloadBuf.data(),
+                                static_cast<int>(len), 1, 0);
+
+        const bool acked = (xEventGroupWaitBits(eg, BIT_ALL_ACKED, pdFALSE, pdTRUE,
+                                                pdMS_TO_TICKS(4000)) & BIT_ALL_ACKED) != 0;
+        if (!acked) {
+            ESP_LOGW(TAG, "backfill batch (%zu entries) not ACKed — resuming next cycle",
+                     replayed.size());
+            break;
+        }
+        history_log_advance(replayed.size());
+        ESP_LOGI(TAG, "replayed %zu backlog entries", replayed.size());
+    }
 }
 
 // Runs the OTA session when one is due, then — the v5 stability core — reconnects and
@@ -730,6 +816,14 @@ static bool run_publish_cycle(const PublishParams &params)
             // value-less cycles every backstop wake so the OTA check below runs promptly.
             ESP_LOGI(TAG, "no sensor values this cycle%s", ota_update_due() ? " (OTA-only cycle)" : "");
         }
+
+        // Same bar as the OTA check below: a data-carrying cycle needs connected AND state
+        // ACKed, an OTA-only cycle just needs CONNECTED. Runs before OTA -- replay is quick
+        // (a handful of small batches) and shouldn't wait behind a multi-minute OTA session,
+        // and running it first means the backlog reaches HA promptly even if that OTA session
+        // then reboots the device.
+        if (ok || !hasAny)
+            replay_history_if_pending(client.get(), dev, ctx, eg.get());
 
         // A staged update only starts from a healthy cycle: for a data-carrying cycle that
         // means connected AND state ACKed (a flaky link fails fast above instead of kicking

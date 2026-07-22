@@ -25,15 +25,25 @@ esp_err_t enableAutomaticLightSleep();
 [[nodiscard("NVS unavailable if init failure ignored")]]
 esp_err_t initNvsFlash();
 
-/// Reset-reason refinement pair. IDF reports both an OTA reboot and the publish-failure
+/// Reset-reason refinement pair. IDF reports both an OTA reboot and the LP-core-stall
 /// supervisor's reboot (sensorstask.cpp) as plain ESP_RST_SW; only the latter is a failure
-/// signal worth surfacing in HA. The supervisor calls markPublishFailReboot() right before
-/// its esp_restart(), leaving a magic word in RTC (LP) RAM — which survives a software
-/// reset — and main.cpp's boot-time reset-reason mapping calls
-/// consumePublishFailRebootMarker() (read-and-clear, so the refinement applies to exactly
-/// one boot) to tell the two apart. Same hint technique esp_reset_reason() itself uses.
-void markPublishFailReboot();
-bool consumePublishFailRebootMarker();
+/// signal worth surfacing in HA (the supervisor reboots ONLY on a confirmed LP-core heartbeat
+/// stall -- link-down and broker-unreachable cycles never reach it, see sensorstask.cpp). The
+/// supervisor calls markLpStallReboot() right before its esp_restart(), leaving a magic word
+/// in RTC (LP) RAM -- which survives a software reset -- and main.cpp's boot-time
+/// reset-reason mapping calls consumeLpStallRebootMarker() (read-and-clear, so the refinement
+/// applies to exactly one boot) to tell the two apart. Same hint technique esp_reset_reason()
+/// itself uses.
+void markLpStallReboot();
+bool consumeLpStallRebootMarker();
+
+/// Same technique, different cause: sensorstask.cpp's bad-OTA safety net reboots when the
+/// running image is still unconfirmed (PENDING_VERIFY) after enough consecutive unhealthy
+/// cycles -- a freshly-flashed image that can never confirm itself has no other way back, and
+/// this reboot doubles as the rollback trigger. Mutually exclusive with the LP-stall marker
+/// above at any single reboot (only one path's esp_restart() call ever actually runs).
+void markOtaUnconfirmedReboot();
+bool consumeOtaUnconfirmedRebootMarker();
 
 /// for loggertask code migration, because it was written for Arduino
 unsigned long millisFromStart();

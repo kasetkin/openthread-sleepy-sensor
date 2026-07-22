@@ -3,6 +3,7 @@ set(srcs
   common_utils.cpp
   errortask.cpp
   sensorstask.cpp
+  history_log.cpp
   mqtt_sender.cpp
   ota_updater.cpp
   net/network_link.cpp

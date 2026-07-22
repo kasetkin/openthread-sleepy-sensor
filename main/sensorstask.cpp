@@ -13,11 +13,13 @@
 #include "mqtt_sender.h"
 #include "ota_updater.h"
 #include "lp_sensor_core.h"
+#include "history_log.h"
 
 // First broker-ACKed publish after an OTA reboot proves the new image out and cancels the
 // bootloader's pending rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE). If this never runs,
-// the REBOOT_AFTER_FAILS supervisor below restarts a still-PENDING_VERIFY image and the
-// bootloader falls back to the previous slot — the supervisor doubles as the rollback watchdog.
+// the UNCONFIRMED_OTA_REBOOT_AFTER_CYCLES safety net below restarts a still-PENDING_VERIFY
+// image and the bootloader falls back to the previous slot — that supervisor doubles as the
+// rollback watchdog.
 static void markAppValidOnFirstConfirmedPublish()
 {
     static bool s_checked = false;
@@ -85,6 +87,13 @@ void SensorsTask::executeTask()
         // A wake that legitimately had nothing to publish -- attached and quiet counts as a
         // healthy cycle below; anything else without a confirmed publish counts as a failure.
         bool quietCycle = false;
+        // Set only in the confirmed-LP-stall branch below -- the sole trigger for a reboot
+        // (see LP_STALL_REBOOT_THRESHOLD). lpProgressedThisCycle is the disproof: any real LP
+        // heartbeat advance this cycle, whether or not attached/publish succeeded. Both stay
+        // false on a !attached cycle -- not being attached says nothing about LP's health, so
+        // the stall counter is simply left alone until we're attached again to actually check.
+        bool lpStalledThisCycle = false;
+        bool lpProgressedThisCycle = false;
         // Don't read/publish until attached as CHILD. A plain blocking wait -- under automatic
         // light sleep this is safe to block through: OpenThread's own PM lock
         // (esp_openthread_sleep.c) keeps the CPU awake whenever the radio is actively
@@ -110,6 +119,7 @@ void SensorsTask::executeTask()
                      static_cast<unsigned long>(heartbeatDelta),
                      state.sensor_ok != 0, state.should_wake_hp != 0);
             m_lastSeenHeartbeat = state.heartbeat_counter;
+            lpProgressedThisCycle = heartbeatDelta > 0;
 
             // Post-hoc heater diagnostic -- there's no live LED indicator any more (heater
             // maintenance runs entirely on LP; see the migration plan's accepted behavior
@@ -149,6 +159,7 @@ void SensorsTask::executeTask()
                 // and restarts the LP binary -- the only recovery path for a dead LP core.
                 ESP_LOGE(TAG, "no LP progress across a full safeguard window (heartbeat stuck at %lu) — LP core stalled?",
                          static_cast<unsigned long>(state.heartbeat_counter));
+                lpStalledThisCycle = true;
             } else if (shouldWake || ota_update_due()) {
                 if (shouldWake && wakeReason == WakeReason::SafeguardTimeout)
                     ESP_LOGW(TAG, "LP flagged data but its wake never arrived — recovered by the safeguard timeout");
@@ -218,6 +229,14 @@ void SensorsTask::executeTask()
                             if (!otaOnly)
                                 lp_sensor_core_ack_delivered(state.cal_temp_c, state.cal_hum_pct);
                             markAppValidOnFirstConfirmedPublish();
+                        } else if (!otaOnly) {
+                            // Broker unreachable (or its ACK never arrived) for a cycle that had
+                            // a real reading -- preserve it for replay once the broker's back
+                            // (see history_log.h). LP's baseline stays unacked regardless (its
+                            // ack call is skipped above), so the CURRENT value also keeps being
+                            // retried live every cycle -- this only protects what would
+                            // otherwise be silently overwritten by LP's next poll meanwhile.
+                            history_log_append(state.cal_temp_c, state.cal_hum_pct);
                         }
                     } else if (ota_session_in_progress()) {
                         // An OTA download legitimately owns the publish task for minutes;
@@ -247,12 +266,12 @@ void SensorsTask::executeTask()
         }
 
         // "Delivered, or legitimately nothing to deliver" both count as a healthy cycle --
-        // mirrors the original HP-only code's (publishedOk || skipSameValuesCycle)
-        // reboot-supervisor gate. Not attaching at all is never healthy, even if LP had
-        // nothing to say; neither is an LP stall (quietCycle stays false there). An
-        // in-flight OTA download also counts as healthy: it blocks the publish path for
-        // minutes by design, and letting REBOOT_AFTER_FAILS fire mid-download would reboot
-        // (and with rollback enabled, roll back) a perfectly good update in progress.
+        // mirrors the original HP-only code's (publishedOk || skipSameValuesCycle) gate. Not
+        // attaching at all is never healthy, even if LP had nothing to say; neither is an LP
+        // stall (quietCycle stays false there). An in-flight OTA download also counts as
+        // healthy: it blocks the publish path for minutes by design, and letting the bad-OTA
+        // safety net below fire mid-download would reboot (and with rollback enabled, roll
+        // back) a perfectly good update in progress.
         const bool cycleOk = publishedOk || (attached && quietCycle) || ota_session_in_progress();
 
         // Honest local indicator: 1 blink = data reached the broker, 5 = should have
@@ -266,23 +285,44 @@ void SensorsTask::executeTask()
             blinkUserLED(LED_BLINK_MS, 5);
         }
 
-        // Recovery supervisor: count consecutive failed cycles and reboot once they pass the
-        // threshold. There is no other path back from a persistent reachability loss — a reboot
-        // re-attaches to Thread and re-learns the NAT64 route — and none from a stalled LP core
-        // either: the reboot reloads and restarts the LP binary. Before that, give a softer
-        // nudge: re-read network data so a merely-stale NAT64 prefix is fixed without a reboot.
-        if (cycleOk) {
-            m_consecutiveFailures = 0;
-        } else {
-            if (m_refreshNat64)
-                m_refreshNat64();
+        // Recovery supervisor: reboot ONLY on a confirmed LP-core stall (lpStalledThisCycle) --
+        // link-down and broker-unreachable cycles retry forever at the existing cadence instead
+        // (see LP_STALL_REBOOT_THRESHOLD's doc comment for why: neither has a local fix a
+        // reboot can provide, and the retry loop already notices recovery on its own). The one
+        // local fault broker-unreachable CAN have -- a stale NAT64 prefix -- still gets a
+        // softer nudge here, without ever counting toward a reboot.
+        if (attached && !cycleOk && m_refreshNat64)
+            m_refreshNat64();
 
-            if (++m_consecutiveFailures >= REBOOT_AFTER_FAILS) {
-                ESP_LOGE(TAG, "%lu consecutive cycles without a successful publish — rebooting to recover",
-                         static_cast<unsigned long>(m_consecutiveFailures));
-                markPublishFailReboot();  // next boot reports "publish_fail_reboot", not "sw_reset"
+        if (lpStalledThisCycle) {
+            if (++m_lpStalledCycles >= LP_STALL_REBOOT_THRESHOLD) {
+                ESP_LOGE(TAG, "%lu consecutive LP-core-stall wakes — rebooting to recover",
+                         static_cast<unsigned long>(m_lpStalledCycles));
+                markLpStallReboot();  // next boot reports "lp_stall_reboot", not "sw_reset"
                 esp_restart();
             }
+        } else if (lpProgressedThisCycle) {
+            m_lpStalledCycles = 0;
+        }
+
+        // Bad-OTA safety net (see UNCONFIRMED_OTA_REBOOT_AFTER_CYCLES): unlike the LP-stall
+        // trigger above, this fires on ANY unhealthy cycle -- but only while the running image
+        // has never confirmed itself, so it can't reintroduce a reboot storm for an
+        // already-trusted image sitting through an ordinary blackout.
+        esp_ota_img_states_t otaState;
+        const bool stillUnconfirmed =
+            esp_ota_get_state_partition(esp_ota_get_running_partition(), &otaState) == ESP_OK &&
+            otaState == ESP_OTA_IMG_PENDING_VERIFY;
+        if (stillUnconfirmed && !cycleOk) {
+            if (++m_cyclesUnconfirmedAndFailing >= UNCONFIRMED_OTA_REBOOT_AFTER_CYCLES) {
+                ESP_LOGE(TAG, "%lu consecutive unhealthy cycles with the image still unconfirmed "
+                         "— rebooting so the bootloader can roll back",
+                         static_cast<unsigned long>(m_cyclesUnconfirmedAndFailing));
+                markOtaUnconfirmedReboot();  // next boot reports "ota_unconfirmed", not "sw_reset"
+                esp_restart();
+            }
+        } else {
+            m_cyclesUnconfirmedAndFailing = 0;
         }
 
         // Block until the LP core flags something (see lp_sensor_core_wait_for_wake()) or

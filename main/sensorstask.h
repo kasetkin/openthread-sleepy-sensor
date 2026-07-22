@@ -176,12 +176,28 @@ public:
     void configureRefreshNat64(RefreshNat64 refreshNat64);
 
 private:
-    /// Recovery: reboot after this many consecutive cycles without a successful publish. A transient
-    /// reachability loss (stale NAT64 prefix, broker blip) otherwise persists forever; rebooting
-    /// re-attaches and re-learns the NAT64 route. Also the recovery path for a stalled LP core —
-    /// safeguard-timeout wakes with no LP progress count as failed cycles here, and the reboot
-    /// reloads and restarts the LP binary (lp_sensor_core_init/start run in app_main()).
-    static constexpr uint32_t REBOOT_AFTER_FAILS = 5;
+    /// Recovery: reboot after this many CONSECUTIVE confirmed LP-core-stall wakes (a full
+    /// safeguard window with zero LP heartbeat progress -- see executeTask()). This is the
+    /// ONLY thing that can trigger esp_restart() -- link-down and broker-unreachable cycles
+    /// never reach this counter: neither has a local fix a reboot can provide (no network to
+    /// join; or a remote process being down, which rebooting THIS chip can't touch), and the
+    /// existing per-cycle retry already notices recovery on its own regardless of any reboot.
+    /// The LP core is the one genuine local firmware wedge a restart addresses -- it reloads
+    /// and restarts the LP binary (lp_sensor_core_init/start run in app_main()).
+    static constexpr uint32_t LP_STALL_REBOOT_THRESHOLD = 2;
+
+    /// Bad-OTA safety net: reboot after this many CONSECUTIVE unhealthy cycles (!cycleOk --
+    /// not attached, broker unreachable, or an LP stall) while the running image is still
+    /// unconfirmed (ESP_OTA_IMG_PENDING_VERIFY -- see markAppValidOnFirstConfirmedPublish(),
+    /// sensorstask.cpp). Unlike LP_STALL_REBOOT_THRESHOLD above, this fires on ANY of those
+    /// causes: a freshly-flashed image that can never confirm itself has no other way back,
+    /// and this reboot doubles as the rollback trigger (the bootloader falls back to the
+    /// previous slot automatically, since esp_ota_mark_app_valid_cancel_rollback() was never
+    /// called). Once an image confirms itself (any successful publish) this becomes
+    /// permanently irrelevant for the rest of that boot. Same value as the pre-redesign
+    /// REBOOT_AFTER_FAILS, since this inherits exactly the safety-net role that constant used
+    /// to serve for every image, not just an unconfirmed one.
+    static constexpr uint32_t UNCONFIRMED_OTA_REBOOT_AFTER_CYCLES = 5;
 
     /// per-cycle awake budget to (re)attach before sleeping anyway
     static constexpr uint32_t ATTACH_TIMEOUT_MS = 30 * 1000;
@@ -203,8 +219,15 @@ private:
     /// derived from VOLTAGE_PIN in initAdc() so the pin constant stays the single source of truth
     adc_channel_t m_adcChannel = ADC_CHANNEL_2;
 
-    /// consecutive cycles with no successful publish; drives the reboot supervisor (see REBOOT_AFTER_FAILS)
-    uint32_t m_consecutiveFailures = 0;
+    /// consecutive confirmed LP-core-stall wakes; drives the reboot supervisor (see
+    /// LP_STALL_REBOOT_THRESHOLD). Reset on any real LP heartbeat progress, not just a
+    /// successful publish -- a live LP core disproves the stall theory regardless of whether
+    /// the broker happened to be reachable that cycle.
+    uint32_t m_lpStalledCycles = 0;
+
+    /// consecutive unhealthy cycles while the running image is still unconfirmed; drives the
+    /// bad-OTA safety net (see UNCONFIRMED_OTA_REBOOT_AFTER_CYCLES).
+    uint32_t m_cyclesUnconfirmedAndFailing = 0;
 
     /// last heater run LP reported (heartbeat_counter value at the time), so the post-hoc
     /// diagnostic log line only fires once per new run rather than every wake.

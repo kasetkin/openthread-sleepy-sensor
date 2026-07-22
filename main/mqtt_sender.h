@@ -24,7 +24,7 @@ inline constexpr size_t MQTT_MAX_DEVICE_ID_LEN =
 // Longest string main.cpp's resetReasonString() can produce (and main.cpp truncates
 // anything longer, mirroring the device_name bound above) — mqtt_sender.cpp's state-JSON
 // buffer is sized against this, so the two can't silently drift apart.
-inline constexpr size_t MQTT_MAX_RESET_REASON_LEN = sizeof("publish_fail_reboot") - 1;
+inline constexpr size_t MQTT_MAX_RESET_REASON_LEN = sizeof("lp_stall_reboot") - 1;  // longest of resetReasonString()'s literals (main.cpp)
 
 struct MqttConfig {
     std::string      broker_address; // literal IPv4 or IPv6 address, e.g. "192.168.77.250" or "fd12:3456:789a::10"

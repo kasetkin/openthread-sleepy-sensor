@@ -64,6 +64,15 @@ struct NetworkLink
     // Recovery after a failed publish (OT: re-scan NAT64 route; Wi-Fi: reconnect kick).
     std::function<void()> refresh;
 
+    // TODO(deferred, see memory note project_blackout_resilience_redesign.md): a lightweight
+    // "soft-rejoin" member was designed but not built -- OT: otThreadSetEnabled() false->true
+    // to force a fresh MLE detach+attach on the same otInstance; Wi-Fi: esp_wifi_disconnect()+
+    // esp_wifi_connect(). Would target OT's own attach state machine getting stuck in a way
+    // plain waiting doesn't clear, separate from a genuine no-network blackout (where
+    // sensorstask.cpp's reboot supervisor now deliberately never reboots -- see its
+    // LP_STALL_REBOOT_THRESHOLD doc comment) and from an LP-core stall (unrelated subsystem).
+    // Revisit only on request -- not wired up anywhere yet.
+
     // Uplink signal strength in dBm (OT: RSSI of the last packet from the SED's parent;
     // Wi-Fi: the associated AP's RSSI), nullopt when unavailable (detached/disconnected).
     // Called from the MQTT publish window, so the radio is awake and the reading is fresh.

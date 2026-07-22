@@ -125,18 +125,33 @@ esp_err_t initNvsFlash()
 // RTC (LP) RAM survives a software reset but not a power cycle, and noinit skips the
 // bootloader's zeroing — so after power-on this holds garbage, which is exactly why a
 // magic word is compared rather than a bool.
-static constexpr uint32_t PUBLISH_FAIL_REBOOT_MAGIC = 0x50464252;  // "PFBR"
-RTC_NOINIT_ATTR static uint32_t s_publish_fail_reboot_marker;
+static constexpr uint32_t LP_STALL_REBOOT_MAGIC = 0x4C505354;  // "LPST"
+RTC_NOINIT_ATTR static uint32_t s_lp_stall_reboot_marker;
 
-void markPublishFailReboot()
+void markLpStallReboot()
 {
-    s_publish_fail_reboot_marker = PUBLISH_FAIL_REBOOT_MAGIC;
+    s_lp_stall_reboot_marker = LP_STALL_REBOOT_MAGIC;
 }
 
-bool consumePublishFailRebootMarker()
+bool consumeLpStallRebootMarker()
 {
-    const bool wasSet = (s_publish_fail_reboot_marker == PUBLISH_FAIL_REBOOT_MAGIC);
-    s_publish_fail_reboot_marker = 0;
+    const bool wasSet = (s_lp_stall_reboot_marker == LP_STALL_REBOOT_MAGIC);
+    s_lp_stall_reboot_marker = 0;
+    return wasSet;
+}
+
+static constexpr uint32_t OTA_UNCONFIRMED_REBOOT_MAGIC = 0x4F544155;  // "OTAU"
+RTC_NOINIT_ATTR static uint32_t s_ota_unconfirmed_reboot_marker;
+
+void markOtaUnconfirmedReboot()
+{
+    s_ota_unconfirmed_reboot_marker = OTA_UNCONFIRMED_REBOOT_MAGIC;
+}
+
+bool consumeOtaUnconfirmedRebootMarker()
+{
+    const bool wasSet = (s_ota_unconfirmed_reboot_marker == OTA_UNCONFIRMED_REBOOT_MAGIC);
+    s_ota_unconfirmed_reboot_marker = 0;
     return wasSet;
 }
 
