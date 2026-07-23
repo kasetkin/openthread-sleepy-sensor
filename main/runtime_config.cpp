@@ -34,6 +34,14 @@ static uint32_t s_poll_interval_sec = 20;
 // other fields' current values, not stale defaults.
 static lp_sensor_core_config_t s_shadow{};
 
+// The 3 of the 8 HA-tunable parameters NOT already trackable from s_shadow in HA-facing units:
+// the heater fields live in s_shadow as LP cycles (not the minutes HA displays), and antenna
+// selection isn't part of s_shadow at all. Seeded at init, updated in apply_pending() alongside
+// the existing shadow/NVS/echo updates for these fields -- backs runtime_config_current_values().
+static uint32_t s_heater_period_minutes = 0;
+static uint32_t s_heater_high_rh_trigger_minutes = 0;
+static bool s_ext_antenna_on = false;
+
 // Every value HA has sent since the last runtime_config_apply_pending() call, guarded by
 // s_mutex. Mirrors ota_updater.cpp's Manifest/s_mutex pattern: the event-handler-context
 // writer takes the mutex only for a fast, non-blocking struct copy.
@@ -92,10 +100,15 @@ static uint32_t minutes_to_lp_cycles(uint32_t minutes, uint32_t poll_sec)
 // ── public API ────────────────────────────────────────────────────────────────
 
 void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
-                          const lp_sensor_core_config_t &boot_config)
+                          const lp_sensor_core_config_t &boot_config,
+                          uint32_t heater_period_minutes, uint32_t heater_high_rh_trigger_minutes,
+                          bool ext_antenna_on)
 {
     s_poll_interval_sec = poll_interval_sec;
     s_shadow = boot_config;
+    s_heater_period_minutes = heater_period_minutes;
+    s_heater_high_rh_trigger_minutes = heater_high_rh_trigger_minutes;
+    s_ext_antenna_on = ext_antenna_on;
 
     const auto full = [&](std::string_view suffix) {
         return std::format("{}/{}", device_id, suffix);
@@ -230,11 +243,13 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
     if (snap.max_skip_cycles_set)  { s_shadow.max_skip_cycles = snap.max_skip_cycles; lpChanged = true; ++applied; }
     if (snap.heater_period_set) {
         s_shadow.heater_period_cycles = minutes_to_lp_cycles(snap.heater_period_minutes, s_poll_interval_sec);
+        s_heater_period_minutes = snap.heater_period_minutes;
         lpChanged = true;
         ++applied;
     }
     if (snap.heater_high_rh_set) {
         s_shadow.high_rh_trigger_cycles = minutes_to_lp_cycles(snap.heater_high_rh_trigger_minutes, s_poll_interval_sec);
+        s_heater_high_rh_trigger_minutes = snap.heater_high_rh_trigger_minutes;
         lpChanged = true;
         ++applied;
     }
@@ -243,6 +258,7 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
 
     if (snap.ext_antenna_set) {
         enableExtAntenna(snap.ext_antenna_on);
+        s_ext_antenna_on = snap.ext_antenna_on;
         ++applied;
     }
 
@@ -344,4 +360,18 @@ bool runtime_config_nvs_override(bool yaml_or_default, const char *nvs_key)
     ESP_LOGI(TAG, "'%s': NVS override %d (yaml/default was %d)",
              nvs_key, static_cast<int>(value), static_cast<int>(yaml_or_default));
     return value != 0;
+}
+
+RuntimeConfigValues runtime_config_current_values()
+{
+    return RuntimeConfigValues{
+        .temp_offset_c = s_shadow.temp_offset_c,
+        .temp_min_change_c = s_shadow.temp_min_change_c,
+        .rh_offset_pct = s_shadow.rh_offset_pct,
+        .rh_min_change_pct = s_shadow.rh_min_change_pct,
+        .max_skip_cycles = s_shadow.max_skip_cycles,
+        .heater_period_minutes = s_heater_period_minutes,
+        .heater_high_rh_trigger_minutes = s_heater_high_rh_trigger_minutes,
+        .ext_antenna_on = s_ext_antenna_on,
+    };
 }

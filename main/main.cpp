@@ -182,8 +182,11 @@ extern "C" void app_main(void)
     enableRf(true);
     // No device_config.yaml tier for this one -- exclusively HA/NVS-driven (see
     // runtime_config.cpp); compiled default false (ceramic) matches the pre-feature behavior
-    // when no override has ever been stored.
-    enableExtAntenna(runtime_config_nvs_override(false, "ext_antenna"));
+    // when no override has ever been stored. Kept as a named local (not inlined into
+    // enableExtAntenna()) so it can also seed runtime_config_init()'s current-value tracking
+    // below, alongside enableExtAntenna()'s own boot-time GPIO write.
+    const bool ext_antenna_on = runtime_config_nvs_override(false, "ext_antenna");
+    enableExtAntenna(ext_antenna_on);
 
     // Must run before the network link starts (esp_openthread_start()/esp_wifi_start()):
     // OpenThread's own radio-state PM lock (esp_openthread_sleep_init(), see esp_openthread
@@ -363,6 +366,14 @@ extern "C" void app_main(void)
     // so it also covers later re-attachment.
 
     // ── LP core sensor ownership ─────────────────────────────────────────────
+    // Heater fields resolved as named locals (not inlined into minutes_to_lp_cycles() below)
+    // so their HA-facing minutes value -- not just the LP-cycle-converted form lpConfig carries
+    // -- is also available to seed runtime_config_init()'s current-value tracking.
+    const uint32_t heater_period_minutes = runtime_config_nvs_override(
+        parse_as_uint32_or(device_config_yaml(), "heater_period_minutes", 1440), "htr_period_min");
+    const uint32_t heater_high_rh_trigger_minutes = runtime_config_nvs_override(
+        parse_as_uint32_or(device_config_yaml(), "heater_high_rh_trigger_minutes", 60), "htr_hi_rh_trig");
+
     const lp_sensor_core_config_t lpConfig {
         .temp_offset_c = runtime_config_nvs_override(
             parse_as_float_or(device_config_yaml(), "temp_offset", 0.0f), "temp_offset"),
@@ -374,14 +385,8 @@ extern "C" void app_main(void)
             parse_as_float_or(device_config_yaml(), "rh_min_change", 2.0f), "rh_min_change"),
         // parsed above, ahead of mqtt_sender_init() -- expire_after_sec derives from it
         .max_skip_cycles = max_skip_cycles,
-        .heater_period_cycles = minutes_to_lp_cycles(
-            runtime_config_nvs_override(
-                parse_as_uint32_or(device_config_yaml(), "heater_period_minutes", 1440), "htr_period_min"),
-            lp_poll_interval_sec),
-        .high_rh_trigger_cycles = minutes_to_lp_cycles(
-            runtime_config_nvs_override(
-                parse_as_uint32_or(device_config_yaml(), "heater_high_rh_trigger_minutes", 60), "htr_hi_rh_trig"),
-            lp_poll_interval_sec),
+        .heater_period_cycles = minutes_to_lp_cycles(heater_period_minutes, lp_poll_interval_sec),
+        .high_rh_trigger_cycles = minutes_to_lp_cycles(heater_high_rh_trigger_minutes, lp_poll_interval_sec),
     };
     ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, temp_offset=%.2f temp_min_change=%.2f "
                   "rh_offset=%.2f rh_min_change=%.2f max_skip_cycles=%lu "
@@ -404,10 +409,11 @@ extern "C" void app_main(void)
         return;
     }
 
-    // Seeds runtime_config's shadow of the 7 live-tunable fields with the boot config just
+    // Seeds runtime_config's shadow of the 8 live-tunable fields with the boot config just
     // applied above (already NVS-override-resolved), and builds the <device_id>/cfg/* topic
     // strings HA drives via MQTT number/switch entities.
-    runtime_config_init(mqtt_name_and_id, lp_poll_interval_sec, lpConfig);
+    runtime_config_init(mqtt_name_and_id, lp_poll_interval_sec, lpConfig,
+                         heater_period_minutes, heater_high_rh_trigger_minutes, ext_antenna_on);
 
     xTaskCreate([](void *) static
     {

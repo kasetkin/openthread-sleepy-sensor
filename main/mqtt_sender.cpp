@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <format>
 #include <memory>
 #include <span>
@@ -604,11 +605,15 @@ static void publish_update_discovery(esp_mqtt_client_handle_t client, std::strin
 // threshold/schedule parameters). Templated on T (float for the 4 calibration/threshold
 // entities, uint32_t for the other 3) so min/max/step format exactly, matching each entity's
 // real type. `topic` serves as BOTH state_topic and command_topic (see CMD_PART_TAIL's doc
-// comment); unit may be nullptr for a unit-less entity (max_skip_cycles).
+// comment); unit may be nullptr for a unit-less entity (max_skip_cycles). Also publishes
+// `current_value` retained on `topic` right after the discovery config -- same "config + state
+// together" shape as publish_update_discovery()'s discovery+installed-version pair -- so HA
+// shows a real value immediately instead of "Unknown" until the entity is first commanded.
 template <typename T>
 static void publish_number_discovery(esp_mqtt_client_handle_t client, std::string_view device_id,
                                      std::string_view device_name, const char *name, const char *slug,
-                                     const char *topic, T min, T max, T step, const char *unit)
+                                     const char *topic, T min, T max, T step, const char *unit,
+                                     T current_value)
 {
     std::array<char, TOPIC_BUF> topicBuf;
     const size_t topicLen = format_into(topicBuf, NUMBER_DISCOVERY_TOPIC_FMT, device_id, slug);
@@ -633,41 +638,61 @@ static void publish_number_discovery(esp_mqtt_client_handle_t client, std::strin
 
     esp_mqtt_client_publish(client, topicBuf.data(), payloadBuf.data(),
                             static_cast<int>(len), 1, 1);
+
+    // Bare scalar, not JSON (matches the retained echo runtime_config_apply_pending() itself
+    // publishes on a live change) -- a fixed 32-byte stack buffer is a directly-reasoned bound
+    // for a to_chars conversion (same reasoning as MAX_FORMATTED_FLOAT_LEN above), not the
+    // file's format-string lemma, since this isn't a std::format call.
+    std::array<char, 32> valBuf;
+    const auto [ptr, ec] = std::to_chars(valBuf.data(), valBuf.data() + valBuf.size(), current_value);
+    if (ec == std::errc{})
+        esp_mqtt_client_publish(client, topic, valBuf.data(),
+                                static_cast<int>(ptr - valBuf.data()), 1, 1);
 }
 
 // Issues all 7 publish_number_discovery() calls -- the ONE place these entities' HA-visible
 // names/units/ranges are decided; ranges come straight from runtime_config.h so the clamp
-// applied on the device side can never drift from what HA's UI advertises.
+// applied on the device side can never drift from what HA's UI advertises. Current values come
+// from runtime_config_current_values(), fetched once here.
 static void publish_number_discoveries(esp_mqtt_client_handle_t client, std::string_view device_id,
                                        std::string_view device_name)
 {
+    const RuntimeConfigValues cur = runtime_config_current_values();
+
     publish_number_discovery(client, device_id, device_name, "Temperature offset", "temp_offset",
-        runtime_config_topic_temp_offset(), TEMP_OFFSET_MIN, TEMP_OFFSET_MAX, TEMP_OFFSET_STEP, "°C");
+        runtime_config_topic_temp_offset(), TEMP_OFFSET_MIN, TEMP_OFFSET_MAX, TEMP_OFFSET_STEP, "°C",
+        cur.temp_offset_c);
     publish_number_discovery(client, device_id, device_name, "Temperature min change", "temp_min_change",
-        runtime_config_topic_temp_min_change(), TEMP_MIN_CHANGE_MIN, TEMP_MIN_CHANGE_MAX, TEMP_MIN_CHANGE_STEP, "°C");
+        runtime_config_topic_temp_min_change(), TEMP_MIN_CHANGE_MIN, TEMP_MIN_CHANGE_MAX, TEMP_MIN_CHANGE_STEP, "°C",
+        cur.temp_min_change_c);
     publish_number_discovery(client, device_id, device_name, "Humidity offset", "rh_offset",
-        runtime_config_topic_rh_offset(), RH_OFFSET_MIN, RH_OFFSET_MAX, RH_OFFSET_STEP, "%");
+        runtime_config_topic_rh_offset(), RH_OFFSET_MIN, RH_OFFSET_MAX, RH_OFFSET_STEP, "%",
+        cur.rh_offset_pct);
     publish_number_discovery(client, device_id, device_name, "Humidity min change", "rh_min_change",
-        runtime_config_topic_rh_min_change(), RH_MIN_CHANGE_MIN, RH_MIN_CHANGE_MAX, RH_MIN_CHANGE_STEP, "%");
+        runtime_config_topic_rh_min_change(), RH_MIN_CHANGE_MIN, RH_MIN_CHANGE_MAX, RH_MIN_CHANGE_STEP, "%",
+        cur.rh_min_change_pct);
     publish_number_discovery(client, device_id, device_name, "Max skip cycles", "max_skip_cycles",
         runtime_config_topic_max_skip_cycles(), MAX_SKIP_CYCLES_MIN, MAX_SKIP_CYCLES_MAX, MAX_SKIP_CYCLES_STEP,
-        nullptr);
+        nullptr, cur.max_skip_cycles);
     publish_number_discovery(client, device_id, device_name, "Heater period", "heater_period_minutes",
         runtime_config_topic_heater_period_minutes(), HEATER_PERIOD_MIN_MINUTES, HEATER_PERIOD_MAX_MINUTES,
-        HEATER_PERIOD_STEP_MINUTES, "min");
+        HEATER_PERIOD_STEP_MINUTES, "min", cur.heater_period_minutes);
     publish_number_discovery(client, device_id, device_name, "Heater high-RH trigger", "heater_high_rh_trigger_minutes",
         runtime_config_topic_heater_high_rh_trigger_minutes(), HEATER_HIGH_RH_MIN_MINUTES, HEATER_HIGH_RH_MAX_MINUTES,
-        HEATER_HIGH_RH_STEP_MINUTES, "min");
+        HEATER_HIGH_RH_STEP_MINUTES, "min", cur.heater_high_rh_trigger_minutes);
 }
 
 // The ext_antenna HA `switch` entity's discovery config -- same state_topic==command_topic
-// shape as the number entities above, with ON/OFF payloads instead of a numeric range.
+// shape as the number entities above, with ON/OFF payloads instead of a numeric range. Also
+// publishes the current ON/OFF state retained on `topic`, same "config + state together"
+// reasoning as publish_number_discovery()'s value publish.
 static void publish_switch_discovery(esp_mqtt_client_handle_t client, std::string_view device_id,
                                      std::string_view device_name)
 {
     static constexpr const char *NAME = "External antenna";
     static constexpr const char *SLUG = "ext_antenna";
     const char *topic = runtime_config_topic_ext_antenna();
+    const bool current_on = runtime_config_current_values().ext_antenna_on;
 
     std::array<char, TOPIC_BUF> topicBuf;
     const size_t topicLen = format_into(topicBuf, SWITCH_DISCOVERY_TOPIC_FMT, device_id, SLUG);
@@ -690,6 +715,9 @@ static void publish_switch_discovery(esp_mqtt_client_handle_t client, std::strin
 
     esp_mqtt_client_publish(client, topicBuf.data(), payloadBuf.data(),
                             static_cast<int>(len), 1, 1);
+
+    const std::string_view val = current_on ? EXT_ANTENNA_PAYLOAD_ON : EXT_ANTENNA_PAYLOAD_OFF;
+    esp_mqtt_client_publish(client, topic, val.data(), static_cast<int>(val.size()), 1, 1);
 }
 
 // Streams history_log.h's backlog (readings that failed to publish live during an outage) over
@@ -888,17 +916,19 @@ static bool run_publish_cycle(const PublishParams &params)
         // Expected ACKs must match what we actually publish below: one state message plus one
         // discovery message per still-owed sensor (two for DISC_BATT: Battery and Voltage;
         // two for DISC_DIAG: Boot count and Reset reason; two for DISC_UPDATE: update config
-        // and installed-version; seven for DISC_NUMBERS, one per HA `number` entity; one for
-        // DISC_SWITCH). A fixed count assuming every discovery is sent would leave
-        // BIT_ALL_ACKED forever unset on any cycle that sends fewer, wrongly failing the cycle.
+        // and installed-version; fourteen for DISC_NUMBERS, discovery config + current-value
+        // state per HA `number` entity, 7 entities x 2 messages; two for DISC_SWITCH, discovery
+        // config + current-value state). A fixed count assuming every discovery is sent would
+        // leave BIT_ALL_ACKED forever unset on any cycle that sends fewer, wrongly failing the
+        // cycle.
         const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
                                  + ((discoveryNeed & DISC_HUM) ? 1 : 0)
                                  + ((discoveryNeed & DISC_BATT) ? 2 : 0)
                                  + ((discoveryNeed & DISC_RSSI) ? 1 : 0)
                                  + ((discoveryNeed & DISC_DIAG) ? 2 : 0)
                                  + ((discoveryNeed & DISC_UPDATE) ? 2 : 0)
-                                 + ((discoveryNeed & DISC_NUMBERS) ? 7 : 0)
-                                 + ((discoveryNeed & DISC_SWITCH) ? 1 : 0);
+                                 + ((discoveryNeed & DISC_NUMBERS) ? 14 : 0)
+                                 + ((discoveryNeed & DISC_SWITCH) ? 2 : 0);
         const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
         // Set counters BEFORE publishing so the handler never races ahead

@@ -72,8 +72,33 @@ inline constexpr uint32_t HEATER_HIGH_RH_STEP_MINUTES = 1;
 // `poll_interval_sec` is the boot's fixed LP poll interval, needed to convert a live
 // heater-minutes change to LP cycles the same way main.cpp's minutes_to_lp_cycles() does at
 // boot (lp_poll_interval_sec itself is NOT retunable live -- out of scope for this feature).
+// `heater_period_minutes`/`heater_high_rh_trigger_minutes`/`ext_antenna_on` are the same
+// boot-resolved values `boot_config`/enableExtAntenna() were already built from, in their
+// HA-facing units (minutes, not LP cycles; boot_config only carries the cycle-converted form) --
+// needed so runtime_config_current_values() has a real value to report from the very first boot.
 void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
-                          const lp_sensor_core_config_t &boot_config);
+                          const lp_sensor_core_config_t &boot_config,
+                          uint32_t heater_period_minutes, uint32_t heater_high_rh_trigger_minutes,
+                          bool ext_antenna_on);
+
+// The 8 HA-tunable parameters' current resolved value, in HA-facing units (heater fields in
+// minutes, not LP cycles) -- whichever is freshest of the boot default/NVS override or the
+// latest MQTT change accepted since. Used by mqtt_sender.cpp to publish each cfg/* topic's
+// retained state alongside its discovery config (see publish_number_discovery()/
+// publish_switch_discovery()), so HA never shows a number/switch entity as "Unknown" simply
+// because it has never been commanded.
+struct RuntimeConfigValues
+{
+    float temp_offset_c;
+    float temp_min_change_c;
+    float rh_offset_pct;
+    float rh_min_change_pct;
+    uint32_t max_skip_cycles;
+    uint32_t heater_period_minutes;
+    uint32_t heater_high_rh_trigger_minutes;
+    bool ext_antenna_on;
+};
+RuntimeConfigValues runtime_config_current_values();
 
 // Stable NUL-terminated topic accessors, mirroring ota_topic_*().
 const char *runtime_config_topic_wildcard();
