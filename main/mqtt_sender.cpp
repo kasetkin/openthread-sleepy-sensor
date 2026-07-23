@@ -19,6 +19,7 @@
 
 #include "ota_updater.h"
 #include "history_log.h"
+#include "runtime_config.h"
 
 static const char *TAG = "mqtt-sender";
 
@@ -39,18 +40,23 @@ static constexpr uint32_t BROKER_REACHABLE_WAIT_MS = 5000;
 // one bool: each cycle publishes configs only for the values actually present, so a first cycle
 // missing one value (humidity disabled, battery ADC failure) must not permanently skip that
 // sensor's discovery -- it goes out on the first later cycle that carries the value.
-enum DiscoveryBit : uint8_t {
-    DISC_TEMP   = 1 << 0,
-    DISC_HUM    = 1 << 1,
-    DISC_BATT   = 1 << 2,  // covers the Battery + Voltage pair -- always published together
-    DISC_UPDATE = 1 << 3,  // HA `update` entity config + retained installed-version -- always published together
-    DISC_RSSI   = 1 << 4,  // Signal strength -- owed once a cycle actually carries an RSSI reading
-    DISC_DIAG   = 1 << 5,  // Boot count + Reset reason pair -- boot-constant, so always available
+// uint16_t: DISC_NUMBERS/DISC_SWITCH below already fill all 8 bits of a uint8_t, leaving zero
+// headroom for anything added later -- widened proactively so the next entity doesn't need a
+// second mask-width migration.
+enum DiscoveryBit : uint16_t {
+    DISC_TEMP    = 1 << 0,
+    DISC_HUM     = 1 << 1,
+    DISC_BATT    = 1 << 2,  // covers the Battery + Voltage pair -- always published together
+    DISC_UPDATE  = 1 << 3,  // HA `update` entity config + retained installed-version -- always published together
+    DISC_RSSI    = 1 << 4,  // Signal strength -- owed once a cycle actually carries an RSSI reading
+    DISC_DIAG    = 1 << 5,  // Boot count + Reset reason pair -- boot-constant, so always available
+    DISC_NUMBERS = 1 << 6,  // all 7 HA `number` entities (calibration/threshold config) -- always published together
+    DISC_SWITCH  = 1 << 7,  // the ext_antenna HA `switch` entity -- boot-constant, so always available
 };
 
 static MqttConfig s_cfg;
 static const NetworkLink *s_link = nullptr;       // set in mqtt_sender_init(); backs the transport
-static std::atomic<uint8_t> s_discovery_sent_mask{0};
+static std::atomic<uint16_t> s_discovery_sent_mask{0};
 static std::atomic<bool> s_task_running{false};
 static std::atomic<bool> s_last_ok{false};        // true iff the most recent finished cycle connected AND was ACKed
 static EventGroupHandle_t s_idle_eg = nullptr;    // created in mqtt_sender_init(); starts idle
@@ -159,10 +165,31 @@ static constexpr std::string_view UPDATE_DISCOVERY_FMT =
     "\"manufacturer\":\"Seeed Studio\",\"model\":\"XIAO ESP32-C6\",\"serial_number\":\"{}\"}}"
     "}}";
 
+// HA `number`/`switch` entities for the HA-tunable-via-MQTT parameters (main/runtime_config.h)
+// -- "entity_category":"config" is HA's dedicated bucket for user-editable settings, a sibling
+// of DISC_PART_DIAGNOSTIC's "diagnostic" (read-only) above. Unlike the sensor/update families,
+// state_topic == command_topic for both: HA's documented pattern for a number/switch entity to
+// read its current value back from the very topic it publishes commands to, since
+// runtime_config.cpp republishes a retained echo of the applied value on that same topic. No
+// value_template: bare scalar payload, not JSON.
+static constexpr std::string_view CMD_PART_CONFIG_CAT = "\"entity_category\":\"config\",";
+static constexpr std::string_view CMD_PART_MINMAXSTEP = "\"min\":{},\"max\":{},\"step\":{},";
+static constexpr std::string_view CMD_PART_PAYLOADS    = "\"payload_on\":\"{}\",\"payload_off\":\"{}\",";
+static constexpr std::string_view CMD_PART_TAIL =
+    "\"state_topic\":\"{}\","
+    "\"command_topic\":\"{}\","
+    "\"retain\":true,"
+    "\"unique_id\":\"{}_{}\","
+    "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\",\"sw_version\":\"{}\","
+    "\"manufacturer\":\"Seeed Studio\",\"model\":\"XIAO ESP32-C6\",\"serial_number\":\"{}\"}}"
+    "}}";
+
 // The other format strings used below, named (like the DISC_PART_* strings above) so their compile-time
 // .size() can size the fixed buffers that follow instead of hand-counting characters.
 static constexpr std::string_view DISCOVERY_TOPIC_FMT = "homeassistant/sensor/{}/{}/config";
 static constexpr std::string_view UPDATE_DISCOVERY_TOPIC_FMT = "homeassistant/update/{}/firmware/config";
+static constexpr std::string_view NUMBER_DISCOVERY_TOPIC_FMT = "homeassistant/number/{}/{}/config";
+static constexpr std::string_view SWITCH_DISCOVERY_TOPIC_FMT = "homeassistant/switch/{}/{}/config";
 static constexpr std::string_view STATE_TOPIC_FMT      = "{}/state";
 static constexpr std::string_view STATE_FMT_BOTH  = "{{\"t\":{:.3g},\"h\":{:.3g}}}";
 static constexpr std::string_view STATE_FMT_TEMP  = "{{\"t\":{:.3g}}}";
@@ -255,8 +282,33 @@ static constexpr size_t MAX_UPDATE_DISCOVERY_TOPIC_LEN =
     UPDATE_DISCOVERY_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 static constexpr size_t MAX_STATE_TOPIC_LEN = STATE_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 static constexpr size_t MAX_BACKFILL_TOPIC_LEN = BACKFILL_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
+
+// Longest HA entity `name` among the 7 `number` + 1 `switch` config entities (see the
+// publish_number_discoveries()/publish_switch_discovery() call sites below).
+static constexpr size_t MAX_CFG_NAME_LEN = std::max({sizeof("Temperature offset"), sizeof("Temperature min change"),
+    sizeof("Humidity offset"), sizeof("Humidity min change"), sizeof("Max skip cycles"),
+    sizeof("Heater period"), sizeof("Heater high-RH trigger"), sizeof("External antenna")}) - 1;
+// Longest of the 8 cfg/* topic suffixes (runtime_config.h).
+static constexpr size_t MAX_CFG_SUFFIX_LEN = std::max({CFG_SUFFIX_TEMP_OFFSET.size(), CFG_SUFFIX_TEMP_MIN_CHANGE.size(),
+    CFG_SUFFIX_RH_OFFSET.size(), CFG_SUFFIX_RH_MIN_CHANGE.size(), CFG_SUFFIX_MAX_SKIP_CYCLES.size(),
+    CFG_SUFFIX_HEATER_PERIOD_MIN.size(), CFG_SUFFIX_HEATER_HIGH_RH_MIN.size(), CFG_SUFFIX_EXT_ANTENNA.size()});
+// Full "<device_id>/cfg/<suffix>" topic, interpolated 2x into CMD_PART_TAIL (state + command).
+static constexpr size_t MAX_CFG_TOPIC_LEN = MAX_DEVICE_ID_LEN + 1 /* '/' */ + MAX_CFG_SUFFIX_LEN;
+// unique_id's slug half -- the bare key name (suffix minus the "cfg/" segment).
+static constexpr size_t MAX_CFG_SLUG_LEN = MAX_CFG_SUFFIX_LEN - (sizeof("cfg/") - 1);
+static constexpr size_t MAX_CFG_UNIT_LEN = std::max({MAX_UNIT_LEN, sizeof("min") - 1});
+
+static constexpr size_t MAX_NUMBER_DISCOVERY_TOPIC_LEN =
+    NUMBER_DISCOVERY_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN + MAX_CFG_SLUG_LEN;
+static constexpr size_t MAX_SWITCH_DISCOVERY_TOPIC_LEN =
+    SWITCH_DISCOVERY_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN + MAX_CFG_SLUG_LEN;
+
+// MAX_CFG_TOPIC_LEN isn't included here: unlike the topics above, the cfg/* command topics
+// are never built via format_into() into a TOPIC_BUF-sized local -- they're already-built
+// std::strings from runtime_config.cpp's topic accessors, passed straight through as args.
 static constexpr size_t TOPIC_BUF = std::max({MAX_DISCOVERY_TOPIC_LEN, MAX_UPDATE_DISCOVERY_TOPIC_LEN,
-                                              MAX_STATE_TOPIC_LEN, MAX_BACKFILL_TOPIC_LEN}) + 1;  // +1 NUL
+                                              MAX_STATE_TOPIC_LEN, MAX_BACKFILL_TOPIC_LEN,
+                                              MAX_NUMBER_DISCOVERY_TOPIC_LEN, MAX_SWITCH_DISCOVERY_TOPIC_LEN}) + 1;  // +1 NUL
 
 // The lemma applies per part (each part is itself a format string of literals, {} and {{/}}
 // escapes), so the bound for the assembled payload is the sum of every part's size — as if
@@ -278,6 +330,24 @@ static constexpr size_t DISCOVERY_PAYLOAD_BUF = DISC_PART_HEAD.size()
 static constexpr size_t UPDATE_DISCOVERY_PAYLOAD_BUF = UPDATE_DISCOVERY_FMT.size()
     + 3 * MAX_OTA_TOPIC_LEN + 2 * MAX_DEVICE_ID_LEN + MAX_DEVICE_NAME_LEN
     + MAX_SW_VERSION_LEN + MAX_SERIAL_LEN + 1;  // +1 NUL
+
+// Shared bound for both publish_number_discovery() and publish_switch_discovery(): built from
+// DISC_PART_HEAD (name) + CMD_PART_CONFIG_CAT (no args) + CMD_PART_MINMAXSTEP (min/max/step,
+// number only) + DISC_PART_UNIT (unit, number only) + CMD_PART_PAYLOADS (payload_on/off,
+// switch only) + CMD_PART_TAIL (state_topic, command_topic, unique_id, device block) --
+// device_id is substituted 2x in CMD_PART_TAIL (unique_id, device.identifiers) and slug 1x
+// (unique_id only), same "verify against the actual argument list" discipline as
+// DISCOVERY_PAYLOAD_BUF's comment above. Summing every part's max as if all applied is a safe
+// (if slightly generous) shared bound, same lemma as DISCOVERY_PAYLOAD_BUF. min/max/step reuse
+// MAX_FORMATTED_FLOAT_LEN even for the uint32_t call sites -- a safe (if generous) bound either way.
+static constexpr size_t CMD_DISCOVERY_PAYLOAD_BUF = DISC_PART_HEAD.size()
+    + CMD_PART_CONFIG_CAT.size() + CMD_PART_MINMAXSTEP.size() + DISC_PART_UNIT.size()
+    + CMD_PART_PAYLOADS.size() + CMD_PART_TAIL.size()
+    + MAX_CFG_NAME_LEN + 3 * MAX_FORMATTED_FLOAT_LEN + MAX_CFG_UNIT_LEN
+    + (sizeof("ON") - 1) + (sizeof("OFF") - 1)
+    + 2 * MAX_CFG_TOPIC_LEN + 2 * MAX_DEVICE_ID_LEN + MAX_CFG_SLUG_LEN
+    + MAX_DEVICE_NAME_LEN + MAX_SW_VERSION_LEN + MAX_SERIAL_LEN
+    + 1;  // +1 NUL
 
 // convertVoltageToPercent() clamps to 0..100, so "100" is the widest "b" can ever print.
 static constexpr size_t MAX_BATTERY_PCT_LEN = sizeof("100") - 1;
@@ -366,6 +436,10 @@ static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
                          ev->data, static_cast<size_t>(ev->data_len),
                          static_cast<size_t>(ev->current_data_offset),
                          static_cast<size_t>(ev->total_data_len));
+        // Sibling demux for the <id>/cfg/* topics (see runtime_config.h) -- no-op for any
+        // other topic, same "each module ignores what isn't its own" shape as ota_on_mqtt_data.
+        runtime_config_on_mqtt_data(ev->topic, static_cast<size_t>(ev->topic_len),
+                                    ev->data, static_cast<size_t>(ev->data_len));
         break;
     }
     case MQTT_EVENT_ERROR: {
@@ -524,6 +598,98 @@ static void publish_update_discovery(esp_mqtt_client_handle_t client, std::strin
                             static_cast<int>(payloadLen), 1, 1);
     // len 0 => esp-mqtt uses strlen(); retained so HA has installed_version across restarts.
     esp_mqtt_client_publish(client, ota_topic_installed(), sw_version, 0, 1, 1);
+}
+
+// One HA `number` entity's discovery config (main/runtime_config.h's live-tunable calibration/
+// threshold/schedule parameters). Templated on T (float for the 4 calibration/threshold
+// entities, uint32_t for the other 3) so min/max/step format exactly, matching each entity's
+// real type. `topic` serves as BOTH state_topic and command_topic (see CMD_PART_TAIL's doc
+// comment); unit may be nullptr for a unit-less entity (max_skip_cycles).
+template <typename T>
+static void publish_number_discovery(esp_mqtt_client_handle_t client, std::string_view device_id,
+                                     std::string_view device_name, const char *name, const char *slug,
+                                     const char *topic, T min, T max, T step, const char *unit)
+{
+    std::array<char, TOPIC_BUF> topicBuf;
+    const size_t topicLen = format_into(topicBuf, NUMBER_DISCOVERY_TOPIC_FMT, device_id, slug);
+
+    std::array<char, CMD_DISCOVERY_PAYLOAD_BUF> payloadBuf;
+    size_t len = format_into(payloadBuf, DISC_PART_HEAD, name);
+    if (len > 0)
+        len = format_append(payloadBuf, len, CMD_PART_CONFIG_CAT);
+    if (len > 0)
+        len = format_append(payloadBuf, len, CMD_PART_MINMAXSTEP, min, max, step);
+    if (len > 0 && unit)
+        len = format_append(payloadBuf, len, DISC_PART_UNIT, unit);
+    if (len > 0)
+        len = format_append(payloadBuf, len, CMD_PART_TAIL,
+                            topic, topic,
+                            device_id, slug,
+                            device_id, device_name, esp_app_get_description()->version,
+                            serial_from_device_id(device_id));
+
+    if (topicLen == 0 || len == 0)
+        return;  // format_into()/format_append() already logged the truncation
+
+    esp_mqtt_client_publish(client, topicBuf.data(), payloadBuf.data(),
+                            static_cast<int>(len), 1, 1);
+}
+
+// Issues all 7 publish_number_discovery() calls -- the ONE place these entities' HA-visible
+// names/units/ranges are decided; ranges come straight from runtime_config.h so the clamp
+// applied on the device side can never drift from what HA's UI advertises.
+static void publish_number_discoveries(esp_mqtt_client_handle_t client, std::string_view device_id,
+                                       std::string_view device_name)
+{
+    publish_number_discovery(client, device_id, device_name, "Temperature offset", "temp_offset",
+        runtime_config_topic_temp_offset(), TEMP_OFFSET_MIN, TEMP_OFFSET_MAX, TEMP_OFFSET_STEP, "°C");
+    publish_number_discovery(client, device_id, device_name, "Temperature min change", "temp_min_change",
+        runtime_config_topic_temp_min_change(), TEMP_MIN_CHANGE_MIN, TEMP_MIN_CHANGE_MAX, TEMP_MIN_CHANGE_STEP, "°C");
+    publish_number_discovery(client, device_id, device_name, "Humidity offset", "rh_offset",
+        runtime_config_topic_rh_offset(), RH_OFFSET_MIN, RH_OFFSET_MAX, RH_OFFSET_STEP, "%");
+    publish_number_discovery(client, device_id, device_name, "Humidity min change", "rh_min_change",
+        runtime_config_topic_rh_min_change(), RH_MIN_CHANGE_MIN, RH_MIN_CHANGE_MAX, RH_MIN_CHANGE_STEP, "%");
+    publish_number_discovery(client, device_id, device_name, "Max skip cycles", "max_skip_cycles",
+        runtime_config_topic_max_skip_cycles(), MAX_SKIP_CYCLES_MIN, MAX_SKIP_CYCLES_MAX, MAX_SKIP_CYCLES_STEP,
+        nullptr);
+    publish_number_discovery(client, device_id, device_name, "Heater period", "heater_period_minutes",
+        runtime_config_topic_heater_period_minutes(), HEATER_PERIOD_MIN_MINUTES, HEATER_PERIOD_MAX_MINUTES,
+        HEATER_PERIOD_STEP_MINUTES, "min");
+    publish_number_discovery(client, device_id, device_name, "Heater high-RH trigger", "heater_high_rh_trigger_minutes",
+        runtime_config_topic_heater_high_rh_trigger_minutes(), HEATER_HIGH_RH_MIN_MINUTES, HEATER_HIGH_RH_MAX_MINUTES,
+        HEATER_HIGH_RH_STEP_MINUTES, "min");
+}
+
+// The ext_antenna HA `switch` entity's discovery config -- same state_topic==command_topic
+// shape as the number entities above, with ON/OFF payloads instead of a numeric range.
+static void publish_switch_discovery(esp_mqtt_client_handle_t client, std::string_view device_id,
+                                     std::string_view device_name)
+{
+    static constexpr const char *NAME = "External antenna";
+    static constexpr const char *SLUG = "ext_antenna";
+    const char *topic = runtime_config_topic_ext_antenna();
+
+    std::array<char, TOPIC_BUF> topicBuf;
+    const size_t topicLen = format_into(topicBuf, SWITCH_DISCOVERY_TOPIC_FMT, device_id, SLUG);
+
+    std::array<char, CMD_DISCOVERY_PAYLOAD_BUF> payloadBuf;
+    size_t len = format_into(payloadBuf, DISC_PART_HEAD, NAME);
+    if (len > 0)
+        len = format_append(payloadBuf, len, CMD_PART_CONFIG_CAT);
+    if (len > 0)
+        len = format_append(payloadBuf, len, CMD_PART_PAYLOADS, EXT_ANTENNA_PAYLOAD_ON, EXT_ANTENNA_PAYLOAD_OFF);
+    if (len > 0)
+        len = format_append(payloadBuf, len, CMD_PART_TAIL,
+                            topic, topic,
+                            device_id, SLUG,
+                            device_id, device_name, esp_app_get_description()->version,
+                            serial_from_device_id(device_id));
+
+    if (topicLen == 0 || len == 0)
+        return;  // format_into()/format_append() already logged the truncation
+
+    esp_mqtt_client_publish(client, topicBuf.data(), payloadBuf.data(),
+                            static_cast<int>(len), 1, 1);
 }
 
 // Streams history_log.h's backlog (readings that failed to publish live during an outage) over
@@ -690,6 +856,9 @@ static bool run_publish_cycle(const PublishParams &params)
         // QoS 0: retained delivery over an already-reliable TCP link. See ota_updater.h.
         esp_mqtt_client_subscribe(client.get(), ota_topic_manifest(), 0);
         esp_mqtt_client_subscribe(client.get(), ota_topic_install(), 0);
+        // <id>/cfg/# -- one SUBSCRIBE packet for all 8 HA-tunable-parameter topics (see
+        // runtime_config.h), same "ride the publish window" reasoning as the OTA subscribes.
+        esp_mqtt_client_subscribe(client.get(), runtime_config_topic_wildcard(), 0);
 
         // Battery is deliberately absent from hasAny: it only ever rides along on a
         // temperature/humidity publish (see mqtt_send_sensor_data()'s doc comment), so it can
@@ -705,26 +874,31 @@ static bool run_publish_cycle(const PublishParams &params)
         // DISC_UPDATE (the HA update entity + installed-version pair) and DISC_DIAG (the
         // boot-constant Boot count + Reset reason pair) aren't tied to any sensor value,
         // so they're owed on whichever publishing cycle comes first.
-        const auto discoveryWant = static_cast<uint8_t>((hasTemp ? DISC_TEMP : 0)
+        const auto discoveryWant = static_cast<uint16_t>((hasTemp ? DISC_TEMP : 0)
                                                       | (hasHumid ? DISC_HUM : 0)
                                                       | (hasBatt ? DISC_BATT : 0)
                                                       | (rssi ? DISC_RSSI : 0)
                                                       | DISC_DIAG
-                                                      | DISC_UPDATE);
+                                                      | DISC_UPDATE
+                                                      | DISC_NUMBERS
+                                                      | DISC_SWITCH);
         const auto discoveryNeed = hasAny
-            ? static_cast<uint8_t>(discoveryWant & ~s_discovery_sent_mask.load()) : uint8_t{0};
+            ? static_cast<uint16_t>(discoveryWant & ~s_discovery_sent_mask.load()) : uint16_t{0};
 
         // Expected ACKs must match what we actually publish below: one state message plus one
         // discovery message per still-owed sensor (two for DISC_BATT: Battery and Voltage;
         // two for DISC_DIAG: Boot count and Reset reason; two for DISC_UPDATE: update config
-        // and installed-version). A fixed count assuming every discovery is sent would leave
+        // and installed-version; seven for DISC_NUMBERS, one per HA `number` entity; one for
+        // DISC_SWITCH). A fixed count assuming every discovery is sent would leave
         // BIT_ALL_ACKED forever unset on any cycle that sends fewer, wrongly failing the cycle.
         const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
                                  + ((discoveryNeed & DISC_HUM) ? 1 : 0)
                                  + ((discoveryNeed & DISC_BATT) ? 2 : 0)
                                  + ((discoveryNeed & DISC_RSSI) ? 1 : 0)
                                  + ((discoveryNeed & DISC_DIAG) ? 2 : 0)
-                                 + ((discoveryNeed & DISC_UPDATE) ? 2 : 0);
+                                 + ((discoveryNeed & DISC_UPDATE) ? 2 : 0)
+                                 + ((discoveryNeed & DISC_NUMBERS) ? 7 : 0)
+                                 + ((discoveryNeed & DISC_SWITCH) ? 1 : 0);
         const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
         // Set counters BEFORE publishing so the handler never races ahead
@@ -768,6 +942,10 @@ static bool run_publish_cycle(const PublishParams &params)
         }
         if (discoveryNeed & DISC_UPDATE)
             publish_update_discovery(client.get(), dev, dev_name);
+        if (discoveryNeed & DISC_NUMBERS)
+            publish_number_discoveries(client.get(), dev, dev_name);
+        if (discoveryNeed & DISC_SWITCH)
+            publish_switch_discovery(client.get(), dev, dev_name);
 
         if (hasAny) {
             std::array<char, STATE_BUF> stateBuf;
@@ -824,6 +1002,12 @@ static bool run_publish_cycle(const PublishParams &params)
         // then reboots the device.
         if (ok || !hasAny)
             replay_history_if_pending(client.get(), dev, ctx, eg.get());
+
+        // Runtime config changes (see runtime_config.h) are quick -- a handful of small
+        // retained publishes, no ACK wait -- so they're serviced here, ahead of OTA, rather
+        // than risk being delayed behind a potentially multi-minute OTA session.
+        if (ok || !hasAny)
+            runtime_config_apply_pending(client.get());
 
         // A staged update only starts from a healthy cycle: for a data-carrying cycle that
         // means connected AND state ACKed (a flaky link fails fast above instead of kicking

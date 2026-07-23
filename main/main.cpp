@@ -15,6 +15,7 @@
 #include "sensorstask.h"
 #include "errortask.h"
 #include "mqtt_sender.h"
+#include "runtime_config.h"
 
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -179,7 +180,10 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_vfs_eventfd_register(&eventfd_config));
 
     enableRf(true);
-    enableExtAntenna(false);
+    // No device_config.yaml tier for this one -- exclusively HA/NVS-driven (see
+    // runtime_config.cpp); compiled default false (ceramic) matches the pre-feature behavior
+    // when no override has ever been stored.
+    enableExtAntenna(runtime_config_nvs_override(false, "ext_antenna"));
 
     // Must run before the network link starts (esp_openthread_start()/esp_wifi_start()):
     // OpenThread's own radio-state PM lock (esp_openthread_sleep_init(), see esp_openthread
@@ -284,8 +288,9 @@ extern "C" void app_main(void)
     // with no delay (busy-loop) -- the non-zero fallback default guards that too.
     const uint32_t lp_poll_interval_sec = parse_as_uint32_or(device_config_yaml(), "lp_poll_interval_sec",
                                                              SensorsTaskSettings{}.lpPollIntervalSec);
-    const uint32_t max_skip_cycles = parse_as_uint32_or(device_config_yaml(), "max_skip_cycles",
-                                                        SensorsTaskSettings{}.maxSkipCycles);
+    const uint32_t max_skip_cycles = runtime_config_nvs_override(
+        parse_as_uint32_or(device_config_yaml(), "max_skip_cycles", SensorsTaskSettings{}.maxSkipCycles),
+        "max_skip_cycles");
     const uint32_t boot_count = incrementBootCount();
     std::string reset_reason = resetReasonString();
     if (reset_reason.size() > MQTT_MAX_RESET_REASON_LEN)
@@ -359,17 +364,23 @@ extern "C" void app_main(void)
 
     // ── LP core sensor ownership ─────────────────────────────────────────────
     const lp_sensor_core_config_t lpConfig {
-        .temp_offset_c = parse_as_float_or(device_config_yaml(), "temp_offset", 0.0f),
-        .temp_min_change_c = parse_as_float_or(device_config_yaml(), "temp_min_change", 0.2f),
-        .rh_offset_pct = parse_as_float_or(device_config_yaml(), "rh_offset", 0.0f),
-        .rh_min_change_pct = parse_as_float_or(device_config_yaml(), "rh_min_change", 2.0f),
+        .temp_offset_c = runtime_config_nvs_override(
+            parse_as_float_or(device_config_yaml(), "temp_offset", 0.0f), "temp_offset"),
+        .temp_min_change_c = runtime_config_nvs_override(
+            parse_as_float_or(device_config_yaml(), "temp_min_change", 0.2f), "temp_min_change"),
+        .rh_offset_pct = runtime_config_nvs_override(
+            parse_as_float_or(device_config_yaml(), "rh_offset", 0.0f), "rh_offset"),
+        .rh_min_change_pct = runtime_config_nvs_override(
+            parse_as_float_or(device_config_yaml(), "rh_min_change", 2.0f), "rh_min_change"),
         // parsed above, ahead of mqtt_sender_init() -- expire_after_sec derives from it
         .max_skip_cycles = max_skip_cycles,
         .heater_period_cycles = minutes_to_lp_cycles(
-            parse_as_uint32_or(device_config_yaml(), "heater_period_minutes", 1440),
+            runtime_config_nvs_override(
+                parse_as_uint32_or(device_config_yaml(), "heater_period_minutes", 1440), "htr_period_min"),
             lp_poll_interval_sec),
         .high_rh_trigger_cycles = minutes_to_lp_cycles(
-            parse_as_uint32_or(device_config_yaml(), "heater_high_rh_trigger_minutes", 60),
+            runtime_config_nvs_override(
+                parse_as_uint32_or(device_config_yaml(), "heater_high_rh_trigger_minutes", 60), "htr_hi_rh_trig"),
             lp_poll_interval_sec),
     };
     ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, temp_offset=%.2f temp_min_change=%.2f "
@@ -392,6 +403,11 @@ extern "C" void app_main(void)
         startErrorTask(ErrorTask::ErrorCode::ecSensorsFail);
         return;
     }
+
+    // Seeds runtime_config's shadow of the 7 live-tunable fields with the boot config just
+    // applied above (already NVS-override-resolved), and builds the <device_id>/cfg/* topic
+    // strings HA drives via MQTT number/switch entities.
+    runtime_config_init(mqtt_name_and_id, lp_poll_interval_sec, lpConfig);
 
     xTaskCreate([](void *) static
     {

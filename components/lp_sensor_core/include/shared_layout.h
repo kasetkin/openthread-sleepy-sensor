@@ -9,22 +9,49 @@
 // the HP side reinterprets the generated symbol's address as a pointer to it.
 //
 // result_seq is a seqlock: the LP program bumps it to odd before writing the rest of the
-// struct and back to even once done; the HP side (lp_sensor_core_get_state()) retries if
-// it observes an odd value or a value that changed mid-read, so a read can never observe a
-// torn/partial update. Only fields the LP program writes every cycle need this protection
-// -- the config block below is written once by HP before ulp_lp_core_run() starts the LP
-// timer, and the LP program never writes it back, so it isn't part of the seqlock.
+// struct and back to even once done; the HP side (lp_sensor_core_get_state()) retries if it
+// observes an odd value or a value that changed mid-read, so a read can never observe a
+// torn/partial update. This protects fields the LP program itself writes every cycle. The
+// config block below is HP-owned in both directions (HP is the only writer; LP only ever
+// reads it) so it needs no protection on THAT axis -- but see its own comment below for why
+// it still isn't given a seqlock of its own, now that it has a SECOND, live write path.
 typedef struct {
-    // --- HP -> LP config, written once by lp_sensor_core_init() before the LP timer
-    // starts. Read-only from the LP program's point of view thereafter. Mirrors
-    // SensorsTaskSettings (main/sensorstask.h).
+    // --- HP -> LP config. Two write paths, both single-writer/HP-owned, both safe WITHOUT a
+    // seqlock:
+    //   1. lp_sensor_core_init() -- once, before ulp_lp_core_run() starts the LP timer, so
+    //      there is no concurrent LP-side reader yet at all.
+    //   2. lp_sensor_core_apply_config() -- live, any time after the LP timer has started
+    //      (HA-driven runtime tuning via main/runtime_config.cpp). This IS a genuine
+    //      concurrent writer-while-reader situation, deliberately NOT given a seqlock like
+    //      result_seq/hp_ack_seq below, for reasons specific to this block:
+    //        - every field is a plain float/uint32_t, individually 4-byte-aligned within the
+    //          struct -- a single field's store is atomic at the hardware level, so no
+    //          individual field can ever be torn/partially-written.
+    //        - the LP program (lp_core/main.cpp) reads this block exactly once, at the top of
+    //          its cycle, into local reasoning for that cycle -- it never re-reads a field
+    //          mid-cycle, so the SAME field can't change value out from under one decision.
+    //        - the seven fields are never compared cross-field against each other (each is an
+    //          independent threshold/offset/budget), so the one real risk a plain multi-field
+    //          write carries -- the LP core observing an old/new MIX across different fields,
+    //          if a config change lands mid-cycle -- is harmless here: worst case, one LP
+    //          cycle (~one poll interval) applies part of a change (e.g. the old
+    //          temp_min_change_c alongside a just-updated rh_offset_pct); the very next cycle
+    //          sees the fully-new set. That's a one-cycle-late partial application, never a
+    //          corrupted value.
+    //      A seqlock would remove even that one-cycle skew, at the cost of the LP program
+    //      retrying/re-reading this block on every single wake, forever, to protect a rare
+    //      HA-driven write against fields nothing else depends on being cross-consistent --
+    //      not worth it here, unlike result_seq/hp_ack_seq below, which protect fields
+    //      written EVERY cycle and/or values that truly must be read together.
+    // Mirrors SensorsTaskSettings (main/sensorstask.h) / lp_sensor_core_config_t.
     float    temp_offset_c;
     float    temp_min_change_c;
     float    rh_offset_pct;
     float    rh_min_change_pct;
     uint32_t max_skip_cycles;
-    // Heater schedule, pre-converted from device_config.yaml's minutes to LP poll cycles by
-    // main.cpp (see minutes_to_lp_cycles there). 0 = that mechanism disabled.
+    // Heater schedule, pre-converted from minutes (device_config.yaml or, if overridden live,
+    // main/runtime_config.cpp) to LP poll cycles using the boot's fixed lp_poll_interval_sec
+    // (see minutes_to_lp_cycles()). 0 = that mechanism disabled.
     uint32_t heater_period_cycles;   // polls between periodic heater self-tests
     uint32_t high_rh_trigger_cycles; // consecutive >90%RH polls before creep mitigation
 

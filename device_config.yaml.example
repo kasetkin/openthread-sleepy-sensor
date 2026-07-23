@@ -1,12 +1,19 @@
 # Per-device configuration: sensor calibration, publish cadence, heater schedule, battery
 # ADC. Same "key: \"value\"" syntax as secrets.yaml. Embedded at build time (rebuild to
 # change). Unlike secrets.yaml this file holds no credentials, so it stays tracked in git.
+#
+# Keys marked "MQTT tunable" below double as the compiled-in fallback for a parameter Home
+# Assistant can also override live, without a reflash -- see the README's "Runtime-tunable
+# parameters over MQTT" section and main/runtime_config.h. Once HA has set one, that value
+# lives in NVS and takes precedence over whatever is written here, until HA changes it again.
 
 # Calibration offsets, added to the raw sensor reading before publishing.
 # Derive rh_offset by comparing this sensor against a trusted reference:
 #   rh_offset = reference_RH - measured_RH   (e.g. 47.8 - 67.9 = -20.1)
 # Leave at "0.0" for no correction.
+# MQTT tunable: <device_id>/cfg/rh_offset
 rh_offset: "0.0"
+# MQTT tunable: <device_id>/cfg/temp_offset
 temp_offset: "0.0"
 
 # Publish cadence. The LP core reads the sensor every lp_poll_interval_sec and publishes a
@@ -16,9 +23,13 @@ temp_offset: "0.0"
 # Everything else is derived from this pair: the HP safeguard wake timeout is
 # (max_skip_cycles + 3) x lp_poll_interval_sec and Home Assistant's expire_after is twice
 # that -- nothing needs retuning when these values change.
+# MQTT tunable: <device_id>/cfg/temp_min_change
 temp_min_change: "0.2"
+# MQTT tunable: <device_id>/cfg/rh_min_change
 rh_min_change: "2.0"
+# MQTT tunable: <device_id>/cfg/max_skip_cycles
 max_skip_cycles: "10"
+# Not MQTT tunable (would need re-arming the LP hardware timer live -- deferred).
 lp_poll_interval_sec: "20"
 
 # Heater maintenance schedule (SHT4x built-in heater), in wall-clock minutes -- converted
@@ -27,7 +38,9 @@ lp_poll_interval_sec: "20"
 # heater_high_rh_trigger_minutes: how long RH must stay above 90 % before a creep-mitigation
 # heater run fires (default 1 h). "0" disables that mechanism entirely (e.g. for power
 # measurements or a sensor that must never self-heat).
+# MQTT tunable: <device_id>/cfg/heater_period_minutes
 heater_period_minutes: "1440"
+# MQTT tunable: <device_id>/cfg/heater_high_rh_trigger_minutes
 heater_high_rh_trigger_minutes: "60"
 
 # Battery measurement. When "true", the HP core reads the battery voltage on GPIO2 (through the

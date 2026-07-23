@@ -13,6 +13,8 @@ and network settings go in `secrets.yaml` (gitignored; see
 calibration offsets, publish cadence, heater schedule, battery-ADC setup — goes in
 [device_config.yaml](device_config.yaml) (see
 [device_config.yaml.example](device_config.yaml.example) for the documented key reference).
+Several of those same values (plus antenna selection) can also be changed **live from Home
+Assistant, without a reflash** — see "Runtime-tunable parameters over MQTT" below.
 
 ## MQTT transport
 
@@ -115,6 +117,44 @@ contract. The flash layout is two 1984 K app slots (`ota_0`/`ota_1` + `otadata`,
 [partitions.csv](partitions.csv)); migrating a device from the old single-`factory` layout
 requires one final USB flash. `tools/ota_push.py --clear` removes the retained image from the
 broker once every device is updated (harmless to leave; it is ~1.8 MB of broker storage).
+
+## Runtime-tunable parameters over MQTT
+
+A subset of `device_config.yaml`'s calibration/threshold/schedule keys, plus antenna
+selection, can be changed from Home Assistant **without rebuilding or reflashing**. HA exposes
+each as a `number` or `switch` entity (filed under the device's "Configuration" section); the
+device applies an accepted change **live, with no reboot**, and persists it to NVS so it
+survives a power cycle.
+
+| HA entity | Same key as in `device_config.yaml` | Range |
+|---|---|---|
+| Temperature offset | `temp_offset` | −10 .. 10 °C |
+| Temperature min change | `temp_min_change` | 0.05 .. 5 °C |
+| Humidity offset | `rh_offset` | −20 .. 20 % |
+| Humidity min change | `rh_min_change` | 0.5 .. 20 % |
+| Max skip cycles | `max_skip_cycles` | 0 .. 1000 |
+| Heater period | `heater_period_minutes` | 0 .. 10080 min |
+| Heater high-RH trigger | `heater_high_rh_trigger_minutes` | 0 .. 1440 min |
+| External antenna | *(no YAML key — HA/NVS only)* | on/off |
+
+Each entity is backed by one retained MQTT topic, `<device_id>/cfg/<name>` (see
+[runtime_config.h](main/runtime_config.h) for the exact contract), which the device subscribes
+to as a single `<device_id>/cfg/#` wildcard each wake — same "retained command a sleepy device
+can't miss" idiom the OTA `install` topic uses above. `state_topic` and `command_topic` are the
+same topic: HA publishes a new value there (retained), and after validating/clamping it the
+device applies it and republishes its own retained echo of the value actually in effect, so
+HA's display always matches reality, not just what was requested.
+
+The first 7 rows go straight into the LP core's shared-memory config block (the same one
+`lp_sensor_core_init()` populates at boot from `device_config.yaml`) and take effect on the LP
+core's very next wake. The external antenna switch is a GPIO-level analog RF-switch selection
+([common_utils.h](main/common_utils.h)'s `enableExtAntenna()`) — also applied immediately, no
+reboot, since the switch is transparent to everything above the radio's physical layer.
+
+Precedence at boot is **NVS override (if HA has ever set one) → `device_config.yaml` → compiled
+default** — editing `device_config.yaml` still works exactly as before for a device that has
+never received an MQTT override; once HA sets a value, it wins until HA (or an NVS erase)
+changes it again.
 
 ## Recovery: when the device reboots, and what survives a blackout
 

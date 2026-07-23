@@ -36,6 +36,16 @@ esp_err_t lp_sensor_core_init(const lp_sensor_core_config_t *config);
 // return value.
 esp_err_t lp_sensor_core_start(uint32_t poll_interval_us);
 
+// Live (post-start) re-application of the config block (calibration offsets, change
+// thresholds, skip budget, heater schedule) -- the HA-tunable subset written by
+// main/runtime_config.cpp after an accepted MQTT change. Unlike lp_sensor_core_init()'s
+// one-time pre-timer-start write, this can be called at any time after lp_sensor_core_start()
+// while the LP core is running its own cycle concurrently. See shared_layout.h's doc comment
+// on the HP->LP config block for why a plain multi-field write (no seqlock) is safe here.
+// Safe to call from any HP-side task at any time; takes effect on the LP core's NEXT wake (it
+// re-reads these fields fresh at the top of every cycle -- see lp_core/main.cpp).
+void lp_sensor_core_apply_config(const lp_sensor_core_config_t *config);
+
 // Torn-read-safe snapshot of the LP program's shared state (seqlock retry internally --
 // see shared_layout.h). Safe to call from any HP-side task at any time.
 void lp_sensor_core_get_state(lp_shared_state_t *out);

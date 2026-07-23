@@ -105,6 +105,22 @@ esp_err_t lp_sensor_core_start(uint32_t poll_interval_us)
     return ulp_lp_core_run(&cfg);
 }
 
+void lp_sensor_core_apply_config(const lp_sensor_core_config_t *config)
+{
+    // Plain field-by-field write, deliberately NOT a seqlock -- see shared_layout.h's comment
+    // on the HP->LP config block for the full reasoning. volatile so the compiler can't
+    // reorder/elide these stores relative to the LP core's own asynchronous reads, matching
+    // lp_sensor_core_ack_delivered()'s convention.
+    volatile lp_shared_state_t *shared = (volatile lp_shared_state_t *)ulp_g_shared;
+    shared->temp_offset_c = config->temp_offset_c;
+    shared->temp_min_change_c = config->temp_min_change_c;
+    shared->rh_offset_pct = config->rh_offset_pct;
+    shared->rh_min_change_pct = config->rh_min_change_pct;
+    shared->max_skip_cycles = config->max_skip_cycles;
+    shared->heater_period_cycles = config->heater_period_cycles;
+    shared->high_rh_trigger_cycles = config->high_rh_trigger_cycles;
+}
+
 void lp_sensor_core_get_state(lp_shared_state_t *out)
 {
     // ulp_g_shared is generated as a flat uint32_t[] blob; reinterpret its address as
