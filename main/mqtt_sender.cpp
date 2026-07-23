@@ -174,6 +174,13 @@ static constexpr std::string_view UPDATE_DISCOVERY_FMT =
 // runtime_config.cpp republishes a retained echo of the applied value on that same topic. No
 // value_template: bare scalar payload, not JSON.
 static constexpr std::string_view CMD_PART_CONFIG_CAT = "\"entity_category\":\"config\",";
+// HA `number` only: forces the plain type-a-value box regardless of range/step. Omitting this
+// leaves HA's own "auto" mode in charge, which picks slider vs. box purely from
+// (max-min)/step -- an accidental, range-dependent choice (it put the four fine-step
+// calibration/threshold entities on sliders while the coarser schedule entities landed on
+// boxes) rather than a deliberate one. A box is more usable for typing an exact calibration
+// value than dragging a slider, for all 7 number entities uniformly.
+static constexpr std::string_view CMD_PART_MODE_BOX = "\"mode\":\"box\",";
 static constexpr std::string_view CMD_PART_MINMAXSTEP = "\"min\":{},\"max\":{},\"step\":{},";
 static constexpr std::string_view CMD_PART_PAYLOADS    = "\"payload_on\":\"{}\",\"payload_off\":\"{}\",";
 static constexpr std::string_view CMD_PART_TAIL =
@@ -333,17 +340,18 @@ static constexpr size_t UPDATE_DISCOVERY_PAYLOAD_BUF = UPDATE_DISCOVERY_FMT.size
     + MAX_SW_VERSION_LEN + MAX_SERIAL_LEN + 1;  // +1 NUL
 
 // Shared bound for both publish_number_discovery() and publish_switch_discovery(): built from
-// DISC_PART_HEAD (name) + CMD_PART_CONFIG_CAT (no args) + CMD_PART_MINMAXSTEP (min/max/step,
-// number only) + DISC_PART_UNIT (unit, number only) + CMD_PART_PAYLOADS (payload_on/off,
-// switch only) + CMD_PART_TAIL (state_topic, command_topic, unique_id, device block) --
-// device_id is substituted 2x in CMD_PART_TAIL (unique_id, device.identifiers) and slug 1x
-// (unique_id only), same "verify against the actual argument list" discipline as
-// DISCOVERY_PAYLOAD_BUF's comment above. Summing every part's max as if all applied is a safe
-// (if slightly generous) shared bound, same lemma as DISCOVERY_PAYLOAD_BUF. min/max/step reuse
-// MAX_FORMATTED_FLOAT_LEN even for the uint32_t call sites -- a safe (if generous) bound either way.
+// DISC_PART_HEAD (name) + CMD_PART_CONFIG_CAT (no args) + CMD_PART_MODE_BOX (no args, number
+// only) + CMD_PART_MINMAXSTEP (min/max/step, number only) + DISC_PART_UNIT (unit, number only)
+// + CMD_PART_PAYLOADS (payload_on/off, switch only) + CMD_PART_TAIL (state_topic,
+// command_topic, unique_id, device block) -- device_id is substituted 2x in CMD_PART_TAIL
+// (unique_id, device.identifiers) and slug 1x (unique_id only), same "verify against the
+// actual argument list" discipline as DISCOVERY_PAYLOAD_BUF's comment above. Summing every
+// part's max as if all applied is a safe (if slightly generous) shared bound, same lemma as
+// DISCOVERY_PAYLOAD_BUF. min/max/step reuse MAX_FORMATTED_FLOAT_LEN even for the uint32_t call
+// sites -- a safe (if generous) bound either way.
 static constexpr size_t CMD_DISCOVERY_PAYLOAD_BUF = DISC_PART_HEAD.size()
-    + CMD_PART_CONFIG_CAT.size() + CMD_PART_MINMAXSTEP.size() + DISC_PART_UNIT.size()
-    + CMD_PART_PAYLOADS.size() + CMD_PART_TAIL.size()
+    + CMD_PART_CONFIG_CAT.size() + CMD_PART_MODE_BOX.size() + CMD_PART_MINMAXSTEP.size()
+    + DISC_PART_UNIT.size() + CMD_PART_PAYLOADS.size() + CMD_PART_TAIL.size()
     + MAX_CFG_NAME_LEN + 3 * MAX_FORMATTED_FLOAT_LEN + MAX_CFG_UNIT_LEN
     + (sizeof("ON") - 1) + (sizeof("OFF") - 1)
     + 2 * MAX_CFG_TOPIC_LEN + 2 * MAX_DEVICE_ID_LEN + MAX_CFG_SLUG_LEN
@@ -622,6 +630,8 @@ static void publish_number_discovery(esp_mqtt_client_handle_t client, std::strin
     size_t len = format_into(payloadBuf, DISC_PART_HEAD, name);
     if (len > 0)
         len = format_append(payloadBuf, len, CMD_PART_CONFIG_CAT);
+    if (len > 0)
+        len = format_append(payloadBuf, len, CMD_PART_MODE_BOX);
     if (len > 0)
         len = format_append(payloadBuf, len, CMD_PART_MINMAXSTEP, min, max, step);
     if (len > 0 && unit)
