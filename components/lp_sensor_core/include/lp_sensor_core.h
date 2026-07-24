@@ -11,13 +11,16 @@ extern "C" {
 #endif
 
 // Calibration/threshold config, mirroring device_config.yaml's rh_offset/rh_min_change/
-// temp_offset/temp_min_change/max_skip_cycles/heater_* keys -- written once into LP shared
-// memory by lp_sensor_core_init(), before the LP program ever runs.
+// temp_offset/temp_min_change keys directly -- written once into LP shared memory by
+// lp_sensor_core_init(), before the LP program ever runs.
 typedef struct {
     float    temp_offset_c;
     float    temp_min_change_c;
     float    rh_offset_pct;
     float    rh_min_change_pct;
+    // Skip budget in LP poll cycles. device_config.yaml expresses this as max_publish_gap_sec
+    // (wall-clock seconds); main.cpp converts using lp_poll_interval_sec (floor, not ceil --
+    // see publish_gap_sec_to_skip_cycles()).
     uint32_t max_skip_cycles;
     // Heater schedule in LP poll cycles, 0 = that mechanism disabled. device_config.yaml
     // expresses these in wall-clock minutes (heater_period_minutes /

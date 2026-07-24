@@ -18,17 +18,25 @@ temp_offset: "0.0"
 
 # Publish cadence. The LP core reads the sensor every lp_poll_interval_sec and publishes a
 # value whose change since the last delivered one is at least temp_min_change degC or
-# rh_min_change %RH; an unchanged value is skipped at most max_skip_cycles polls, so a
-# publish is guaranteed at latest every (max_skip_cycles + 1) x lp_poll_interval_sec.
-# Everything else is derived from this pair: the HP safeguard wake timeout is
-# (max_skip_cycles + 3) x lp_poll_interval_sec and Home Assistant's expire_after is twice
-# that -- nothing needs retuning when these values change.
+# rh_min_change %RH; an unchanged value is otherwise held back until max_publish_gap_sec has
+# elapsed since the last delivered publish, at which point it's forced through anyway. Everything
+# else is derived from this pair: the HP safeguard wake timeout is max_publish_gap_sec plus 2 more
+# polls (lp_poll_interval_sec) and Home Assistant's expire_after is twice that -- nothing needs
+# retuning when these values change.
+# Because the LP core only samples every lp_poll_interval_sec, max_publish_gap_sec is rounded
+# DOWN to the nearest whole multiple of it internally -- so the actual gap between forced
+# publishes may be up to almost one lp_poll_interval_sec SHORTER than requested, never longer.
+# A value at or below lp_poll_interval_sec collapses to "publish every cycle", the finest
+# cadence achievable. The MQTT/HA display always shows the raw seconds value you set, not the
+# rounded internal one -- same "display what was asked for" behavior as this file's
+# heater_period_minutes/heater_high_rh_trigger_minutes below (those round UP instead, since
+# overshooting a heater period is the safe direction, unlike a publish-staleness bound).
 # MQTT tunable: <device_id>/cfg/temp_min_change
 temp_min_change: "0.2"
 # MQTT tunable: <device_id>/cfg/rh_min_change
 rh_min_change: "2.0"
-# MQTT tunable: <device_id>/cfg/max_skip_cycles
-max_skip_cycles: "10"
+# MQTT tunable: <device_id>/cfg/max_publish_gap_sec
+max_publish_gap_sec: "300"
 # Not MQTT tunable (would need re-arming the LP hardware timer live -- deferred).
 lp_poll_interval_sec: "20"
 

@@ -122,9 +122,11 @@ struct SensorsTaskSettings
     /// HP sets no publish cadence of its own — see SensorsTask::safeguardWakeSec() for the
     /// only timeout it applies.
     uint32_t lpPollIntervalSec = 20;
-    /// LP's skip budget (device_config.yaml's max_skip_cycles): an unchanged value may be
-    /// skipped at most this many LP polls before LP flags it anyway, so a publish is
-    /// guaranteed at latest every (this + 1) × lpPollIntervalSec after the last ACKed one.
+    /// LP's skip budget, derived in main.cpp from device_config.yaml's max_publish_gap_sec
+    /// (wall-clock seconds, floored to whole polls -- see publish_gap_sec_to_skip_cycles()):
+    /// an unchanged value may be skipped at most this many LP polls before LP flags it anyway,
+    /// so a publish is guaranteed at latest every (this + 1) × lpPollIntervalSec after the last
+    /// ACKed one.
     uint32_t maxSkipCycles = 0;
     /// should HP core read battery voltage via the ADC GPIO pin right before each publish
     bool readVoltageViaAdc = false;

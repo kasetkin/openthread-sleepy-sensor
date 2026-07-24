@@ -22,7 +22,7 @@ static std::string s_topic_temp_offset;
 static std::string s_topic_temp_min_change;
 static std::string s_topic_rh_offset;
 static std::string s_topic_rh_min_change;
-static std::string s_topic_max_skip_cycles;
+static std::string s_topic_max_publish_gap_sec;
 static std::string s_topic_heater_period_minutes;
 static std::string s_topic_heater_high_rh_trigger_minutes;
 static std::string s_topic_ext_antenna;
@@ -34,10 +34,12 @@ static uint32_t s_poll_interval_sec = 20;
 // other fields' current values, not stale defaults.
 static lp_sensor_core_config_t s_shadow{};
 
-// The 3 of the 8 HA-tunable parameters NOT already trackable from s_shadow in HA-facing units:
-// the heater fields live in s_shadow as LP cycles (not the minutes HA displays), and antenna
-// selection isn't part of s_shadow at all. Seeded at init, updated in apply_pending() alongside
-// the existing shadow/NVS/echo updates for these fields -- backs runtime_config_current_values().
+// The 4 of the 8 HA-tunable parameters NOT already trackable from s_shadow in HA-facing units:
+// the heater fields and max_publish_gap_sec live in s_shadow as LP cycles (not the minutes/
+// seconds HA displays), and antenna selection isn't part of s_shadow at all. Seeded at init,
+// updated in apply_pending() alongside the existing shadow/NVS/echo updates for these fields --
+// backs runtime_config_current_values().
+static uint32_t s_max_publish_gap_sec = 0;
 static uint32_t s_heater_period_minutes = 0;
 static uint32_t s_heater_high_rh_trigger_minutes = 0;
 static bool s_ext_antenna_on = false;
@@ -51,7 +53,7 @@ struct PendingCfg
     bool temp_min_change_set = false;
     bool rh_offset_set = false;
     bool rh_min_change_set = false;
-    bool max_skip_cycles_set = false;
+    bool max_publish_gap_sec_set = false;
     bool heater_period_set = false;
     bool heater_high_rh_set = false;
     bool ext_antenna_set = false;
@@ -60,7 +62,7 @@ struct PendingCfg
     float temp_min_change_c = 0.0f;
     float rh_offset_pct = 0.0f;
     float rh_min_change_pct = 0.0f;
-    uint32_t max_skip_cycles = 0;
+    uint32_t max_publish_gap_sec = 0;
     uint32_t heater_period_minutes = 0;
     uint32_t heater_high_rh_trigger_minutes = 0;
     bool ext_antenna_on = false;
@@ -97,15 +99,32 @@ static uint32_t minutes_to_lp_cycles(uint32_t minutes, uint32_t poll_sec)
     return (minutes * 60u + poll_sec - 1) / poll_sec;
 }
 
+// HA expresses the guaranteed max publish gap in wall-clock seconds; the LP program counts
+// skipped polls. Floors (unlike minutes_to_lp_cycles above) so the actual guarantee
+// (result+1)*poll_sec never exceeds what was requested -- ceiling here would let the real gap
+// overshoot the promise by almost a full poll period, which is the wrong direction for a
+// staleness bound (unlike the heater schedule, where overshooting is the safe direction). A
+// request at or below one poll period is the finest granularity achievable (LP only samples
+// every poll_sec) and maps to 0 -- publish every cycle, same as this field's old "0 = fail-safe"
+// meaning. Mirrors main.cpp's copy of this same helper -- keep the two in sync if either changes.
+static uint32_t publish_gap_sec_to_skip_cycles(uint32_t gap_sec, uint32_t poll_sec)
+{
+    if (gap_sec <= poll_sec)
+        return 0;
+    return gap_sec / poll_sec - 1;
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
                           const lp_sensor_core_config_t &boot_config,
+                          uint32_t max_publish_gap_sec,
                           uint32_t heater_period_minutes, uint32_t heater_high_rh_trigger_minutes,
                           bool ext_antenna_on)
 {
     s_poll_interval_sec = poll_interval_sec;
     s_shadow = boot_config;
+    s_max_publish_gap_sec = max_publish_gap_sec;
     s_heater_period_minutes = heater_period_minutes;
     s_heater_high_rh_trigger_minutes = heater_high_rh_trigger_minutes;
     s_ext_antenna_on = ext_antenna_on;
@@ -118,7 +137,7 @@ void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
     s_topic_temp_min_change                = full(CFG_SUFFIX_TEMP_MIN_CHANGE);
     s_topic_rh_offset                      = full(CFG_SUFFIX_RH_OFFSET);
     s_topic_rh_min_change                  = full(CFG_SUFFIX_RH_MIN_CHANGE);
-    s_topic_max_skip_cycles                = full(CFG_SUFFIX_MAX_SKIP_CYCLES);
+    s_topic_max_publish_gap_sec             = full(CFG_SUFFIX_MAX_PUBLISH_GAP_SEC);
     s_topic_heater_period_minutes          = full(CFG_SUFFIX_HEATER_PERIOD_MIN);
     s_topic_heater_high_rh_trigger_minutes = full(CFG_SUFFIX_HEATER_HIGH_RH_MIN);
     s_topic_ext_antenna                    = full(CFG_SUFFIX_EXT_ANTENNA);
@@ -132,7 +151,7 @@ const char *runtime_config_topic_temp_offset()                    { return s_top
 const char *runtime_config_topic_temp_min_change()                { return s_topic_temp_min_change.c_str(); }
 const char *runtime_config_topic_rh_offset()                      { return s_topic_rh_offset.c_str(); }
 const char *runtime_config_topic_rh_min_change()                  { return s_topic_rh_min_change.c_str(); }
-const char *runtime_config_topic_max_skip_cycles()                { return s_topic_max_skip_cycles.c_str(); }
+const char *runtime_config_topic_max_publish_gap_sec()            { return s_topic_max_publish_gap_sec.c_str(); }
 const char *runtime_config_topic_heater_period_minutes()          { return s_topic_heater_period_minutes.c_str(); }
 const char *runtime_config_topic_heater_high_rh_trigger_minutes() { return s_topic_heater_high_rh_trigger_minutes.c_str(); }
 const char *runtime_config_topic_ext_antenna()                    { return s_topic_ext_antenna.c_str(); }
@@ -179,14 +198,14 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         s_pending.rh_min_change_pct = v;
         s_pending.rh_min_change_set = true;
         xSemaphoreGive(s_mutex);
-    } else if (topic_is(topic, topic_len, s_topic_max_skip_cycles)) {
+    } else if (topic_is(topic, topic_len, s_topic_max_publish_gap_sec)) {
         uint32_t v;
         if (!parse_uint32(data, data_len, v))
             return;
-        v = std::clamp(v, MAX_SKIP_CYCLES_MIN, MAX_SKIP_CYCLES_MAX);
+        v = std::clamp(v, MAX_PUBLISH_GAP_SEC_MIN, MAX_PUBLISH_GAP_SEC_MAX);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        s_pending.max_skip_cycles = v;
-        s_pending.max_skip_cycles_set = true;
+        s_pending.max_publish_gap_sec = v;
+        s_pending.max_publish_gap_sec_set = true;
         xSemaphoreGive(s_mutex);
     } else if (topic_is(topic, topic_len, s_topic_heater_period_minutes)) {
         uint32_t v;
@@ -240,7 +259,12 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
     if (snap.temp_min_change_set)  { s_shadow.temp_min_change_c = snap.temp_min_change_c; lpChanged = true; ++applied; }
     if (snap.rh_offset_set)        { s_shadow.rh_offset_pct = snap.rh_offset_pct; lpChanged = true; ++applied; }
     if (snap.rh_min_change_set)    { s_shadow.rh_min_change_pct = snap.rh_min_change_pct; lpChanged = true; ++applied; }
-    if (snap.max_skip_cycles_set)  { s_shadow.max_skip_cycles = snap.max_skip_cycles; lpChanged = true; ++applied; }
+    if (snap.max_publish_gap_sec_set) {
+        s_shadow.max_skip_cycles = publish_gap_sec_to_skip_cycles(snap.max_publish_gap_sec, s_poll_interval_sec);
+        s_max_publish_gap_sec = snap.max_publish_gap_sec;
+        lpChanged = true;
+        ++applied;
+    }
     if (snap.heater_period_set) {
         s_shadow.heater_period_cycles = minutes_to_lp_cycles(snap.heater_period_minutes, s_poll_interval_sec);
         s_heater_period_minutes = snap.heater_period_minutes;
@@ -266,8 +290,10 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
         return 0;
 
     // Persist whichever fields changed. Floats have no native NVS type -- raw 4-byte blob,
-    // simpler than a string round-trip. Heater fields are stored in MINUTES (the HA-facing
-    // unit), not pre-converted LP cycles, so they stay independent of lp_poll_interval_sec.
+    // simpler than a string round-trip. Heater fields and max_publish_gap_sec are stored in
+    // their HA-facing units (minutes/seconds), not pre-converted LP cycles, so a later
+    // lp_poll_interval_sec change (a reflash, since it's boot-only) re-derives the right cycle
+    // count instead of replaying a now-stale one.
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         if (snap.temp_offset_set)
@@ -278,8 +304,8 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
             nvs_set_blob(nvs, "rh_offset", &snap.rh_offset_pct, sizeof(float));
         if (snap.rh_min_change_set)
             nvs_set_blob(nvs, "rh_min_change", &snap.rh_min_change_pct, sizeof(float));
-        if (snap.max_skip_cycles_set)
-            nvs_set_u32(nvs, "max_skip_cycles", snap.max_skip_cycles);
+        if (snap.max_publish_gap_sec_set)
+            nvs_set_u32(nvs, "max_pub_gap_s", snap.max_publish_gap_sec);
         if (snap.heater_period_set)
             nvs_set_u32(nvs, "htr_period_min", snap.heater_period_minutes);
         if (snap.heater_high_rh_set)
@@ -306,7 +332,7 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
         if (snap.temp_min_change_set) { appendNum(val, snap.temp_min_change_c); echo(s_topic_temp_min_change.c_str()); }
         if (snap.rh_offset_set)       { appendNum(val, snap.rh_offset_pct); echo(s_topic_rh_offset.c_str()); }
         if (snap.rh_min_change_set)   { appendNum(val, snap.rh_min_change_pct); echo(s_topic_rh_min_change.c_str()); }
-        if (snap.max_skip_cycles_set) { appendNum(val, snap.max_skip_cycles); echo(s_topic_max_skip_cycles.c_str()); }
+        if (snap.max_publish_gap_sec_set) { appendNum(val, snap.max_publish_gap_sec); echo(s_topic_max_publish_gap_sec.c_str()); }
         if (snap.heater_period_set)   { appendNum(val, snap.heater_period_minutes); echo(s_topic_heater_period_minutes.c_str()); }
         if (snap.heater_high_rh_set)  { appendNum(val, snap.heater_high_rh_trigger_minutes); echo(s_topic_heater_high_rh_trigger_minutes.c_str()); }
         if (snap.ext_antenna_set)     { val = snap.ext_antenna_on ? "ON" : "OFF"; echo(s_topic_ext_antenna.c_str()); }
@@ -369,7 +395,7 @@ RuntimeConfigValues runtime_config_current_values()
         .temp_min_change_c = s_shadow.temp_min_change_c,
         .rh_offset_pct = s_shadow.rh_offset_pct,
         .rh_min_change_pct = s_shadow.rh_min_change_pct,
-        .max_skip_cycles = s_shadow.max_skip_cycles,
+        .max_publish_gap_sec = s_max_publish_gap_sec,
         .heater_period_minutes = s_heater_period_minutes,
         .heater_high_rh_trigger_minutes = s_heater_high_rh_trigger_minutes,
         .ext_antenna_on = s_ext_antenna_on,

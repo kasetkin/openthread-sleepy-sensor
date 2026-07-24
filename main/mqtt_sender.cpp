@@ -294,11 +294,11 @@ static constexpr size_t MAX_BACKFILL_TOPIC_LEN = BACKFILL_TOPIC_FMT.size() + MAX
 // Longest HA entity `name` among the 7 `number` + 1 `switch` config entities (see the
 // publish_number_discoveries()/publish_switch_discovery() call sites below).
 static constexpr size_t MAX_CFG_NAME_LEN = std::max({sizeof("Temperature offset"), sizeof("Temperature min change"),
-    sizeof("Humidity offset"), sizeof("Humidity min change"), sizeof("Max skip cycles"),
+    sizeof("Humidity offset"), sizeof("Humidity min change"), sizeof("Max publish gap"),
     sizeof("Heater period"), sizeof("Heater high-RH trigger"), sizeof("External antenna")}) - 1;
 // Longest of the 8 cfg/* topic suffixes (runtime_config.h).
 static constexpr size_t MAX_CFG_SUFFIX_LEN = std::max({CFG_SUFFIX_TEMP_OFFSET.size(), CFG_SUFFIX_TEMP_MIN_CHANGE.size(),
-    CFG_SUFFIX_RH_OFFSET.size(), CFG_SUFFIX_RH_MIN_CHANGE.size(), CFG_SUFFIX_MAX_SKIP_CYCLES.size(),
+    CFG_SUFFIX_RH_OFFSET.size(), CFG_SUFFIX_RH_MIN_CHANGE.size(), CFG_SUFFIX_MAX_PUBLISH_GAP_SEC.size(),
     CFG_SUFFIX_HEATER_PERIOD_MIN.size(), CFG_SUFFIX_HEATER_HIGH_RH_MIN.size(), CFG_SUFFIX_EXT_ANTENNA.size()});
 // Full "<device_id>/cfg/<suffix>" topic, interpolated 2x into CMD_PART_TAIL (state + command).
 static constexpr size_t MAX_CFG_TOPIC_LEN = MAX_DEVICE_ID_LEN + 1 /* '/' */ + MAX_CFG_SUFFIX_LEN;
@@ -613,7 +613,7 @@ static void publish_update_discovery(esp_mqtt_client_handle_t client, std::strin
 // threshold/schedule parameters). Templated on T (float for the 4 calibration/threshold
 // entities, uint32_t for the other 3) so min/max/step format exactly, matching each entity's
 // real type. `topic` serves as BOTH state_topic and command_topic (see CMD_PART_TAIL's doc
-// comment); unit may be nullptr for a unit-less entity (max_skip_cycles). Also publishes
+// comment); unit may be nullptr for a unit-less entity (none currently, but supported). Also publishes
 // `current_value` retained on `topic` right after the discovery config -- same "config + state
 // together" shape as publish_update_discovery()'s discovery+installed-version pair -- so HA
 // shows a real value immediately instead of "Unknown" until the entity is first commanded.
@@ -660,6 +660,22 @@ static void publish_number_discovery(esp_mqtt_client_handle_t client, std::strin
                                 static_cast<int>(ptr - valBuf.data()), 1, 1);
 }
 
+// Retires the pre-rename "Max skip cycles" HA entity (device_config.yaml's `max_skip_cycles`,
+// an LP-cycle count, became `max_publish_gap_sec`, wall-clock seconds -- a deliberate rename,
+// not a reinterpretation, precisely so an old NVS/retained value is never silently misread in
+// the wrong unit). Publishing an empty retained payload to its old discovery topic is MQTT
+// discovery's standard removal convention, so HA drops the stale entity instead of showing it
+// permanently "unavailable". Safe to publish every discovery cycle indefinitely -- idempotent
+// and negligible cost -- so no one-shot guard is needed.
+static void retire_old_max_skip_cycles_discovery(esp_mqtt_client_handle_t client, std::string_view device_id)
+{
+    std::array<char, TOPIC_BUF> topicBuf;
+    const size_t topicLen = format_into(topicBuf, NUMBER_DISCOVERY_TOPIC_FMT, device_id, "max_skip_cycles");
+    if (topicLen == 0)
+        return;  // format_into() already logged the truncation
+    esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 1, 1);
+}
+
 // Issues all 7 publish_number_discovery() calls -- the ONE place these entities' HA-visible
 // names/units/ranges are decided; ranges come straight from runtime_config.h so the clamp
 // applied on the device side can never drift from what HA's UI advertises. Current values come
@@ -681,15 +697,17 @@ static void publish_number_discoveries(esp_mqtt_client_handle_t client, std::str
     publish_number_discovery(client, device_id, device_name, "Humidity min change", "rh_min_change",
         runtime_config_topic_rh_min_change(), RH_MIN_CHANGE_MIN, RH_MIN_CHANGE_MAX, RH_MIN_CHANGE_STEP, "%",
         cur.rh_min_change_pct);
-    publish_number_discovery(client, device_id, device_name, "Max skip cycles", "max_skip_cycles",
-        runtime_config_topic_max_skip_cycles(), MAX_SKIP_CYCLES_MIN, MAX_SKIP_CYCLES_MAX, MAX_SKIP_CYCLES_STEP,
-        nullptr, cur.max_skip_cycles);
+    publish_number_discovery(client, device_id, device_name, "Max publish gap", "max_publish_gap_sec",
+        runtime_config_topic_max_publish_gap_sec(), MAX_PUBLISH_GAP_SEC_MIN, MAX_PUBLISH_GAP_SEC_MAX,
+        MAX_PUBLISH_GAP_SEC_STEP, "s", cur.max_publish_gap_sec);
     publish_number_discovery(client, device_id, device_name, "Heater period", "heater_period_minutes",
         runtime_config_topic_heater_period_minutes(), HEATER_PERIOD_MIN_MINUTES, HEATER_PERIOD_MAX_MINUTES,
         HEATER_PERIOD_STEP_MINUTES, "min", cur.heater_period_minutes);
     publish_number_discovery(client, device_id, device_name, "Heater high-RH trigger", "heater_high_rh_trigger_minutes",
         runtime_config_topic_heater_high_rh_trigger_minutes(), HEATER_HIGH_RH_MIN_MINUTES, HEATER_HIGH_RH_MAX_MINUTES,
         HEATER_HIGH_RH_STEP_MINUTES, "min", cur.heater_high_rh_trigger_minutes);
+
+    retire_old_max_skip_cycles_discovery(client, device_id);
 }
 
 // The ext_antenna HA `switch` entity's discovery config -- same state_topic==command_topic

@@ -21,10 +21,10 @@ struct Record {
 // link time is 263,344 B; confirmed permanent task-stack overhead (sensors_task 16,384 B +
 // event/idle tasks ~3,840 B) leaves ~243 KB before OpenThread/lwIP/mbedTLS's own runtime heap
 // use, which isn't visible in that static report -- this budgets conservatively for that
-// unknown. At device_config.yaml's worst-case forced-publish cadence
-// ((max_skip_cycles+1) x lp_poll_interval_sec = 220 s today), that floors at ~21 days of outage
-// coverage, likely much more in practice since most cycles are flagged sooner than the forced
-// ceiling. A power of two so wraparound is a mask, not a modulo.
+// unknown. At device_config.yaml's worst-case forced-publish cadence (max_publish_gap_sec =
+// 300 s today), that floors at ~28 days of outage coverage, likely much more in practice since
+// most cycles are flagged sooner than the forced ceiling. A power of two so wraparound is a
+// mask, not a modulo.
 constexpr size_t CAPACITY = 8192;
 static_assert((CAPACITY & (CAPACITY - 1)) == 0, "CAPACITY must be a power of two");
 

@@ -76,8 +76,9 @@ static std::string addOTMacSuffix(std::string_view usernamePrefix)
 // device_config.yaml key rather than silently defaulting to 0 -- these two wrappers apply an
 // explicit, loud fallback at the one place (main.cpp) that owns device_config.yaml policy.
 // Defaults are chosen to fail *safe*, not fail *silent-and-low-power*: e.g. lp_poll_interval_sec
-// defaulting to 0 would turn the LP timer into a busy-loop, and max_skip_cycles defaulting to 0
-// would (correctly, if noisily) publish every cycle rather than silently drop changed readings.
+// defaulting to 0 would turn the LP timer into a busy-loop, and max_publish_gap_sec defaulting
+// to 0 would (correctly, if noisily) publish every cycle rather than silently drop changed
+// readings.
 static float parse_as_float_or(std::string_view content, std::string_view key, float def)
 {
     if (const auto v = parse_as_float(content, key))
@@ -104,6 +105,20 @@ static uint32_t minutes_to_lp_cycles(uint32_t minutes, uint32_t poll_sec)
     if (minutes == 0)
         return 0;
     return (minutes * 60u + poll_sec - 1) / poll_sec;
+}
+
+// device_config.yaml expresses the guaranteed max publish gap in wall-clock seconds; the LP
+// program counts skipped polls. Floors (unlike minutes_to_lp_cycles above) so the actual
+// guarantee (result+1)*poll_sec never exceeds what was requested -- ceiling here would let the
+// real gap overshoot the promise by almost a full poll period, the wrong direction for a
+// staleness bound. A request at or below one poll period is the finest granularity achievable
+// and maps to 0 (publish every cycle). Mirrors runtime_config.cpp's copy of this same helper --
+// keep the two in sync if either changes.
+static uint32_t publish_gap_sec_to_skip_cycles(uint32_t gap_sec, uint32_t poll_sec)
+{
+    if (gap_sec <= poll_sec)
+        return 0;
+    return gap_sec / poll_sec - 1;
 }
 
 static bool parse_as_bool_or(std::string_view content, std::string_view key, bool def)
@@ -291,9 +306,14 @@ extern "C" void app_main(void)
     // with no delay (busy-loop) -- the non-zero fallback default guards that too.
     const uint32_t lp_poll_interval_sec = parse_as_uint32_or(device_config_yaml(), "lp_poll_interval_sec",
                                                              SensorsTaskSettings{}.lpPollIntervalSec);
-    const uint32_t max_skip_cycles = runtime_config_nvs_override(
-        parse_as_uint32_or(device_config_yaml(), "max_skip_cycles", SensorsTaskSettings{}.maxSkipCycles),
-        "max_skip_cycles");
+    // 0 (not device_config.yaml's own "300" default) is the compiled fail-safe fallback here,
+    // matching this file's fail-*safe*-not-fail-silent-and-low-power policy (see the comment
+    // above parse_as_uint32_or()): a missing/malformed key publishes every cycle rather than
+    // silently assuming some "normal" cadence.
+    const uint32_t max_publish_gap_sec = runtime_config_nvs_override(
+        parse_as_uint32_or(device_config_yaml(), "max_publish_gap_sec", 0u),
+        "max_pub_gap_s");
+    const uint32_t max_skip_cycles = publish_gap_sec_to_skip_cycles(max_publish_gap_sec, lp_poll_interval_sec);
     const uint32_t boot_count = incrementBootCount();
     std::string reset_reason = resetReasonString();
     if (reset_reason.size() > MQTT_MAX_RESET_REASON_LEN)
@@ -333,9 +353,10 @@ extern "C" void app_main(void)
                                                   static_cast<float>(SensorsTaskSettings{}.batteryDividerRGndOhm)),
     };
 
-    ESP_LOGI("main", "sensor settings: lp_poll_interval_sec=%lu max_skip_cycles=%lu "
+    ESP_LOGI("main", "sensor settings: lp_poll_interval_sec=%lu max_publish_gap_sec=%lu (%lu LP cycles) "
                      "safeguard_wake_sec=%lu read_battery_via_adc=%d battery_divider=%.0f/%.0f Ohm",
              static_cast<unsigned long>(sSettings.lpPollIntervalSec),
+             static_cast<unsigned long>(max_publish_gap_sec),
              static_cast<unsigned long>(sSettings.maxSkipCycles),
              static_cast<unsigned long>(SensorsTask::safeguardWakeSec(sSettings.lpPollIntervalSec,
                                                                       sSettings.maxSkipCycles)),
@@ -389,11 +410,12 @@ extern "C" void app_main(void)
         .high_rh_trigger_cycles = minutes_to_lp_cycles(heater_high_rh_trigger_minutes, lp_poll_interval_sec),
     };
     ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, temp_offset=%.2f temp_min_change=%.2f "
-                  "rh_offset=%.2f rh_min_change=%.2f max_skip_cycles=%lu "
+                  "rh_offset=%.2f rh_min_change=%.2f max_publish_gap_sec=%lu (%lu cycles) "
                   "heater_period=%lu cycles high_rh_trigger=%lu cycles",
              static_cast<unsigned long>(lp_poll_interval_sec),
              static_cast<double>(lpConfig.temp_offset_c), static_cast<double>(lpConfig.temp_min_change_c),
              static_cast<double>(lpConfig.rh_offset_pct), static_cast<double>(lpConfig.rh_min_change_pct),
+             static_cast<unsigned long>(max_publish_gap_sec),
              static_cast<unsigned long>(lpConfig.max_skip_cycles),
              static_cast<unsigned long>(lpConfig.heater_period_cycles),
              static_cast<unsigned long>(lpConfig.high_rh_trigger_cycles));
@@ -412,7 +434,7 @@ extern "C" void app_main(void)
     // Seeds runtime_config's shadow of the 8 live-tunable fields with the boot config just
     // applied above (already NVS-override-resolved), and builds the <device_id>/cfg/* topic
     // strings HA drives via MQTT number/switch entities.
-    runtime_config_init(mqtt_name_and_id, lp_poll_interval_sec, lpConfig,
+    runtime_config_init(mqtt_name_and_id, lp_poll_interval_sec, lpConfig, max_publish_gap_sec,
                          heater_period_minutes, heater_high_rh_trigger_minutes, ext_antenna_on);
 
     xTaskCreate([](void *) static

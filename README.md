@@ -132,7 +132,7 @@ survives a power cycle.
 | Temperature min change | `temp_min_change` | 0.05 .. 5 °C |
 | Humidity offset | `rh_offset` | −20 .. 20 % |
 | Humidity min change | `rh_min_change` | 0.5 .. 20 % |
-| Max skip cycles | `max_skip_cycles` | 0 .. 1000 |
+| Max publish gap | `max_publish_gap_sec` | 0 .. 21600 s |
 | Heater period | `heater_period_minutes` | 0 .. 10080 min |
 | Heater high-RH trigger | `heater_high_rh_trigger_minutes` | 0 .. 1440 min |
 | External antenna | *(no YAML key — HA/NVS only)* | on/off |
