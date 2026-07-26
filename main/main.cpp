@@ -368,7 +368,8 @@ extern "C" void app_main(void)
     sensorTask->configureReadyEvent([](const SensorsValues &values) static
     {
         mqtt_send_sensor_data(values.envTemperature, values.envHumidity,
-                              values.batteryPercent, values.batteryVoltageMilliV);
+                              values.batteryPercent, values.batteryVoltageMilliV,
+                              values.heaterProblem, values.heaterRunCount);
     });
 
     // Gate each sensor cycle on the network link being ready (OT: Thread CHILD role) so the

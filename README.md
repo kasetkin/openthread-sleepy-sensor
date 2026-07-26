@@ -156,6 +156,12 @@ default** — editing `device_config.yaml` still works exactly as before for a d
 never received an MQTT override; once HA sets a value, it wins until HA (or an NVS erase)
 changes it again.
 
+Two read-only diagnostic entities report on the heater schedule above rather than configure
+it: **Heater problem** (a `binary_sensor`, ON if the most recent heater run's temperature
+rise never cleared its target) and **Heater run count** (a monotonically increasing counter
+of completed heater runs since boot, so HA can graph/sum activations over time). Both stay
+absent from HA until the first heater run since boot completes.
+
 ## Recovery: when the device reboots, and what survives a blackout
 
 The MQTT broker/Home Assistant is wall-powered; this device isn't, so a grid blackout takes the

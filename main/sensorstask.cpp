@@ -177,6 +177,13 @@ void SensorsTask::executeTask()
                     v.envTemperature = state.cal_temp_c;
                     v.envHumidity = state.cal_hum_pct;
 
+                    // Both absent until the LP core has ever completed a heater run --
+                    // mirrors the battery fields' "no data yet" convention below.
+                    if (state.last_heater_run_cycle != 0) {
+                        v.heaterProblem = state.last_heater_passed == 0;
+                        v.heaterRunCount = state.heater_run_count;
+                    }
+
                     // Battery is a passenger on this already-decided publish -- it is read here,
                     // and only here, so it can never wake HP or trigger a send by itself. Create ->
                     // read -> delete strictly inside this awake window: with

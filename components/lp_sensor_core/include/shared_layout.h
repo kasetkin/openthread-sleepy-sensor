@@ -102,4 +102,5 @@ typedef struct {
     uint32_t last_heater_run_cycle; // heartbeat_counter value of the most recent heater run
     float    last_heater_delta_t;   // heated - baseline, most recent run (0 until first run)
     uint32_t last_heater_passed;    // 1 if the most recent run's delta-T cleared its target
+    uint32_t heater_run_count;      // cumulative completed heater runs since boot (monotonic)
 } lp_shared_state_t;

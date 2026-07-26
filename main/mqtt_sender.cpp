@@ -53,6 +53,7 @@ enum DiscoveryBit : uint16_t {
     DISC_DIAG    = 1 << 5,  // Boot count + Reset reason pair -- boot-constant, so always available
     DISC_NUMBERS = 1 << 6,  // all 7 HA `number` entities (calibration/threshold config) -- always published together
     DISC_SWITCH  = 1 << 7,  // the ext_antenna HA `switch` entity -- boot-constant, so always available
+    DISC_HEATER  = 1 << 8,  // Heater problem + Heater run count pair -- owed once a heater run has ever completed
 };
 
 static MqttConfig s_cfg;
@@ -195,6 +196,7 @@ static constexpr std::string_view CMD_PART_TAIL =
 // The other format strings used below, named (like the DISC_PART_* strings above) so their compile-time
 // .size() can size the fixed buffers that follow instead of hand-counting characters.
 static constexpr std::string_view DISCOVERY_TOPIC_FMT = "homeassistant/sensor/{}/{}/config";
+static constexpr std::string_view BINARY_DISCOVERY_TOPIC_FMT = "homeassistant/binary_sensor/{}/{}/config";
 static constexpr std::string_view UPDATE_DISCOVERY_TOPIC_FMT = "homeassistant/update/{}/firmware/config";
 static constexpr std::string_view NUMBER_DISCOVERY_TOPIC_FMT = "homeassistant/number/{}/{}/config";
 static constexpr std::string_view SWITCH_DISCOVERY_TOPIC_FMT = "homeassistant/switch/{}/{}/config";
@@ -212,6 +214,9 @@ static constexpr std::string_view STATE_BATT_SUFFIX_FMT = ",\"b\":{},\"v\":{:.3f
 // unavailable while the rest of the device keeps reporting).
 static constexpr std::string_view STATE_RSSI_SUFFIX_FMT = ",\"r\":{}}}";
 static constexpr std::string_view STATE_DIAG_SUFFIX_FMT = ",\"bc\":{},\"rr\":\"{}\"}}";
+// Heater problem/run-count pair -- absent until the LP core has ever completed a heater run
+// (see hasHeater below), same "omit until real data exists" shape as battery/RSSI above.
+static constexpr std::string_view STATE_HEATER_SUFFIX_FMT = ",\"hp\":\"{}\",\"hc\":{}}}";
 
 // history_log.h backlog replay -- not part of HA discovery/state, a plain device -> broker
 // event stream an HA-side automation consumes (see README's "Blackout data buffering &
@@ -245,25 +250,28 @@ static constexpr int    BACKFILL_MAX_BATCHES_PER_CYCLE = 5;
 // to one of the format strings above.
 static constexpr size_t MAX_DEVICE_ID_LEN   = MQTT_MAX_DEVICE_ID_LEN;    // mqtt_sender.h
 static constexpr size_t MAX_DEVICE_NAME_LEN = MQTT_MAX_DEVICE_NAME_LEN;  // mqtt_sender.h
-// Longest of each DiscoverySpec-field literal ever passed, at the seven publish_discovery()
-// call sites below (Temperature/Humidity/Battery/Voltage/Signal strength/Boot count/Reset reason).
+// Longest of each DiscoverySpec-field literal ever passed, at the nine publish_discovery()
+// call sites below (Temperature/Humidity/Battery/Voltage/Signal strength/Boot count/Reset
+// reason/Heater problem/Heater run count).
 static constexpr size_t MAX_NAME_LEN         = std::max({sizeof("Temperature"), sizeof("Humidity"),
                                                          sizeof("Battery"), sizeof("Voltage"),
                                                          sizeof("Signal strength"), sizeof("Boot count"),
-                                                         sizeof("Reset reason")}) - 1;
+                                                         sizeof("Reset reason"), sizeof("Heater problem"),
+                                                         sizeof("Heater run count")}) - 1;
 static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max({sizeof("temperature"), sizeof("humidity"),
                                                          sizeof("battery"), sizeof("voltage"),
-                                                         sizeof("signal_strength")}) - 1;
+                                                         sizeof("signal_strength"), sizeof("problem")}) - 1;
 // The config topic's path segment -- device_class where one exists, so its lengths are a
 // superset of MAX_DEVICE_CLASS_LEN's plus the class-less sensors' made-up slugs.
 static constexpr size_t MAX_TOPIC_SLUG_LEN   = std::max({MAX_DEVICE_CLASS_LEN + 1, sizeof("rssi"),
-                                                         sizeof("boot_count"), sizeof("reset_reason")}) - 1;
+                                                         sizeof("boot_count"), sizeof("reset_reason"),
+                                                         sizeof("heater_problem"), sizeof("heater_run_count")}) - 1;
 static constexpr size_t MAX_STATE_CLASS_LEN  = std::max({sizeof("measurement"),
                                                          sizeof("total_increasing")}) - 1;
 static constexpr size_t MAX_UNIT_LEN         = std::max({sizeof("°C"), sizeof("%"), sizeof("V"),
                                                          sizeof("dBm")}) - 1;
-static constexpr size_t MAX_KEY_LEN          = std::max({sizeof("t"), sizeof("bc"),
-                                                         sizeof("rr")}) - 1;  // h/b/v/r are 1 char
+static constexpr size_t MAX_KEY_LEN          = std::max({sizeof("t"), sizeof("bc"), sizeof("rr"),
+                                                         sizeof("hp"), sizeof("hc")}) - 1;  // h/b/v/r are 1 char
 static constexpr size_t MAX_PRECISION_LEN    = 1;   // a single decimal digit at every call site
 static constexpr size_t MAX_EXPIRE_LEN       = 10;  // uint32_t seconds, at most 10 digits
 // {:.3g} (3 significant digits) always needs fewer characters than a full round-trip float --
@@ -284,8 +292,11 @@ static constexpr size_t MAX_SW_VERSION_LEN = sizeof(esp_app_desc_t::version) - 1
 // addOTMacSuffix() (main.cpp) appends to every device_id -- see serial_from_device_id().
 static constexpr size_t MAX_SERIAL_LEN = 2 * MQTT_MAC_ADDRESS_BYTES;
 
+// max() of the two component prefixes: BINARY_DISCOVERY_TOPIC_FMT ("binary_sensor") is
+// longer than DISCOVERY_TOPIC_FMT ("sensor"), and both share this one buffer.
 static constexpr size_t MAX_DISCOVERY_TOPIC_LEN =
-    DISCOVERY_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN + MAX_TOPIC_SLUG_LEN;
+    std::max(DISCOVERY_TOPIC_FMT.size(), BINARY_DISCOVERY_TOPIC_FMT.size())
+    + MAX_DEVICE_ID_LEN + MAX_TOPIC_SLUG_LEN;
 static constexpr size_t MAX_UPDATE_DISCOVERY_TOPIC_LEN =
     UPDATE_DISCOVERY_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 static constexpr size_t MAX_STATE_TOPIC_LEN = STATE_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
@@ -365,6 +376,9 @@ static constexpr size_t MAX_BATTERY_PCT_LEN = sizeof("100") - 1;
 // MAX_FORMATTED_FLOAT_LEN above rather than trusting callers.
 static constexpr size_t MAX_RSSI_LEN       = sizeof("-2147483648") - 1;
 static constexpr size_t MAX_BOOT_COUNT_LEN = 10;  // uint32_t, at most 10 digits
+static constexpr size_t MAX_HEATER_RUN_COUNT_LEN = 10;  // uint32_t, at most 10 digits
+// "OFF" is the longer of the two literals STATE_HEATER_SUFFIX_FMT's "hp" field ever holds.
+static constexpr size_t MAX_ON_OFF_LEN = sizeof("OFF") - 1;
 
 // Each suffix overwrites the previous JSON's closing '}' (net -1), so simply adding every
 // suffix's full worst-case length on top of the base keeps this a safe upper bound per the
@@ -376,6 +390,7 @@ static constexpr size_t STATE_BUF = std::max({
 }) + STATE_BATT_SUFFIX_FMT.size() + MAX_BATTERY_PCT_LEN + MAX_FORMATTED_FLOAT_LEN
    + STATE_RSSI_SUFFIX_FMT.size() + MAX_RSSI_LEN
    + STATE_DIAG_SUFFIX_FMT.size() + MAX_BOOT_COUNT_LEN + MQTT_MAX_RESET_REASON_LEN
+   + STATE_HEATER_SUFFIX_FMT.size() + MAX_ON_OFF_LEN + MAX_HEATER_RUN_COUNT_LEN
    + 1;  // +1 NUL
 
 // Same lemma, applied to one backfill array: BACKFILL_ENTRY_REST_FMT (the wider of the two --
@@ -545,18 +560,15 @@ static std::string_view serial_from_device_id(std::string_view device_id)
         ? device_id.substr(device_id.size() - MAX_SERIAL_LEN) : device_id;
 }
 
-// Builds and publishes one HA MQTT-discovery config message by chaining the DISC_PART_*
-// strings into a fixed-size stack buffer (see format_into()'s doc comment), appending only
-// the parts `spec` asks for. expire_after rides on every sensor entity from
-// MqttConfig::expire_after_sec (0 omits it) rather than from the spec: it's a device-level
-// liveness property, not a per-entity one.
-static void publish_discovery(esp_mqtt_client_handle_t client, std::string_view device_id,
-                               std::string_view device_name, const DiscoverySpec &spec)
+// Shared payload body for both publish_discovery() and publish_binary_discovery() below --
+// factored out because format_into()'s format-string argument must be a compile-time
+// constant (std::format_string is consteval-checked), so the two callers can't merge into
+// one function with a runtime-chosen topic format string; only the topic-building line
+// differs between them, so only that part is duplicated, not this chaining logic.
+static size_t build_discovery_payload(std::array<char, DISCOVERY_PAYLOAD_BUF> &payloadBuf,
+                                      std::string_view device_id, std::string_view device_name,
+                                      const DiscoverySpec &spec)
 {
-    std::array<char, TOPIC_BUF> topicBuf;
-    const size_t topicLen = format_into(topicBuf, DISCOVERY_TOPIC_FMT, device_id, spec.topic_slug);
-
-    std::array<char, DISCOVERY_PAYLOAD_BUF> payloadBuf;
     size_t len = format_into(payloadBuf, DISC_PART_HEAD, spec.name);
     if (len > 0 && spec.device_class)
         len = format_append(payloadBuf, len, DISC_PART_DEVICE_CLASS, spec.device_class);
@@ -576,6 +588,42 @@ static void publish_discovery(esp_mqtt_client_handle_t client, std::string_view 
                             device_id, spec.key,
                             device_id, device_name, esp_app_get_description()->version,
                             serial_from_device_id(device_id));
+    return len;
+}
+
+// Builds and publishes one HA `sensor` MQTT-discovery config message, chaining the
+// DISC_PART_* strings into a fixed-size stack buffer (see format_into()'s doc comment),
+// appending only the parts `spec` asks for. expire_after rides on every sensor entity from
+// MqttConfig::expire_after_sec (0 omits it) rather than from the spec: it's a device-level
+// liveness property, not a per-entity one.
+static void publish_discovery(esp_mqtt_client_handle_t client, std::string_view device_id,
+                               std::string_view device_name, const DiscoverySpec &spec)
+{
+    std::array<char, TOPIC_BUF> topicBuf;
+    const size_t topicLen = format_into(topicBuf, DISCOVERY_TOPIC_FMT, device_id, spec.topic_slug);
+
+    std::array<char, DISCOVERY_PAYLOAD_BUF> payloadBuf;
+    const size_t len = build_discovery_payload(payloadBuf, device_id, device_name, spec);
+
+    if (topicLen == 0 || len == 0)
+        return;  // format_into()/format_append() already logged the truncation
+
+    esp_mqtt_client_publish(client, topicBuf.data(), payloadBuf.data(),
+                            static_cast<int>(len), 1, 1);
+}
+
+// Same as publish_discovery() above, but files under HA's `binary_sensor` component instead
+// of `sensor` -- the payload shape is identical (HA's default payload_on/payload_off,
+// "ON"/"OFF", already match the plain {{value_json.<key>}} template as long as the state
+// JSON carries that literal string), only the discovery topic's component segment differs.
+static void publish_binary_discovery(esp_mqtt_client_handle_t client, std::string_view device_id,
+                                     std::string_view device_name, const DiscoverySpec &spec)
+{
+    std::array<char, TOPIC_BUF> topicBuf;
+    const size_t topicLen = format_into(topicBuf, BINARY_DISCOVERY_TOPIC_FMT, device_id, spec.topic_slug);
+
+    std::array<char, DISCOVERY_PAYLOAD_BUF> payloadBuf;
+    const size_t len = build_discovery_payload(payloadBuf, device_id, device_name, spec);
 
     if (topicLen == 0 || len == 0)
         return;  // format_into()/format_append() already logged the truncation
@@ -845,6 +893,8 @@ struct PublishParams
 	std::optional<float> humidity;
 	std::optional<int>   battery_percent;
 	std::optional<int>   battery_millivolts;
+	std::optional<bool>     heater_problem;
+	std::optional<uint32_t> heater_run_count;
 };
 
 // Runs one connect -> publish -> disconnect cycle and reports whether the state message was
@@ -863,6 +913,8 @@ static bool run_publish_cycle(const PublishParams &params)
     // Both-or-neither: a lone battery value (shouldn't happen -- sensorstask always sets the
     // pair) is ignored rather than published half-formed.
     const bool hasBatt = params.battery_percent.has_value() && params.battery_millivolts.has_value();
+    // Both-or-neither, same reasoning as hasBatt above -- sensorstask always sets the pair.
+    const bool hasHeater = params.heater_problem.has_value() && params.heater_run_count.has_value();
     const float temp = params.temperature.value_or(0.0f);
     const float hum  = params.humidity.value_or(0.0f);
 
@@ -934,6 +986,7 @@ static bool run_publish_cycle(const PublishParams &params)
                                                       | (hasHumid ? DISC_HUM : 0)
                                                       | (hasBatt ? DISC_BATT : 0)
                                                       | (rssi ? DISC_RSSI : 0)
+                                                      | (hasHeater ? DISC_HEATER : 0)
                                                       | DISC_DIAG
                                                       | DISC_UPDATE
                                                       | DISC_NUMBERS
@@ -946,9 +999,9 @@ static bool run_publish_cycle(const PublishParams &params)
         // two for DISC_DIAG: Boot count and Reset reason; two for DISC_UPDATE: update config
         // and installed-version; fourteen for DISC_NUMBERS, discovery config + current-value
         // state per HA `number` entity, 7 entities x 2 messages; two for DISC_SWITCH, discovery
-        // config + current-value state). A fixed count assuming every discovery is sent would
-        // leave BIT_ALL_ACKED forever unset on any cycle that sends fewer, wrongly failing the
-        // cycle.
+        // config + current-value state; two for DISC_HEATER: Heater problem and Heater run
+        // count). A fixed count assuming every discovery is sent would leave BIT_ALL_ACKED
+        // forever unset on any cycle that sends fewer, wrongly failing the cycle.
         const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
                                  + ((discoveryNeed & DISC_HUM) ? 1 : 0)
                                  + ((discoveryNeed & DISC_BATT) ? 2 : 0)
@@ -956,7 +1009,8 @@ static bool run_publish_cycle(const PublishParams &params)
                                  + ((discoveryNeed & DISC_DIAG) ? 2 : 0)
                                  + ((discoveryNeed & DISC_UPDATE) ? 2 : 0)
                                  + ((discoveryNeed & DISC_NUMBERS) ? 14 : 0)
-                                 + ((discoveryNeed & DISC_SWITCH) ? 2 : 0);
+                                 + ((discoveryNeed & DISC_SWITCH) ? 2 : 0)
+                                 + ((discoveryNeed & DISC_HEATER) ? 2 : 0);
         const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
         // Set counters BEFORE publishing so the handler never races ahead
@@ -998,6 +1052,14 @@ static bool run_publish_cycle(const PublishParams &params)
                 {.name = "Reset reason", .topic_slug = "reset_reason", .key = "rr",
                  .diagnostic = true});
         }
+        if (discoveryNeed & DISC_HEATER) {
+            publish_binary_discovery(client.get(), dev, dev_name,
+                {.name = "Heater problem", .topic_slug = "heater_problem", .device_class = "problem",
+                 .key = "hp", .diagnostic = true});
+            publish_discovery(client.get(), dev, dev_name,
+                {.name = "Heater run count", .topic_slug = "heater_run_count",
+                 .state_class = "total_increasing", .key = "hc", .diagnostic = true});
+        }
         if (discoveryNeed & DISC_UPDATE)
             publish_update_discovery(client.get(), dev, dev_name);
         if (discoveryNeed & DISC_NUMBERS)
@@ -1023,6 +1085,10 @@ static bool run_publish_cycle(const PublishParams &params)
             }
             if (stateLen > 0 && rssi)
                 stateLen = format_append(stateBuf, stateLen - 1, STATE_RSSI_SUFFIX_FMT, *rssi);
+            if (stateLen > 0 && hasHeater)
+                stateLen = format_append(stateBuf, stateLen - 1, STATE_HEATER_SUFFIX_FMT,
+                                         *params.heater_problem ? "ON" : "OFF",
+                                         *params.heater_run_count);
             // Boot count and reset reason are boot-constant, so they're re-sent on every state
             // message -- otherwise their entities would go stale-then-unavailable under
             // expire_after while the rest of the device keeps reporting.
@@ -1122,7 +1188,8 @@ void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link)
 }
 
 void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity,
-                           std::optional<int> battery_percent, std::optional<int> battery_millivolts)
+                           std::optional<int> battery_percent, std::optional<int> battery_millivolts,
+                           std::optional<bool> heater_problem, std::optional<uint32_t> heater_run_count)
 {
     if (s_task_running.exchange(true)) {
         ESP_LOGW(TAG, "previous publish cycle still running, skipping");
@@ -1133,7 +1200,8 @@ void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float
     	xEventGroupClearBits(s_idle_eg, BIT_IDLE);  // mark busy until the task exits
 
     std::unique_ptr<PublishParams> params(new PublishParams{temperature, humidity,
-                                                            battery_percent, battery_millivolts});
+                                                            battery_percent, battery_millivolts,
+                                                            heater_problem, heater_run_count});
     if (xTaskCreate(mqtt_publish_task, "mqtt_pub", 12288, params.get(), 5, nullptr) != pdPASS) {
         ESP_LOGE(TAG, "failed to create mqtt_pub task");
         s_task_running.store(false);

@@ -21,6 +21,11 @@ public:
     std::optional<float> envTemperature;
     std::optional<float> envHumidity;
     std::optional<float> barometricPressure;
+    /// Set together, gated on the LP core ever having completed a heater run (see
+    /// lp_shared_state_t::last_heater_run_cycle) -- both absent until then, same "no data
+    /// yet" convention as the battery fields below.
+    std::optional<bool> heaterProblem;      // true if the most recent run's delta-T missed its target
+    std::optional<uint32_t> heaterRunCount; // cumulative completed heater runs since boot
 
     /// 0 % / 100 % anchors for the CURRENT pack (LiitoKala NCR18650B), applied to the
     /// pack-independent BATTERY_CURVE below at conversion time; after a battery swap only these

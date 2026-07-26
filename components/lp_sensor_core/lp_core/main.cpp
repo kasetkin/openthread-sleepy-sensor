@@ -76,6 +76,13 @@ constexpr float kCooldownEpsilonC = 0.3f;         // resume once T within this o
 constexpr uint32_t kCooldownMaxMs = 240000;       // cap on cooldown wait
 constexpr uint32_t kCooldownPollMs = 2000;        // re-read interval while cooling
 
+// Temperature recovering to baseline doesn't mean RH has: the sensing polymer's moisture
+// re-absorption lags the die's (much faster) thermal recovery, so the reading right after
+// the temperature-based cooldown above can still read artificially low -- this is what
+// showed up as a visible dip-and-recover in HA history right after every heater run. Fixed
+// wait added on top of the cooldown loop, before the final reading, to let that catch up.
+constexpr uint32_t kRhSettleMs = 90000;
+
 // Same CRC-8 (poly 0x31, init 0xFF) as components/sht4x/sht4x.c's crc8() -- duplicated
 // here rather than shared because the LP core's freestanding toolchain can't link against
 // the HP-side sht4x component.
@@ -178,6 +185,10 @@ bool runHeaterMaintenance(uint8_t heaterCmd, uint32_t heaterDelayUs, float minDe
         }
     }
 
+    // Extra fixed settle time on top of the temperature-based cooldown above -- see
+    // kRhSettleMs's comment.
+    ulp_lp_core_delay_us(kRhSettleMs * 1000);
+
     // Final clean reading (fall back to the last cooldown sample if it fails).
     if (!measure(kCmdMeasureHigh, kMeasureDelayUs, cleanTemp, cleanHum)) {
         cleanTemp = t;
@@ -256,6 +267,7 @@ extern "C" int main()
                 g_shared.last_heater_run_cycle = g_shared.heartbeat_counter;
                 g_shared.last_heater_delta_t = deltaT;
                 g_shared.last_heater_passed = passed ? 1 : 0;
+                g_shared.heater_run_count++;
             } else {
                 g_shared.result_seq++; // odd: resume writing (baseline read failed -- nothing new to report)
             }
