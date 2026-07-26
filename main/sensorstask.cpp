@@ -198,7 +198,7 @@ void SensorsTask::executeTask()
                             if (const auto milliVolts = readBatteryVoltageMilliV()) {
                                 v.batteryVoltageMilliV = *milliVolts;
                                 v.batteryPercent = SensorsValues::convertVoltageToPercent(*milliVolts);
-                                ESP_LOGI(TAG, "battery: %d mV (%d%%)", *milliVolts, *v.batteryPercent);
+                                ESP_LOGI(TAG, "battery: %d mV (%.2f%%)", *milliVolts, *v.batteryPercent);
                             } else {
                                 ESP_LOGW(TAG, "battery ADC read failed (err=0x%x), publishing without battery",
                                          milliVolts.error());

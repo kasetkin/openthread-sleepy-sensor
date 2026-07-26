@@ -88,4 +88,4 @@ bool ota_session_ended_by_connection_loss();
 // after restoring the sleepy link mode; a partial download is kept and resumed on the next
 // call (same staged image only). battery_percent (when known) gates the session: below the
 // threshold the update is deferred unless the manifest carries "force":true.
-void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery_percent);
+void ota_run_session(esp_mqtt_client_handle_t client, std::optional<float> battery_percent);

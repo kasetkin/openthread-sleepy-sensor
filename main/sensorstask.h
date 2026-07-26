@@ -5,6 +5,7 @@
 #include <string_view>
 #include <functional>
 #include <cstdint>
+#include <cmath>
 #include <expected>
 #include <array>
 #include <algorithm>
@@ -17,7 +18,7 @@ struct SensorsValues
 {
 public:
     std::optional<int> batteryVoltageMilliV;
-    std::optional<int> batteryPercent;
+    std::optional<float> batteryPercent;
     std::optional<float> envTemperature;
     std::optional<float> envHumidity;
     std::optional<float> barometricPressure;
@@ -40,8 +41,8 @@ public:
     static constexpr int MIN_VOLTAGE = 3300; // mV → 0 %
     static constexpr int MAX_VOLTAGE = 4120; // mV → 100 %
 
-    static constexpr int convertVoltageToPercent(int batteryVoltageMilliV,
-                                                 int minMv = MIN_VOLTAGE, int maxMv = MAX_VOLTAGE);
+    static constexpr float convertVoltageToPercent(int batteryVoltageMilliV,
+                                                   int minMv = MIN_VOLTAGE, int maxMv = MAX_VOLTAGE);
 
 private:
     struct BatteryCurvePoint
@@ -85,39 +86,49 @@ constexpr double SensorsValues::etalonSoc(const int mv)
     return lo->pct + static_cast<double>(mv - lo->mv) * (hi->pct - lo->pct) / (hi->mv - lo->mv);
 }
 
-constexpr int SensorsValues::convertVoltageToPercent(const int batteryVoltageMilliV,
-                                                     const int minMv, const int maxMv)
+constexpr float SensorsValues::convertVoltageToPercent(const int batteryVoltageMilliV,
+                                                       const int minMv, const int maxMv)
 {
     // Misconfiguration guards rather than asserts: min/max will eventually arrive from a runtime
     // MQTT setting, so a degenerate or inverted range must degrade safely, not crash.
     if (maxMv <= minMv)
-        return 0;
+        return 0.0f;
     const double socMin = etalonSoc(minMv);
     const double socMax = etalonSoc(maxMv);
     if (socMax <= socMin)  // both anchors clamped onto the same etalon endpoint
-        return 0;
+        return 0.0f;
 
     // The etalon curve contributes only the SHAPE; the anchors set the scale (minMv → 0 %,
     // maxMv → 100 %). Inputs outside [minMv, maxMv] land outside [0, 100] and are clamped.
     const double normalized = (etalonSoc(batteryVoltageMilliV) - socMin) / (socMax - socMin) * 100.0;
-    return static_cast<int>(std::clamp(normalized, 0.0, 100.0) + 0.5);
+    const double clamped = std::clamp(normalized, 0.0, 100.0);
+    // Rounded to 2 decimal places -- HA shows this precision (see the Battery discovery config's
+    // suggested_display_precision in mqtt_sender.cpp), so anything finer is meaningless noise.
+    return static_cast<float>(std::round(clamped * 100.0) / 100.0);
 }
 
 // Compile-time unit tests: the function is pure and there is no on-target test runner, so every
-// build verifies the clamping, interpolation and anchor normalization directly.
-static_assert(SensorsValues::convertVoltageToPercent(3000) == 0);    // below min anchor -> clamped
-static_assert(SensorsValues::convertVoltageToPercent(3300) == 0);    // exact min anchor
-static_assert(SensorsValues::convertVoltageToPercent(3610) == 5);    // knee region
-static_assert(SensorsValues::convertVoltageToPercent(3840) == 55);   // plateau
-static_assert(SensorsValues::convertVoltageToPercent(4022) == 88);   // value seen in 2026-07-13 hardware log
-static_assert(SensorsValues::convertVoltageToPercent(4110) == 99);
-static_assert(SensorsValues::convertVoltageToPercent(4120) == 100);  // exact max anchor
-static_assert(SensorsValues::convertVoltageToPercent(4200) == 100);  // above max anchor -> clamped
+// build verifies the clamping, interpolation and anchor normalization directly. Curve-interpolated
+// results are checked against the ±0.5 bucket the old exact-int test used (the precise fractional
+// digits aren't worth hand-computing here); only the exact-anchor/degenerate cases -- where the
+// numerator and denominator are identical by construction and the division is exact -- assert a
+// precise value.
+static constexpr bool near(float value, float expectedInt) { return std::abs(value - expectedInt) < 0.5f; }
+static_assert(SensorsValues::convertVoltageToPercent(3000) == 0.0f);   // below min anchor -> clamped, exact
+static_assert(SensorsValues::convertVoltageToPercent(3300) == 0.0f);   // exact min anchor, exact
+static_assert(near(SensorsValues::convertVoltageToPercent(3610), 5.0f));    // knee region
+static_assert(near(SensorsValues::convertVoltageToPercent(3840), 55.0f));   // plateau
+static_assert(near(SensorsValues::convertVoltageToPercent(4022), 88.0f));   // value seen in 2026-07-13 hardware log
+static_assert(near(SensorsValues::convertVoltageToPercent(4110), 99.0f));
+static_assert(SensorsValues::convertVoltageToPercent(4120) == 100.0f);  // exact max anchor, exact
+static_assert(SensorsValues::convertVoltageToPercent(4200) == 100.0f);  // above max anchor -> clamped, exact
 // Anchor parameters: defaults wired through, custom anchors honored, degenerate range guarded.
+// Same call twice (default vs. explicit args) is bit-for-bit identical, and the two degenerate
+// cases below divide a value by itself (or hit the early guard), both exact in IEEE 754.
 static_assert(SensorsValues::convertVoltageToPercent(3840)
               == SensorsValues::convertVoltageToPercent(3840, SensorsValues::MIN_VOLTAGE, SensorsValues::MAX_VOLTAGE));
-static_assert(SensorsValues::convertVoltageToPercent(4090, 3300, 4090) == 100);
-static_assert(SensorsValues::convertVoltageToPercent(3700, 3300, 3300) == 0);
+static_assert(SensorsValues::convertVoltageToPercent(4090, 3300, 4090) == 100.0f);
+static_assert(SensorsValues::convertVoltageToPercent(3700, 3300, 3300) == 0.0f);
 
 struct SensorsTaskSettings
 {

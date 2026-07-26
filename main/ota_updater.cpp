@@ -352,7 +352,7 @@ bool ota_session_ended_by_connection_loss()
     return s_conn_lost.load();
 }
 
-void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery_percent)
+void ota_run_session(esp_mqtt_client_handle_t client, std::optional<float> battery_percent)
 {
     // Reset FIRST, before any early return below: mqtt_sender's in-cycle reconnect loop
     // keys off ota_session_ended_by_connection_loss(), and a stale true from the previous
@@ -370,7 +370,7 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<int> battery
 
     if (battery_percent.has_value() && *battery_percent < OTA_MIN_BATTERY_PERCENT && !manifest.force) {
         publish_status(client, std::format(
-            "{{\"state\":\"deferred\",\"reason\":\"battery {}% < {}%\"}}",
+            "{{\"state\":\"deferred\",\"reason\":\"battery {:.2f}% < {}%\"}}",
             *battery_percent, OTA_MIN_BATTERY_PERCENT));
         return;  // deliberately NOT an attempt: retried once the battery recovers
     }

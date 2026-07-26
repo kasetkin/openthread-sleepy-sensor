@@ -207,7 +207,7 @@ static constexpr std::string_view STATE_FMT_HUMID = "{{\"h\":{:.3g}}}";
 // Appended over the base state JSON's closing '}' when battery data is present (percent, then
 // volts) -- re-closes the object, so the result stays valid JSON. Kept as a suffix instead of
 // battery variants of the three STATE_FMT_* strings above: that would double them to six.
-static constexpr std::string_view STATE_BATT_SUFFIX_FMT = ",\"b\":{},\"v\":{:.3f}}}";
+static constexpr std::string_view STATE_BATT_SUFFIX_FMT = ",\"b\":{:.2f},\"v\":{:.3f}}}";
 // Same overwrite-the-'}' chaining for the diagnostic values: link RSSI in dBm (only when the
 // transport has a reading this cycle), then boot count + reset reason (boot-constant, so
 // appended on every state message -- HA's expire_after would otherwise flag the two entities
@@ -369,8 +369,9 @@ static constexpr size_t CMD_DISCOVERY_PAYLOAD_BUF = DISC_PART_HEAD.size()
     + MAX_DEVICE_NAME_LEN + MAX_SW_VERSION_LEN + MAX_SERIAL_LEN
     + 1;  // +1 NUL
 
-// convertVoltageToPercent() clamps to 0..100, so "100" is the widest "b" can ever print.
-static constexpr size_t MAX_BATTERY_PCT_LEN = sizeof("100") - 1;
+// convertVoltageToPercent() clamps to 0..100 with 2 decimal places, so "100.00" is the widest
+// "b" can ever print.
+static constexpr size_t MAX_BATTERY_PCT_LEN = sizeof("100.00") - 1;
 // RSSI arrives as int; both link implementations produce int8 dBm values, but bounding by
 // the argument's actual type (INT32_MIN is 11 chars) keeps this reasoned like
 // MAX_FORMATTED_FLOAT_LEN above rather than trusting callers.
@@ -858,7 +859,7 @@ static void replay_history_if_pending(esp_mqtt_client_handle_t client, std::stri
 // 0.5-3 min wait for the next LP-flagged publish cycle (~half the measured 17.6 min total).
 // Replaces the caller's client on reconnect; the caller's normal teardown then destroys
 // whichever client is current. On success ota_run_session() reboots and never returns.
-static void run_ota_if_due(MqttClientPtr &client, MqttCtx &ctx, std::optional<int> battery_percent)
+static void run_ota_if_due(MqttClientPtr &client, MqttCtx &ctx, std::optional<float> battery_percent)
 {
     if (!ota_update_due())
         return;
@@ -891,7 +892,7 @@ struct PublishParams
 {
 	std::optional<float> temperature;
 	std::optional<float> humidity;
-	std::optional<int>   battery_percent;
+	std::optional<float> battery_percent;
 	std::optional<int>   battery_millivolts;
 	std::optional<bool>     heater_problem;
 	std::optional<uint32_t> heater_run_count;
@@ -1032,7 +1033,7 @@ static bool run_publish_cycle(const PublishParams &params)
         if (discoveryNeed & DISC_BATT) {
             publish_discovery(client.get(), dev, dev_name,
                 {.name = "Battery", .topic_slug = "battery", .device_class = "battery",
-                 .state_class = "measurement", .unit = "%", .precision = 0, .key = "b",
+                 .state_class = "measurement", .unit = "%", .precision = 2, .key = "b",
                  .diagnostic = true});
             publish_discovery(client.get(), dev, dev_name,
                 {.name = "Voltage", .topic_slug = "voltage", .device_class = "voltage",
@@ -1188,7 +1189,7 @@ void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link)
 }
 
 void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity,
-                           std::optional<int> battery_percent, std::optional<int> battery_millivolts,
+                           std::optional<float> battery_percent, std::optional<int> battery_millivolts,
                            std::optional<bool> heater_problem, std::optional<uint32_t> heater_run_count)
 {
     if (s_task_running.exchange(true)) {

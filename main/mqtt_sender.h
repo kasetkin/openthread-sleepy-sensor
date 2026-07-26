@@ -63,7 +63,7 @@ void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link);
 // lone one is ignored; heater_problem/heater_run_count are likewise set together or not at
 // all (absent until the LP core has ever completed a heater run).
 void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity,
-                           std::optional<int> battery_percent = std::nullopt,
+                           std::optional<float> battery_percent = std::nullopt,
                            std::optional<int> battery_millivolts = std::nullopt,
                            std::optional<bool> heater_problem = std::nullopt,
                            std::optional<uint32_t> heater_run_count = std::nullopt);
