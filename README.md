@@ -262,3 +262,41 @@ fast ACK, short wake window). Idle frequency scaling is already handled by ESP-I
 Management (DFS) + automatic light sleep (`CONFIG_PM_ENABLE`, tickless idle), which drop the clock
 when idle and burst to 160 MHz only when there is work — the best of both. Confirming the choice
 on real hardware would take a coulomb-counter measurement over a full wake→publish→sleep cycle.
+
+## Radio TX power, and the instrumentation that has to come first
+
+The device has never set its 802.15.4 transmit power, so it runs at the PHY power table's
+maximum — **+20 dBm**, the loudest the part can transmit. Turning that down is the obvious
+battery lever, and the per-level cost is steeply non-linear (ESP32-C6 datasheet, Table 5-9):
+
+| TX power | Peak current | Saved vs. 20 dBm | dB of margin given up |
+|---|---|---|---|
+| **20.0 dBm (current default)** | 305 mA | — | — |
+| 12.0 dBm | 187 mA | **118 mA** | 8 |
+| 0 dBm | 119 mA | 186 mA | 20 |
+| −15.0 dBm | 92 mA | 213 mA | 35 |
+| *(RX, for reference)* | *74 mA* | | |
+
+The first 8 dB buys 55% of the total available saving; the last 15 dB buys 13%. The efficient
+knee is around **+8…+12 dBm** — dropping straight to the minimum spends 35 dB of link margin to
+buy almost nothing beyond what +12 dBm already gives.
+
+Two things make it wrong to just set it and hope:
+
+1. **The "Signal strength" entity measures the wrong direction.** It is
+   `otThreadGetParentLastRssi` — *our* receiver measuring the *border router's* transmitter — so
+   it cannot respond to our own TX power at all. The entity that can is **"Uplink signal
+   strength"**, fed by Thread 1.2 enhanced-ACK probing: the parent stamps its own measurement of
+   our frames into the ACKs it returns. That one is absent on a Thread 1.1 border router, in
+   which case "Parent link quality" (0–3) and the TX retry/CCA/no-ack counters are the fallback.
+2. **The saving cannot be predicted without knowing radio duty cycle.** What reaches the battery
+   is `ΔI_avg = ΔI_peak(P) × t_tx / cycle_period`. The **"Radio TX time"** diagnostic entity is
+   that `t_tx` term. At ~5 ms/cycle the 20→12 dBm step is worth ~2 µA (≈1% of budget — not worth
+   any link margin); at ~50 ms/cycle it is worth ~20 µA (≈10% — worth real work).
+
+Hence the diagnostic entities (Radio TX/RX time, TX retries, CCA failures, TX no-ack expiry,
+Parent link quality, Uplink signal strength), enabled by `CONFIG_OPENTHREAD_RADIO_STATS_ENABLE`
+and `CONFIG_OPENTHREAD_LINK_METRICS` and read once per publish window as per-cycle deltas. They
+change no radio behaviour; they exist so the TX-power decision can be made from measurements
+rather than guessed. Note also that `CONFIG_OPENTHREAD_PARENT_SEARCH_RSS_THRESHOLD=-65` operates
+on *downlink* RSSI and does **not** interact with our transmit power.

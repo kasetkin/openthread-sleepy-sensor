@@ -54,6 +54,16 @@ enum DiscoveryBit : uint16_t {
     DISC_NUMBERS = 1 << 6,  // all 7 HA `number` entities (calibration/threshold config) -- always published together
     DISC_SWITCH  = 1 << 7,  // the ext_antenna HA `switch` entity -- boot-constant, so always available
     DISC_HEATER  = 1 << 8,  // Heater problem + Heater run count pair -- owed once a heater run has ever completed
+    // Uplink instrumentation (LinkStats, network_link.h). Split across three bits rather than
+    // grouped into one because the three groups have genuinely different availability, and a
+    // bit whose entities can't all be fed would leave HA showing a permanently unavailable
+    // entity once expire_after lapsed: radio timings need CONFIG_OPENTHREAD_RADIO_STATS_ENABLE
+    // and a second cycle (they're deltas), the MAC/link-quality group needs an attached Thread
+    // link, and the uplink RSSI needs a border router that speaks Thread 1.2 link metrics --
+    // on a Thread 1.1 mesh, or any Wi-Fi build, DISC_UPLINK is simply never owed at all.
+    DISC_RADIO   = 1 << 9,   // Radio TX time + Radio RX time pair
+    DISC_LINKQ   = 1 << 10,  // TX retries + CCA failures + TX no-ack expiry + Parent link quality
+    DISC_UPLINK  = 1 << 11,  // Uplink signal strength (the parent's RSSI measurement of US)
 };
 
 static MqttConfig s_cfg;
@@ -217,6 +227,15 @@ static constexpr std::string_view STATE_DIAG_SUFFIX_FMT = ",\"bc\":{},\"rr\":\"{
 // Heater problem/run-count pair -- absent until the LP core has ever completed a heater run
 // (see hasHeater below), same "omit until real data exists" shape as battery/RSSI above.
 static constexpr std::string_view STATE_HEATER_SUFFIX_FMT = ",\"hp\":\"{}\",\"hc\":{}}}";
+// Uplink instrumentation, same overwrite-the-'}' chaining. All of these are PER-CYCLE values,
+// not since-boot totals (openthread_link.cpp does the differencing), which is why the counters
+// carry state_class "measurement" rather than "total_increasing" at their discovery sites.
+// Radio times are published in milliseconds though LinkStats carries microseconds: a whole
+// sleepy cycle's radio time is a few tens of ms at most, and ms keeps the HA graph readable.
+// Note "rx" for radio RX time, not the more obvious "rr" -- that key is already reset reason.
+static constexpr std::string_view STATE_RADIO_SUFFIX_FMT  = ",\"rt\":{:.2f},\"rx\":{:.2f}}}";
+static constexpr std::string_view STATE_LINKQ_SUFFIX_FMT  = ",\"tr\":{},\"cf\":{},\"nk\":{},\"lq\":{}}}";
+static constexpr std::string_view STATE_UPLINK_SUFFIX_FMT = ",\"ur\":{}}}";
 
 // history_log.h backlog replay -- not part of HA discovery/state, a plain device -> broker
 // event stream an HA-side automation consumes (see README's "Blackout data buffering &
@@ -257,7 +276,12 @@ static constexpr size_t MAX_NAME_LEN         = std::max({sizeof("Temperature"), 
                                                          sizeof("Battery"), sizeof("Voltage"),
                                                          sizeof("Signal strength"), sizeof("Boot count"),
                                                          sizeof("Reset reason"), sizeof("Heater problem"),
-                                                         sizeof("Heater run count")}) - 1;
+                                                         sizeof("Heater run count"),
+                                                         sizeof("Radio TX time"), sizeof("Radio RX time"),
+                                                         sizeof("TX retries"), sizeof("CCA failures"),
+                                                         sizeof("TX no-ack expiry"),
+                                                         sizeof("Parent link quality"),
+                                                         sizeof("Uplink signal strength")}) - 1;
 static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max({sizeof("temperature"), sizeof("humidity"),
                                                          sizeof("battery"), sizeof("voltage"),
                                                          sizeof("signal_strength"), sizeof("problem")}) - 1;
@@ -265,11 +289,16 @@ static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max({sizeof("temperature"), 
 // superset of MAX_DEVICE_CLASS_LEN's plus the class-less sensors' made-up slugs.
 static constexpr size_t MAX_TOPIC_SLUG_LEN   = std::max({MAX_DEVICE_CLASS_LEN + 1, sizeof("rssi"),
                                                          sizeof("boot_count"), sizeof("reset_reason"),
-                                                         sizeof("heater_problem"), sizeof("heater_run_count")}) - 1;
+                                                         sizeof("heater_problem"), sizeof("heater_run_count"),
+                                                         sizeof("radio_tx_time"), sizeof("radio_rx_time"),
+                                                         sizeof("tx_retries"), sizeof("cca_failures"),
+                                                         sizeof("tx_no_ack_expiry"),
+                                                         sizeof("link_quality_out"),
+                                                         sizeof("uplink_rssi")}) - 1;
 static constexpr size_t MAX_STATE_CLASS_LEN  = std::max({sizeof("measurement"),
                                                          sizeof("total_increasing")}) - 1;
 static constexpr size_t MAX_UNIT_LEN         = std::max({sizeof("°C"), sizeof("%"), sizeof("V"),
-                                                         sizeof("dBm")}) - 1;
+                                                         sizeof("dBm"), sizeof("ms")}) - 1;
 static constexpr size_t MAX_KEY_LEN          = std::max({sizeof("t"), sizeof("bc"), sizeof("rr"),
                                                          sizeof("hp"), sizeof("hc")}) - 1;  // h/b/v/r are 1 char
 static constexpr size_t MAX_PRECISION_LEN    = 1;   // a single decimal digit at every call site
@@ -378,6 +407,9 @@ static constexpr size_t MAX_BATTERY_PCT_LEN = sizeof("100.00") - 1;
 static constexpr size_t MAX_RSSI_LEN       = sizeof("-2147483648") - 1;
 static constexpr size_t MAX_BOOT_COUNT_LEN = 10;  // uint32_t, at most 10 digits
 static constexpr size_t MAX_HEATER_RUN_COUNT_LEN = 10;  // uint32_t, at most 10 digits
+// Every per-cycle LinkStats counter (radio ms, retries, CCA failures, no-ack expiries, link
+// quality) is a uint32_t, so one bound covers them all.
+static constexpr size_t MAX_LINK_COUNTER_LEN = 10;
 // "OFF" is the longer of the two literals STATE_HEATER_SUFFIX_FMT's "hp" field ever holds.
 static constexpr size_t MAX_ON_OFF_LEN = sizeof("OFF") - 1;
 
@@ -392,6 +424,9 @@ static constexpr size_t STATE_BUF = std::max({
    + STATE_RSSI_SUFFIX_FMT.size() + MAX_RSSI_LEN
    + STATE_DIAG_SUFFIX_FMT.size() + MAX_BOOT_COUNT_LEN + MQTT_MAX_RESET_REASON_LEN
    + STATE_HEATER_SUFFIX_FMT.size() + MAX_ON_OFF_LEN + MAX_HEATER_RUN_COUNT_LEN
+   + STATE_RADIO_SUFFIX_FMT.size() + 2 * MAX_FORMATTED_FLOAT_LEN
+   + STATE_LINKQ_SUFFIX_FMT.size() + 4 * MAX_LINK_COUNTER_LEN
+   + STATE_UPLINK_SUFFIX_FMT.size() + MAX_RSSI_LEN
    + 1;  // +1 NUL
 
 // Same lemma, applied to one backfill array: BACKFILL_ENTRY_REST_FMT (the wider of the two --
@@ -974,10 +1009,20 @@ static bool run_publish_cycle(const PublishParams &params)
         // neither trigger a cycle nor carry one alone.
         const bool hasAny = hasTemp || hasHumid;
 
-        // Link RSSI is read here, not passed in with the sensor values: it's transport
+        // Link telemetry is read here, not passed in with the sensor values: it's transport
         // state, and inside the publish window the radio is awake with the connect exchange
-        // just refreshed (OT: "last packet from parent" is the CONNACK's frame).
-        const std::optional<int> rssi = s_link->readRssiDbm ? s_link->readRssiDbm() : std::nullopt;
+        // just refreshed (OT: "last packet from parent" is the CONNACK's frame). Read exactly
+        // ONCE per cycle -- the counter-derived fields are per-cycle deltas, so a second call
+        // would split this cycle's radio time across the two.
+        const std::optional<LinkStats> link =
+            s_link->readLinkStats ? s_link->readLinkStats() : std::nullopt;
+        const std::optional<int> rssi = link ? link->rssiDbm : std::nullopt;
+        // Grouped exactly as the DISC_RADIO/DISC_LINKQ/DISC_UPLINK bits are, so a group is
+        // owed only when every entity in it can actually be fed this cycle.
+        const bool hasRadioStats = link && link->radioTxTimeUs && link->radioRxTimeUs;
+        const bool hasLinkQuality = link && link->txRetries && link->txCcaFailures
+                                 && link->txNoAckExpiry && link->linkQualityOut;
+        const bool hasUplinkRssi = link && link->uplinkRssiDbm;
 
         // Discovery configs still owed this boot for the values present in THIS cycle.
         // DISC_UPDATE (the HA update entity + installed-version pair) and DISC_DIAG (the
@@ -988,6 +1033,9 @@ static bool run_publish_cycle(const PublishParams &params)
                                                       | (hasBatt ? DISC_BATT : 0)
                                                       | (rssi ? DISC_RSSI : 0)
                                                       | (hasHeater ? DISC_HEATER : 0)
+                                                      | (hasRadioStats ? DISC_RADIO : 0)
+                                                      | (hasLinkQuality ? DISC_LINKQ : 0)
+                                                      | (hasUplinkRssi ? DISC_UPLINK : 0)
                                                       | DISC_DIAG
                                                       | DISC_UPDATE
                                                       | DISC_NUMBERS
@@ -1001,8 +1049,10 @@ static bool run_publish_cycle(const PublishParams &params)
         // and installed-version; fourteen for DISC_NUMBERS, discovery config + current-value
         // state per HA `number` entity, 7 entities x 2 messages; two for DISC_SWITCH, discovery
         // config + current-value state; two for DISC_HEATER: Heater problem and Heater run
-        // count). A fixed count assuming every discovery is sent would leave BIT_ALL_ACKED
-        // forever unset on any cycle that sends fewer, wrongly failing the cycle.
+        // count; two for DISC_RADIO: Radio TX time and Radio RX time; four for DISC_LINKQ: TX
+        // retries, CCA failures, TX no-ack expiry and Parent link quality; one for DISC_UPLINK:
+        // Uplink signal strength). A fixed count assuming every discovery is sent would leave
+        // BIT_ALL_ACKED forever unset on any cycle that sends fewer, wrongly failing the cycle.
         const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
                                  + ((discoveryNeed & DISC_HUM) ? 1 : 0)
                                  + ((discoveryNeed & DISC_BATT) ? 2 : 0)
@@ -1011,7 +1061,10 @@ static bool run_publish_cycle(const PublishParams &params)
                                  + ((discoveryNeed & DISC_UPDATE) ? 2 : 0)
                                  + ((discoveryNeed & DISC_NUMBERS) ? 14 : 0)
                                  + ((discoveryNeed & DISC_SWITCH) ? 2 : 0)
-                                 + ((discoveryNeed & DISC_HEATER) ? 2 : 0);
+                                 + ((discoveryNeed & DISC_HEATER) ? 2 : 0)
+                                 + ((discoveryNeed & DISC_RADIO) ? 2 : 0)
+                                 + ((discoveryNeed & DISC_LINKQ) ? 4 : 0)
+                                 + ((discoveryNeed & DISC_UPLINK) ? 1 : 0);
         const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
         // Set counters BEFORE publishing so the handler never races ahead
@@ -1061,6 +1114,43 @@ static bool run_publish_cycle(const PublishParams &params)
                 {.name = "Heater run count", .topic_slug = "heater_run_count",
                  .state_class = "total_increasing", .key = "hc", .diagnostic = true});
         }
+        // Uplink instrumentation. The counter entities are per-cycle deltas, so "measurement"
+        // and not "total_increasing" -- HA would otherwise treat each cycle's small count as a
+        // counter reset. Radio times are the ones that matter most: mean(rt) is the t_tx term
+        // in dI_avg = dI_peak * t_tx / cycle_period, which is what decides whether reducing the
+        // radio's +20 dBm default TX power is worth any link margin at all.
+        if (discoveryNeed & DISC_RADIO) {
+            publish_discovery(client.get(), dev, dev_name,
+                {.name = "Radio TX time", .topic_slug = "radio_tx_time",
+                 .state_class = "measurement", .unit = "ms", .precision = 1, .key = "rt",
+                 .diagnostic = true});
+            publish_discovery(client.get(), dev, dev_name,
+                {.name = "Radio RX time", .topic_slug = "radio_rx_time",
+                 .state_class = "measurement", .unit = "ms", .precision = 1, .key = "rx",
+                 .diagnostic = true});
+        }
+        if (discoveryNeed & DISC_LINKQ) {
+            publish_discovery(client.get(), dev, dev_name,
+                {.name = "TX retries", .topic_slug = "tx_retries",
+                 .state_class = "measurement", .precision = 0, .key = "tr", .diagnostic = true});
+            publish_discovery(client.get(), dev, dev_name,
+                {.name = "CCA failures", .topic_slug = "cca_failures",
+                 .state_class = "measurement", .precision = 0, .key = "cf", .diagnostic = true});
+            publish_discovery(client.get(), dev, dev_name,
+                {.name = "TX no-ack expiry", .topic_slug = "tx_no_ack_expiry",
+                 .state_class = "measurement", .precision = 0, .key = "nk", .diagnostic = true});
+            publish_discovery(client.get(), dev, dev_name,
+                {.name = "Parent link quality", .topic_slug = "link_quality_out",
+                 .state_class = "measurement", .precision = 0, .key = "lq", .diagnostic = true});
+        }
+        // The parent's OWN measurement of our signal -- the opposite direction from "Signal
+        // strength" above, and the only one that responds to our TX power. Absent entirely on a
+        // Thread 1.1 border router (enh-ACK probing unsupported), by design.
+        if (discoveryNeed & DISC_UPLINK)
+            publish_discovery(client.get(), dev, dev_name,
+                {.name = "Uplink signal strength", .topic_slug = "uplink_rssi",
+                 .device_class = "signal_strength", .state_class = "measurement", .unit = "dBm",
+                 .precision = 0, .key = "ur", .diagnostic = true});
         if (discoveryNeed & DISC_UPDATE)
             publish_update_discovery(client.get(), dev, dev_name);
         if (discoveryNeed & DISC_NUMBERS)
@@ -1090,6 +1180,21 @@ static bool run_publish_cycle(const PublishParams &params)
                 stateLen = format_append(stateBuf, stateLen - 1, STATE_HEATER_SUFFIX_FMT,
                                          *params.heater_problem ? "ON" : "OFF",
                                          *params.heater_run_count);
+            // us -> ms as float: a quiet sleepy cycle's radio time lands in the hundreds of
+            // microseconds, which integer milliseconds would flatten to 0 and destroy exactly
+            // the measurement these entities exist to make.
+            if (stateLen > 0 && hasRadioStats)
+                stateLen = format_append(stateBuf, stateLen - 1, STATE_RADIO_SUFFIX_FMT,
+                                         static_cast<float>(*link->radioTxTimeUs) / 1000.0f,
+                                         static_cast<float>(*link->radioRxTimeUs) / 1000.0f);
+            if (stateLen > 0 && hasLinkQuality)
+                stateLen = format_append(stateBuf, stateLen - 1, STATE_LINKQ_SUFFIX_FMT,
+                                         *link->txRetries, *link->txCcaFailures,
+                                         *link->txNoAckExpiry,
+                                         static_cast<unsigned>(*link->linkQualityOut));
+            if (stateLen > 0 && hasUplinkRssi)
+                stateLen = format_append(stateBuf, stateLen - 1, STATE_UPLINK_SUFFIX_FMT,
+                                         *link->uplinkRssiDbm);
             // Boot count and reset reason are boot-constant, so they're re-sent on every state
             // message -- otherwise their entities would go stale-then-unavailable under
             // expire_after while the rest of the device keeps reporting.

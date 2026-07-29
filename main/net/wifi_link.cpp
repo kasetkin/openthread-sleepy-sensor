@@ -152,12 +152,19 @@ static void refresh()
     esp_wifi_connect();
 }
 
-static std::optional<int> readApRssi()
+// Wi-Fi fills only the downlink RSSI. The rest of LinkStats is 802.15.4/OpenThread-specific
+// (radio TX/RX time accounting, MAC retry counters, the parent's own view of our link) and has
+// no Wi-Fi equivalent this device can read, so those fields stay absent and the corresponding
+// HA entities are simply never published on a Wi-Fi build.
+static std::optional<LinkStats> readApLinkStats()
 {
     wifi_ap_record_t ap = {};
     if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK)
         return std::nullopt;
-    return ap.rssi;
+
+    LinkStats stats;
+    stats.rssiDbm = ap.rssi;
+    return stats;
 }
 
 NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
@@ -176,6 +183,6 @@ NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
     link.onOtaWindowBegin = noop;   // Wi-Fi STA is already always-RX during the awake window
     link.onOtaWindowEnd = noop;
     link.refresh = refresh;
-    link.readRssiDbm = readApRssi;
+    link.readLinkStats = readApLinkStats;
     return link;
 }

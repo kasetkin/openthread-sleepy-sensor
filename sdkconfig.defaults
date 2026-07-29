@@ -27,6 +27,22 @@ CONFIG_OPENTHREAD_DNS64_CLIENT=n
 CONFIG_OPENTHREAD_CLI=y
 CONFIG_OPENTHREAD_TASK_SIZE=4096
 CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
+# Uplink instrumentation, both read once per publish window by openthread_link.cpp's
+# read_link_stats(). The device has never set its 802.15.4 TX power, so it transmits at the
+# PHY power table's maximum (+20 dBm, 305 mA peak per the C6 datasheet's Table 5-9 vs 187 mA
+# at +12); whether turning that down is worth any link margin depends entirely on how much of
+# each cycle is actually spent transmitting, which nothing measured before these two options.
+#
+# RADIO_STATS gives otRadioTimeStatsGet(): cumulative us the radio spent in TX/RX. That TX
+# figure is the missing multiplier in dI_avg = dI_peak * t_tx / cycle_period.
+#
+# LINK_METRICS gives Thread 1.2 enhanced-ACK probing, the only way to learn the RSSI the
+# PARENT measures of us. The RSSI this device already publishes is otThreadGetParentLastRssi
+# -- our receiver measuring the border router's transmitter -- which cannot respond to our own
+# TX power at all, so it is useless as a control input. NOTE this option selects
+# IEEE802154_TIMING_OPTIMIZATION and OPENTHREAD_TIMING_OPTIMIZATION.
+CONFIG_OPENTHREAD_RADIO_STATS_ENABLE=y
+CONFIG_OPENTHREAD_LINK_METRICS=y
 # end of OpenThread
 
 #

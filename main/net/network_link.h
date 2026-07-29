@@ -24,6 +24,34 @@ inline std::string_view mqttScheme(bool use_tls)
     return use_tls ? "mqtts" : "mqtt";
 }
 
+// One publish window's view of the radio link, read in a single pass so the whole set is
+// mutually consistent (and, for Thread, costs one OpenThread lock acquisition instead of one
+// per field). Every field is optional because the two transports can produce very different
+// subsets: Wi-Fi fills only rssiDbm, and even on Thread uplinkRssiDbm stays empty unless the
+// border router turns out to speak Thread 1.2 link metrics.
+//
+// The two RSSI fields point in OPPOSITE directions, which is the whole reason this struct
+// exists. rssiDbm is what our receiver measures of the parent's transmitter -- it says nothing
+// about how well we are heard, and in particular it cannot respond to our own TX power.
+// uplinkRssiDbm is the parent's measurement of US, reported back in enhanced ACKs, and is the
+// only direct evidence of our uplink margin. linkQualityOut is the same direction as
+// uplinkRssiDbm but far coarser (0-3), and is the fallback when link metrics are unavailable.
+//
+// The counter-derived fields are PER-CYCLE DELTAS, not the cumulative totals OpenThread
+// actually stores -- openthread_link.cpp does the differencing, so consumers can treat every
+// field as "this cycle" without knowing which underlying API is cumulative.
+struct LinkStats
+{
+    std::optional<int> rssiDbm;             // downlink: RSSI we measure of the parent
+    std::optional<int> uplinkRssiDbm;       // uplink: RSSI the PARENT measures of us
+    std::optional<uint8_t> linkQualityOut;  // uplink, coarse: parent's 0-3 grade of our link
+    std::optional<uint32_t> radioTxTimeUs;  // radio time spent transmitting
+    std::optional<uint32_t> radioRxTimeUs;  // radio time spent receiving
+    std::optional<uint32_t> txRetries;      // MAC-layer retransmissions
+    std::optional<uint32_t> txCcaFailures;  // transmits abandoned because the channel was busy
+    std::optional<uint32_t> txNoAckExpiry;  // transmits that exhausted every retry unacked
+};
+
 // Abstracts "how do I reach an IP-connected MQTT broker" over OpenThread or
 // Wi-Fi so mqtt_sender.cpp and SensorsTask stay transport-agnostic. A plain
 // struct of std::function seams (matching SensorsTask's configureAttachGate/
@@ -73,10 +101,11 @@ struct NetworkLink
     // LP_STALL_REBOOT_THRESHOLD doc comment) and from an LP-core stall (unrelated subsystem).
     // Revisit only on request -- not wired up anywhere yet.
 
-    // Uplink signal strength in dBm (OT: RSSI of the last packet from the SED's parent;
-    // Wi-Fi: the associated AP's RSSI), nullopt when unavailable (detached/disconnected).
-    // Called from the MQTT publish window, so the radio is awake and the reading is fresh.
-    std::function<std::optional<int>()> readRssiDbm;
+    // This cycle's link telemetry (see LinkStats above), nullopt when the link is unusable
+    // altogether (detached/disconnected). Called ONCE per MQTT publish window, so the radio is
+    // awake and the readings are fresh -- and so the delta fields cover exactly one cycle.
+    // Calling it more than once per cycle would split those deltas across the calls.
+    std::function<std::optional<LinkStats>()> readLinkStats;
 };
 
 struct NetworkLinkConfig

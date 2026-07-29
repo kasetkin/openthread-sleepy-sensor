@@ -1,6 +1,8 @@
 #include "openthread_link.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <format>
 #include <optional>
 #include <string>
@@ -21,7 +23,9 @@
 #include "openthread/dataset.h"
 #include "openthread/ip6.h"
 #include "openthread/link.h"
+#include "openthread/link_metrics.h"
 #include "openthread/netdata.h"
+#include "openthread/radio_stats.h"
 #include "openthread/thread.h"
 
 static const char *TAG = "ot-link";
@@ -69,17 +73,182 @@ static void set_poll_period(uint32_t ms)
     esp_openthread_lock_release();
 }
 
-// RSSI of the last packet received from the parent — for a SED the parent link is the only
-// one that exists. Called from the MQTT task, so it takes the OT lock like set_poll_period().
-static std::optional<int> read_parent_rssi()
+// ── uplink telemetry ──────────────────────────────────────────────────────────
+// Latest RSSI the PARENT reported measuring of us, from the enhanced-ACK report callback
+// below. A sentinel int rather than a std::optional because it is written from the OpenThread
+// task and read from the MQTT task: a lock-free atomic<int16_t> load/store is well-defined
+// across that boundary, while an optional's value/engaged pair would be two unsynchronised
+// stores. INT16_MIN is safely outside the int8_t range every real RSSI arrives in.
+static constexpr int16_t UPLINK_RSSI_NONE = INT16_MIN;
+static std::atomic<int16_t> s_uplink_rssi_dbm{UPLINK_RSSI_NONE};
+
+// Cumulative counters OpenThread exposes, sampled at the end of the previous read_link_stats().
+// LinkStats reports per-cycle deltas, so the differencing happens here and consumers never see
+// a running total. Only ever touched from the MQTT task under the OT lock.
+struct CounterSnapshot
 {
-    int8_t rssi = 0;
+    uint64_t radio_tx_time_us = 0;
+    uint64_t radio_rx_time_us = 0;
+    uint32_t tx_retries = 0;
+    uint32_t tx_cca_failures = 0;
+    uint32_t tx_no_ack_expiry = 0;
+    bool valid = false;  // false until the first sample; the first cycle reports no deltas
+};
+static CounterSnapshot s_prev_counters;
+
+// Parent's link-local address, needed as the enhanced-ACK probing destination. OpenThread has
+// no getter for it (otThreadGetLinkLocalIp6Address returns OUR address), so it is derived the
+// standard way: fe80::/64 plus the modified EUI-64 form of the parent's extended address,
+// which is the extended address with the universal/local bit of its first byte inverted.
+// Caller must hold the OpenThread lock.
+static bool parent_link_local_address(otInstance *ot, otIp6Address &out)
+{
+    otRouterInfo parent;
+    if (otThreadGetParentInfo(ot, &parent) != OT_ERROR_NONE)
+        return false;
+
+    out = {};
+    out.mFields.m8[0] = 0xfe;
+    out.mFields.m8[1] = 0x80;
+    std::copy_n(parent.mExtAddress.m8, OT_EXT_ADDRESS_SIZE, out.mFields.m8 + 8);
+    out.mFields.m8[8] ^= 0x02;
+    return true;
+}
+
+// Enhanced-ACK Based Probing report: the parent stamps its own measurement of each frame we
+// send into the ACK it returns, which is the ONLY direct evidence this device can get of its
+// uplink margin. Runs in OpenThread task context.
+static void enh_ack_report_cb(otShortAddress /*aShortAddress*/,
+                              const otExtAddress * /*aExtAddress*/,
+                              const otLinkMetricsValues *aMetricsValues,
+                              void * /*aContext*/)
+{
+    if (aMetricsValues && aMetricsValues->mMetrics.mRssi)
+        s_uplink_rssi_dbm.store(aMetricsValues->mRssiValue, std::memory_order_relaxed);
+}
+
+static void enh_ack_mgmt_response_cb(const otIp6Address * /*aSource*/,
+                                     otLinkMetricsStatus aStatus,
+                                     void * /*aContext*/)
+{
+    ESP_LOGI(TAG, "enh-ACK probing management response: status %d", static_cast<int>(aStatus));
+}
+
+// Registers Enhanced-ACK Based Probing with the current parent. Called on every CHILD
+// transition rather than once per boot on purpose: the registration lives in the parent's
+// neighbour state, so it does not survive a parent change or a re-attach.
+//
+// Purely diagnostic — every failure path here is logged and swallowed. In particular a border
+// router that is not a Thread 1.2 device answers OT_ERROR_NOT_CAPABLE, which is an expected
+// outcome, not an error: uplinkRssiDbm simply stays absent and LinkStats::linkQualityOut plus
+// the retry counters remain the only uplink evidence. Nothing here may ever fail an attach.
+//
+// Caller must already hold the OpenThread lock (process_state_change() does).
+static void register_enh_ack_probing(otInstance *ot)
+{
+    s_uplink_rssi_dbm.store(UPLINK_RSSI_NONE, std::memory_order_relaxed);
+
+    otIp6Address parent_addr;
+    if (!parent_link_local_address(ot, parent_addr)) {
+        ESP_LOGW(TAG, "enh-ACK probing: parent info unavailable, uplink RSSI stays unknown");
+        return;
+    }
+
+    otLinkMetrics metrics = {};
+    metrics.mRssi = true;
+    metrics.mLinkMargin = true;
+
+    const otError err = otLinkMetricsConfigEnhAckProbing(
+        ot, &parent_addr, OT_LINK_METRICS_ENH_ACK_REGISTER, &metrics,
+        enh_ack_mgmt_response_cb, nullptr, enh_ack_report_cb, nullptr);
+
+    if (err == OT_ERROR_NONE) {
+        ESP_LOGI(TAG, "enh-ACK probing registered with parent — uplink RSSI available");
+    } else if (err == OT_ERROR_NOT_CAPABLE) {
+        ESP_LOGW(TAG, "enh-ACK probing unsupported by parent (not a Thread 1.2 device); "
+                      "falling back to link quality out + retry counters");
+    } else {
+        ESP_LOGW(TAG, "enh-ACK probing registration failed: %d", static_cast<int>(err));
+    }
+}
+
+// This cycle's view of the link. Called once per MQTT publish window from the MQTT task, so it
+// takes the OT lock like set_poll_period() — once, for the whole set, rather than per field.
+//
+// Note the two RSSIs measure opposite directions (see LinkStats in network_link.h): rssiDbm is
+// the parent's transmitter as heard by us, uplinkRssiDbm is us as heard by the parent.
+static std::optional<LinkStats> read_link_stats()
+{
+    otInstance *ot = esp_openthread_get_instance();
+    LinkStats stats;
+
     esp_openthread_lock_acquire(portMAX_DELAY);
-    const otError err = otThreadGetParentLastRssi(esp_openthread_get_instance(), &rssi);
+
+    int8_t rssi = 0;
+    if (otThreadGetParentLastRssi(ot, &rssi) == OT_ERROR_NONE)
+        stats.rssiDbm = rssi;
+
+    otRouterInfo parent;
+    if (otThreadGetParentInfo(ot, &parent) == OT_ERROR_NONE)
+        stats.linkQualityOut = parent.mLinkQualityOut;
+
+    // Cumulative us since boot; deltas below. Deliberately NOT otRadioTimeStatsReset() — a
+    // reset would discard everything the radio does between this read and the next window
+    // (the data polls that make up most of a sleepy cycle), which is exactly the time we are
+    // trying to account for.
+    const otRadioTimeStats *radio = otRadioTimeStatsGet(ot);
+    const otMacCounters *mac = otLinkGetCounters(ot);
+
+    CounterSnapshot now;
+    now.valid = true;
+    if (radio) {
+        now.radio_tx_time_us = radio->mTxTime;
+        now.radio_rx_time_us = radio->mRxTime;
+    }
+    if (mac) {
+        now.tx_retries = mac->mTxRetry;
+        now.tx_cca_failures = mac->mTxErrCca;
+        now.tx_no_ack_expiry = mac->mTxDirectMaxRetryExpiry;
+    }
+
     esp_openthread_lock_release();
-    if (err != OT_ERROR_NONE)
+
+    // First call of the boot establishes the baseline and reports no deltas — a "delta" against
+    // zero would really be a since-boot total and would badly skew the very measurement this
+    // instrumentation exists to make.
+    if (s_prev_counters.valid) {
+        if (radio) {
+            stats.radioTxTimeUs = static_cast<uint32_t>(now.radio_tx_time_us - s_prev_counters.radio_tx_time_us);
+            stats.radioRxTimeUs = static_cast<uint32_t>(now.radio_rx_time_us - s_prev_counters.radio_rx_time_us);
+        }
+        if (mac) {
+            stats.txRetries = now.tx_retries - s_prev_counters.tx_retries;
+            stats.txCcaFailures = now.tx_cca_failures - s_prev_counters.tx_cca_failures;
+            stats.txNoAckExpiry = now.tx_no_ack_expiry - s_prev_counters.tx_no_ack_expiry;
+        }
+    }
+    s_prev_counters = now;
+
+    const int16_t uplink = s_uplink_rssi_dbm.load(std::memory_order_relaxed);
+    if (uplink != UPLINK_RSSI_NONE)
+        stats.uplinkRssiDbm = uplink;
+
+    // Nothing readable at all means detached, not merely uninstrumented — report absence so the
+    // caller skips the whole group rather than publishing a row of zeroes.
+    if (!stats.rssiDbm && !stats.linkQualityOut && !stats.radioTxTimeUs)
         return std::nullopt;
-    return rssi;
+
+    ESP_LOGI(TAG, "link: rssi=%d dBm uplink_rssi=%d lqo=%u tx=%lu us rx=%lu us "
+                  "retries=%lu cca_fail=%lu no_ack=%lu",
+             stats.rssiDbm.value_or(0), stats.uplinkRssiDbm.value_or(0),
+             static_cast<unsigned>(stats.linkQualityOut.value_or(0)),
+             static_cast<unsigned long>(stats.radioTxTimeUs.value_or(0)),
+             static_cast<unsigned long>(stats.radioRxTimeUs.value_or(0)),
+             static_cast<unsigned long>(stats.txRetries.value_or(0)),
+             static_cast<unsigned long>(stats.txCcaFailures.value_or(0)),
+             static_cast<unsigned long>(stats.txNoAckExpiry.value_or(0)));
+
+    return stats;
 }
 
 // OTA-download link boost. Deliberately just a faster data-poll cadence, NOT
@@ -192,6 +361,10 @@ static void process_state_change(otChangedFlags flags, void *context)
         case OT_DEVICE_ROLE_CHILD:
             ESP_LOGI(TAG, "OT role: CHILD — joined network as sleepy end device");
             log_thread_network_info();
+            // Re-registered on every CHILD transition, not just the boot's first: the
+            // registration is neighbour state on the parent and does not survive a re-attach
+            // or a parent change. Already inside the OT lock here.
+            register_enh_ack_probing(esp_openthread_get_instance());
             if (s_ot_attached_eg)
                 xEventGroupSetBits(s_ot_attached_eg, BIT_ATTACHED);
             break;
@@ -342,6 +515,6 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.onOtaWindowEnd = []() { ESP_LOGI(TAG, "OTA window end: poll %lu ms", (unsigned long)POLL_FAST_MS);
                                  set_poll_period(POLL_FAST_MS); };
     link.refresh = refresh_nat64_prefix;
-    link.readRssiDbm = read_parent_rssi;
+    link.readLinkStats = read_link_stats;
     return link;
 }
