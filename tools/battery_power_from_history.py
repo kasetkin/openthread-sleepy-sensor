@@ -9,6 +9,7 @@ mean mW / mA the same way docs/power-usage-from-usb.ods does it by hand.
     tools/battery_power_from_history.py
 """
 import csv
+import statistics
 from datetime import datetime
 
 CSV_PATH = "voltage_history.csv"
@@ -64,18 +65,13 @@ percents = [voltage_to_percent(v * 1000) for v in voltages]
 total_hours = hours[-1]
 
 n = len(hours)
-mean_h = sum(hours) / n
-mean_p = sum(percents) / n
-covariance = sum((h - mean_h) * (p - mean_p) for h, p in zip(hours, percents))
-variance = sum((h - mean_h) ** 2 for h in hours)
-slope = covariance / variance
-intercept = mean_p - slope * mean_h
+slope, intercept = statistics.linear_regression(hours, percents)
 
 pct_start = intercept
 pct_end = intercept + slope * total_hours
 pct_delta = pct_start - pct_end
 
-mean_v = sum(voltages) / n
+mean_v = statistics.mean(voltages)
 mwh_used = pct_delta / 100.0 * PACK_ENERGY_MWH
 mean_mw = mwh_used / total_hours
 mean_ma = mean_mw / mean_v
