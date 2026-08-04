@@ -1,17 +1,17 @@
 #include "hp_awake_stats.h"
 
 #include <algorithm>
+#include <atomic>
 
 #include "esp_pm.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 
-static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
-
 // Accumulated by exit_cb (IDLE task context) between reads; snapshot+reset by
-// hp_awake_stats_get_and_reset_us() (MQTT task context) -- portMUX-protected across that
-// boundary the same way esp_pm's own internal callback list is.
-static uint64_t s_accumulated_sleep_us = 0;
+// hp_awake_stats_get_and_reset_us() (MQTT task context) -- a single-producer/single-consumer
+// counter, so a plain atomic (relaxed: this value carries no other memory with it) covers the
+// cross-context boundary without needing a critical section.
+static std::atomic<uint64_t> s_accumulated_sleep_us{0};
 static int64_t s_period_start_us = 0;
 
 // No blocking calls allowed here -- runs from IDLE task context after every automatic
@@ -21,9 +21,7 @@ static esp_err_t on_light_sleep_exit(int64_t sleep_time_us, void *arg)
 {
     (void)arg;
     if (sleep_time_us > 0) {
-        portENTER_CRITICAL(&s_mux);
-        s_accumulated_sleep_us += static_cast<uint64_t>(sleep_time_us);
-        portEXIT_CRITICAL(&s_mux);
+        s_accumulated_sleep_us.fetch_add(static_cast<uint64_t>(sleep_time_us), std::memory_order_relaxed);
     }
     return ESP_OK;
 }
@@ -47,10 +45,7 @@ uint32_t hp_awake_stats_get_and_reset_us()
 {
     const int64_t now = esp_timer_get_time();
 
-    portENTER_CRITICAL(&s_mux);
-    const uint64_t slept = s_accumulated_sleep_us;
-    s_accumulated_sleep_us = 0;
-    portEXIT_CRITICAL(&s_mux);
+    const uint64_t slept = s_accumulated_sleep_us.exchange(0, std::memory_order_relaxed);
 
     const int64_t elapsed = now - s_period_start_us;
     s_period_start_us = now;
