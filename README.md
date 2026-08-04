@@ -334,3 +334,25 @@ failures for N cycles" as originally sketched; retries and no-ack expiry are the
 gate on instead. `Uplink signal strength` averaged **−48.6 dBm**, ~15 dB above the −85 dBm target
 margin Phase C would step down toward — comfortable headroom. `Parent link quality` stayed almost
 entirely absent (2 samples in 2365 cycles), confirming it's too sparse to gate on alone.
+
+### The knob: built, flashed, and part of a broader power investigation
+
+`cfg/tx_power_dbm` (HA number, −15…20 dBm) plus a read-only `TX power (active)` diagnostic are
+implemented (`main/runtime_config.{h,cpp}`, `NetworkLink::setTxPowerDbm`, brick-hazard
+pending/known-good/revert-after-3-cycles state machine, radio pinned to +20 dBm until first
+attach and for the whole OTA window). Flashed and set to **0 dBm** as the first step of a larger
+question: this device measures **~335 µA average current**, well above a commonly-cited **~35 µA**
+"correctly configured ESP32-C6 light sleep" figure. Turns out the datasheet's own Table 5-11 says
+**180 µA** Typ, not 35 — the 35 µA figure is a *more* optimized configuration than "light sleep
+just enabled," achieved (per extensive ESP-IDF GitHub issue research) only with every
+retention/clock optimization applied together. A quantitative duty-cycle model built from this
+project's own timing data attributes ~229 of the 335 µA to legitimate, already-characterized radio
+TX/RX activity (not a bug — directly reducible by this TX-power knob), leaving a ~106 µA residual
+that points at two more candidates: the RTC clock source (`CONFIG_RTC_CLK_SRC_INT_RC` vs the
+Espressif-recommended `INT_RC32K`) and possibly the shared MODEM power domain not fully powering
+down for an OpenThread-only, Bluetooth-less build. A second new diagnostic sensor, `HP awake
+time`, was added alongside the TX-power knob specifically to help pin this down (it measures total
+HP-core wall-clock time outside of light sleep per cycle, which the existing Radio TX/RX time
+entities don't capture). Full research, the ranked hypotheses, and the quantitative model are in
+memory (`project_light_sleep_power_investigation`) — this is an active, sequenced investigation
+(one variable changed at a time so each result stays attributable), not a closed topic.

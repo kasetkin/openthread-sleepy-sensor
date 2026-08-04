@@ -7,6 +7,7 @@ set(srcs
   mqtt_sender.cpp
   ota_updater.cpp
   runtime_config.cpp
+  hp_awake_stats.cpp
   net/network_link.cpp
   net/openthread_link.cpp
   net/wifi_link.cpp

@@ -21,6 +21,7 @@
 #include "ota_updater.h"
 #include "history_log.h"
 #include "runtime_config.h"
+#include "hp_awake_stats.h"
 
 static const char *TAG = "mqtt-sender";
 
@@ -65,6 +66,7 @@ enum DiscoveryBit : uint16_t {
     DISC_LINKQ   = 1 << 10,  // TX retries + CCA failures + TX no-ack expiry + Parent link quality
     DISC_UPLINK  = 1 << 11,  // Uplink signal strength (the parent's RSSI measurement of US)
     DISC_TXPOWER = 1 << 12,  // TX power (active) diagnostic -- boot-constant, so always available
+    DISC_AWAKE   = 1 << 13,  // HP awake time diagnostic -- boot-constant, so always available
 };
 
 static MqttConfig s_cfg;
@@ -240,6 +242,10 @@ static constexpr std::string_view STATE_UPLINK_SUFFIX_FMT = ",\"ur\":{}}}";
 // TX power actually in effect right now (runtime_config_tx_power_active_dbm()) -- boot-constant
 // availability like STATE_DIAG_SUFFIX_FMT above, so appended on every state message.
 static constexpr std::string_view STATE_TXPOWER_SUFFIX_FMT = ",\"tp\":{}}}";
+// HP-core wall-clock time NOT in light sleep this cycle (hp_awake_stats_get_and_reset_us()) --
+// same boot-constant availability, always appended. Float ms, not integer: a quiet cycle's
+// awake time is meaningfully sub-millisecond-precise at this scale (see STATE_RADIO_SUFFIX_FMT).
+static constexpr std::string_view STATE_AWAKE_SUFFIX_FMT = ",\"aw\":{:.2f}}}";
 
 // history_log.h backlog replay -- not part of HA discovery/state, a plain device -> broker
 // event stream an HA-side automation consumes (see README's "Blackout data buffering &
@@ -286,7 +292,8 @@ static constexpr size_t MAX_NAME_LEN         = std::max({sizeof("Temperature"), 
                                                          sizeof("TX no-ack expiry"),
                                                          sizeof("Parent link quality"),
                                                          sizeof("Uplink signal strength"),
-                                                         sizeof("TX power (active)")}) - 1;
+                                                         sizeof("TX power (active)"),
+                                                         sizeof("HP awake time")}) - 1;
 static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max({sizeof("temperature"), sizeof("humidity"),
                                                          sizeof("battery"), sizeof("voltage"),
                                                          sizeof("signal_strength"), sizeof("problem")}) - 1;
@@ -300,7 +307,8 @@ static constexpr size_t MAX_TOPIC_SLUG_LEN   = std::max({MAX_DEVICE_CLASS_LEN + 
                                                          sizeof("tx_no_ack_expiry"),
                                                          sizeof("link_quality_out"),
                                                          sizeof("uplink_rssi"),
-                                                         sizeof("tx_power_active")}) - 1;
+                                                         sizeof("tx_power_active"),
+                                                         sizeof("hp_awake_time")}) - 1;
 static constexpr size_t MAX_STATE_CLASS_LEN  = std::max({sizeof("measurement"),
                                                          sizeof("total_increasing")}) - 1;
 static constexpr size_t MAX_UNIT_LEN         = std::max({sizeof("°C"), sizeof("%"), sizeof("V"),
@@ -439,6 +447,7 @@ static constexpr size_t STATE_BUF = std::max({
    + STATE_LINKQ_SUFFIX_FMT.size() + 4 * MAX_LINK_COUNTER_LEN
    + STATE_UPLINK_SUFFIX_FMT.size() + MAX_RSSI_LEN
    + STATE_TXPOWER_SUFFIX_FMT.size() + MAX_TXPOWER_LEN
+   + STATE_AWAKE_SUFFIX_FMT.size() + MAX_FORMATTED_FLOAT_LEN
    + 1;  // +1 NUL
 
 // Same lemma, applied to one backfill array: BACKFILL_ENTRY_REST_FMT (the wider of the two --
@@ -1032,6 +1041,10 @@ static bool run_publish_cycle(const PublishParams &params)
         const std::optional<LinkStats> link =
             s_link->readLinkStats ? s_link->readLinkStats() : std::nullopt;
         const std::optional<int> rssi = link ? link->rssiDbm : std::nullopt;
+        // Same "read exactly once per cycle" discipline as readLinkStats() above -- called
+        // unconditionally (not gated on stateLen later) so a truncated/failed buffer never
+        // skips resetting the accumulator and silently merges two cycles' awake time into one.
+        const uint32_t hpAwakeUs = hp_awake_stats_get_and_reset_us();
         // Grouped exactly as the DISC_RADIO/DISC_LINKQ/DISC_UPLINK bits are, so a group is
         // owed only when every entity in it can actually be fed this cycle.
         const bool hasRadioStats = link && link->radioTxTimeUs && link->radioRxTimeUs;
@@ -1055,7 +1068,8 @@ static bool run_publish_cycle(const PublishParams &params)
                                                       | DISC_UPDATE
                                                       | DISC_NUMBERS
                                                       | DISC_SWITCH
-                                                      | DISC_TXPOWER);
+                                                      | DISC_TXPOWER
+                                                      | DISC_AWAKE);
         const auto discoveryNeed = hasAny
             ? static_cast<uint16_t>(discoveryWant & ~s_discovery_sent_mask.load()) : uint16_t{0};
 
@@ -1067,9 +1081,9 @@ static bool run_publish_cycle(const PublishParams &params)
         // config + current-value state; two for DISC_HEATER: Heater problem and Heater run
         // count; two for DISC_RADIO: Radio TX time and Radio RX time; four for DISC_LINKQ: TX
         // retries, CCA failures, TX no-ack expiry and Parent link quality; one for DISC_UPLINK:
-        // Uplink signal strength; one for DISC_TXPOWER: TX power (active)). A fixed count
-        // assuming every discovery is sent would leave BIT_ALL_ACKED forever unset on any cycle
-        // that sends fewer, wrongly failing the cycle.
+        // Uplink signal strength; one for DISC_TXPOWER: TX power (active); one for DISC_AWAKE:
+        // HP awake time). A fixed count assuming every discovery is sent would leave
+        // BIT_ALL_ACKED forever unset on any cycle that sends fewer, wrongly failing the cycle.
         const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
                                  + ((discoveryNeed & DISC_HUM) ? 1 : 0)
                                  + ((discoveryNeed & DISC_BATT) ? 2 : 0)
@@ -1082,7 +1096,8 @@ static bool run_publish_cycle(const PublishParams &params)
                                  + ((discoveryNeed & DISC_RADIO) ? 2 : 0)
                                  + ((discoveryNeed & DISC_LINKQ) ? 4 : 0)
                                  + ((discoveryNeed & DISC_UPLINK) ? 1 : 0)
-                                 + ((discoveryNeed & DISC_TXPOWER) ? 1 : 0);
+                                 + ((discoveryNeed & DISC_TXPOWER) ? 1 : 0)
+                                 + ((discoveryNeed & DISC_AWAKE) ? 1 : 0);
         const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
         // Set counters BEFORE publishing so the handler never races ahead
@@ -1176,6 +1191,14 @@ static bool run_publish_cycle(const PublishParams &params)
                 {.name = "TX power (active)", .topic_slug = "tx_power_active",
                  .state_class = "measurement", .unit = "dBm", .precision = 0, .key = "tp",
                  .diagnostic = true});
+        // Total HP-core wall-clock time NOT in light sleep this cycle -- the piece Radio TX/RX
+        // time doesn't cover (attach check, JSON encode, ACK wait, DFS ramp). Part of the
+        // ~335 uA vs ~35 uA power investigation -- see the plan doc's quantitative model.
+        if (discoveryNeed & DISC_AWAKE)
+            publish_discovery(client.get(), dev, dev_name,
+                {.name = "HP awake time", .topic_slug = "hp_awake_time",
+                 .state_class = "measurement", .unit = "ms", .precision = 2, .key = "aw",
+                 .diagnostic = true});
         if (discoveryNeed & DISC_UPDATE)
             publish_update_discovery(client.get(), dev, dev_name);
         if (discoveryNeed & DISC_NUMBERS)
@@ -1231,6 +1254,10 @@ static bool run_publish_cycle(const PublishParams &params)
             if (stateLen > 0)
                 stateLen = format_append(stateBuf, stateLen - 1, STATE_TXPOWER_SUFFIX_FMT,
                                          static_cast<int>(runtime_config_tx_power_active_dbm()));
+            // HP awake time -- also boot-constant availability, re-sent every state message.
+            if (stateLen > 0)
+                stateLen = format_append(stateBuf, stateLen - 1, STATE_AWAKE_SUFFIX_FMT,
+                                         static_cast<float>(hpAwakeUs) / 1000.0f);
 
             std::array<char, TOPIC_BUF> stateTopicBuf;
             const size_t stateTopicLen = format_into(stateTopicBuf, STATE_TOPIC_FMT, dev);

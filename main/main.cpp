@@ -16,6 +16,7 @@
 #include "errortask.h"
 #include "mqtt_sender.h"
 #include "runtime_config.h"
+#include "hp_awake_stats.h"
 
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -216,6 +217,8 @@ extern "C" void app_main(void)
     // OpenThread's own radio-state PM lock (esp_openthread_sleep_init(), see esp_openthread
     // component) only gates sleep through this automatic path.
     ESP_ERROR_CHECK(enableAutomaticLightSleep());
+    // Sleep time before this point is untracked -- same ordering constraint as the call above.
+    ESP_ERROR_CHECK(hp_awake_stats_init());
 
     // ── parse secrets ─────────────────────────────────────────────────────────
     const std::string_view yaml = secrets_yaml();
