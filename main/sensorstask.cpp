@@ -14,6 +14,7 @@
 #include "ota_updater.h"
 #include "lp_sensor_core.h"
 #include "history_log.h"
+#include "runtime_config.h"
 
 // First broker-ACKed publish after an OTA reboot proves the new image out and cancels the
 // bootloader's pending rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE). If this never runs,
@@ -104,6 +105,10 @@ void SensorsTask::executeTask()
 
         if (!attached) {
             ESP_LOGW(TAG, "OT not attached within %u ms, retrying next cycle", ATTACH_TIMEOUT_MS);
+            // A failed attach is the most direct symptom of a TX power too low to sustain the
+            // uplink -- it happens before the publish logic below is ever reached, so it needs
+            // its own tap into the confirm/revert counter (see runtime_config.cpp's design note).
+            runtime_config_tx_power_note_cycle_result(false);
         } else {
             lp_shared_state_t state{};
             lp_sensor_core_get_state(&state);
@@ -225,6 +230,7 @@ void SensorsTask::executeTask()
                 if (mqtt_is_busy()) {
                     if (mqtt_wait_for_idle(PUBLISH_TIMEOUT_MS)) {
                         publishedOk = mqtt_last_publish_succeeded();
+                        runtime_config_tx_power_note_cycle_result(publishedOk);
                         // Only ack on CONFIRMED delivery -- an attempted-but-failed publish
                         // must leave LP's baseline untouched, so the still-undelivered value
                         // keeps being flagged next cycle instead of silently getting dropped.
@@ -251,6 +257,7 @@ void SensorsTask::executeTask()
                         ESP_LOGI(TAG, "OTA download in progress — leaving the publish window open");
                     } else {
                         ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
+                        runtime_config_tx_power_note_cycle_result(false);
                     }
                 } else {
                     ESP_LOGW(TAG, "mqtt is not working? not sure");

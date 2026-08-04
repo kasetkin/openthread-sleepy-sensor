@@ -25,6 +25,7 @@
 #include "openthread/link.h"
 #include "openthread/link_metrics.h"
 #include "openthread/netdata.h"
+#include "openthread/platform/radio.h"
 #include "openthread/radio_stats.h"
 #include "openthread/thread.h"
 
@@ -71,6 +72,18 @@ static void set_poll_period(uint32_t ms)
     esp_openthread_lock_acquire(portMAX_DELAY);
     otLinkSetPollPeriod(esp_openthread_get_instance(), ms);
     esp_openthread_lock_release();
+}
+
+static esp_err_t set_tx_power_dbm(int8_t dbm)
+{
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    const otError err = otPlatRadioSetTransmitPower(esp_openthread_get_instance(), dbm);
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "otPlatRadioSetTransmitPower(%d) failed: %d", dbm, static_cast<int>(err));
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 // ── uplink telemetry ──────────────────────────────────────────────────────────
@@ -516,5 +529,6 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
                                  set_poll_period(POLL_FAST_MS); };
     link.refresh = refresh_nat64_prefix;
     link.readLinkStats = read_link_stats;
+    link.setTxPowerDbm = set_tx_power_dbm;
     return link;
 }

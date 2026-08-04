@@ -92,6 +92,12 @@ struct NetworkLink
     // Recovery after a failed publish (OT: re-scan NAT64 route; Wi-Fi: reconnect kick).
     std::function<void()> refresh;
 
+    // Sets the radio's transmit power ceiling in dBm (OT: otPlatRadioSetTransmitPower under the
+    // OT lock; Wi-Fi: esp_wifi_set_max_tx_power, quarter-dBm units -- a real conversion, done in
+    // wifi_link.cpp). Populated on both transports, unlike the diagnostic-only seams that fall
+    // back to wifi_link.cpp's shared noop().
+    std::function<esp_err_t(int8_t dbm)> setTxPowerDbm;
+
     // TODO(deferred, see memory note project_blackout_resilience_redesign.md): a lightweight
     // "soft-rejoin" member was designed but not built -- OT: otThreadSetEnabled() false->true
     // to force a fresh MLE detach+attach on the same otInstance; Wi-Fi: esp_wifi_disconnect()+

@@ -64,6 +64,7 @@ enum DiscoveryBit : uint16_t {
     DISC_RADIO   = 1 << 9,   // Radio TX time + Radio RX time pair
     DISC_LINKQ   = 1 << 10,  // TX retries + CCA failures + TX no-ack expiry + Parent link quality
     DISC_UPLINK  = 1 << 11,  // Uplink signal strength (the parent's RSSI measurement of US)
+    DISC_TXPOWER = 1 << 12,  // TX power (active) diagnostic -- boot-constant, so always available
 };
 
 static MqttConfig s_cfg;
@@ -236,6 +237,9 @@ static constexpr std::string_view STATE_HEATER_SUFFIX_FMT = ",\"hp\":\"{}\",\"hc
 static constexpr std::string_view STATE_RADIO_SUFFIX_FMT  = ",\"rt\":{:.2f},\"rx\":{:.2f}}}";
 static constexpr std::string_view STATE_LINKQ_SUFFIX_FMT  = ",\"tr\":{},\"cf\":{},\"nk\":{},\"lq\":{}}}";
 static constexpr std::string_view STATE_UPLINK_SUFFIX_FMT = ",\"ur\":{}}}";
+// TX power actually in effect right now (runtime_config_tx_power_active_dbm()) -- boot-constant
+// availability like STATE_DIAG_SUFFIX_FMT above, so appended on every state message.
+static constexpr std::string_view STATE_TXPOWER_SUFFIX_FMT = ",\"tp\":{}}}";
 
 // history_log.h backlog replay -- not part of HA discovery/state, a plain device -> broker
 // event stream an HA-side automation consumes (see README's "Blackout data buffering &
@@ -281,7 +285,8 @@ static constexpr size_t MAX_NAME_LEN         = std::max({sizeof("Temperature"), 
                                                          sizeof("TX retries"), sizeof("CCA failures"),
                                                          sizeof("TX no-ack expiry"),
                                                          sizeof("Parent link quality"),
-                                                         sizeof("Uplink signal strength")}) - 1;
+                                                         sizeof("Uplink signal strength"),
+                                                         sizeof("TX power (active)")}) - 1;
 static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max({sizeof("temperature"), sizeof("humidity"),
                                                          sizeof("battery"), sizeof("voltage"),
                                                          sizeof("signal_strength"), sizeof("problem")}) - 1;
@@ -294,7 +299,8 @@ static constexpr size_t MAX_TOPIC_SLUG_LEN   = std::max({MAX_DEVICE_CLASS_LEN + 
                                                          sizeof("tx_retries"), sizeof("cca_failures"),
                                                          sizeof("tx_no_ack_expiry"),
                                                          sizeof("link_quality_out"),
-                                                         sizeof("uplink_rssi")}) - 1;
+                                                         sizeof("uplink_rssi"),
+                                                         sizeof("tx_power_active")}) - 1;
 static constexpr size_t MAX_STATE_CLASS_LEN  = std::max({sizeof("measurement"),
                                                          sizeof("total_increasing")}) - 1;
 static constexpr size_t MAX_UNIT_LEN         = std::max({sizeof("°C"), sizeof("%"), sizeof("V"),
@@ -331,15 +337,17 @@ static constexpr size_t MAX_UPDATE_DISCOVERY_TOPIC_LEN =
 static constexpr size_t MAX_STATE_TOPIC_LEN = STATE_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 static constexpr size_t MAX_BACKFILL_TOPIC_LEN = BACKFILL_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 
-// Longest HA entity `name` among the 7 `number` + 1 `switch` config entities (see the
+// Longest HA entity `name` among the 8 `number` + 1 `switch` config entities (see the
 // publish_number_discoveries()/publish_switch_discovery() call sites below).
 static constexpr size_t MAX_CFG_NAME_LEN = std::max({sizeof("Temperature offset"), sizeof("Temperature min change"),
     sizeof("Humidity offset"), sizeof("Humidity min change"), sizeof("Max publish gap"),
-    sizeof("Heater period"), sizeof("Heater high-RH trigger"), sizeof("External antenna")}) - 1;
-// Longest of the 8 cfg/* topic suffixes (runtime_config.h).
+    sizeof("Heater period"), sizeof("Heater high-RH trigger"), sizeof("External antenna"),
+    sizeof("TX power")}) - 1;
+// Longest of the 9 cfg/* topic suffixes (runtime_config.h).
 static constexpr size_t MAX_CFG_SUFFIX_LEN = std::max({CFG_SUFFIX_TEMP_OFFSET.size(), CFG_SUFFIX_TEMP_MIN_CHANGE.size(),
     CFG_SUFFIX_RH_OFFSET.size(), CFG_SUFFIX_RH_MIN_CHANGE.size(), CFG_SUFFIX_MAX_PUBLISH_GAP_SEC.size(),
-    CFG_SUFFIX_HEATER_PERIOD_MIN.size(), CFG_SUFFIX_HEATER_HIGH_RH_MIN.size(), CFG_SUFFIX_EXT_ANTENNA.size()});
+    CFG_SUFFIX_HEATER_PERIOD_MIN.size(), CFG_SUFFIX_HEATER_HIGH_RH_MIN.size(), CFG_SUFFIX_EXT_ANTENNA.size(),
+    CFG_SUFFIX_TX_POWER_DBM.size()});
 // Full "<device_id>/cfg/<suffix>" topic, interpolated 2x into CMD_PART_TAIL (state + command).
 static constexpr size_t MAX_CFG_TOPIC_LEN = MAX_DEVICE_ID_LEN + 1 /* '/' */ + MAX_CFG_SUFFIX_LEN;
 // unique_id's slug half -- the bare key name (suffix minus the "cfg/" segment).
@@ -412,6 +420,9 @@ static constexpr size_t MAX_HEATER_RUN_COUNT_LEN = 10;  // uint32_t, at most 10 
 static constexpr size_t MAX_LINK_COUNTER_LEN = 10;
 // "OFF" is the longer of the two literals STATE_HEATER_SUFFIX_FMT's "hp" field ever holds.
 static constexpr size_t MAX_ON_OFF_LEN = sizeof("OFF") - 1;
+// runtime_config_tx_power_active_dbm() returns int8_t (widened to int for formatting), so -128
+// bounds it exactly -- unlike MAX_RSSI_LEN above, the source type's real range is known here.
+static constexpr size_t MAX_TXPOWER_LEN = sizeof("-128") - 1;
 
 // Each suffix overwrites the previous JSON's closing '}' (net -1), so simply adding every
 // suffix's full worst-case length on top of the base keeps this a safe upper bound per the
@@ -427,6 +438,7 @@ static constexpr size_t STATE_BUF = std::max({
    + STATE_RADIO_SUFFIX_FMT.size() + 2 * MAX_FORMATTED_FLOAT_LEN
    + STATE_LINKQ_SUFFIX_FMT.size() + 4 * MAX_LINK_COUNTER_LEN
    + STATE_UPLINK_SUFFIX_FMT.size() + MAX_RSSI_LEN
+   + STATE_TXPOWER_SUFFIX_FMT.size() + MAX_TXPOWER_LEN
    + 1;  // +1 NUL
 
 // Same lemma, applied to one backfill array: BACKFILL_ENTRY_REST_FMT (the wider of the two --
@@ -760,7 +772,7 @@ static void retire_old_max_skip_cycles_discovery(esp_mqtt_client_handle_t client
     esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 1, 1);
 }
 
-// Issues all 7 publish_number_discovery() calls -- the ONE place these entities' HA-visible
+// Issues all 8 publish_number_discovery() calls -- the ONE place these entities' HA-visible
 // names/units/ranges are decided; ranges come straight from runtime_config.h so the clamp
 // applied on the device side can never drift from what HA's UI advertises. Current values come
 // from runtime_config_current_values(), fetched once here.
@@ -790,6 +802,9 @@ static void publish_number_discoveries(esp_mqtt_client_handle_t client, std::str
     publish_number_discovery(client, device_id, device_name, "Heater high-RH trigger", "heater_high_rh_trigger_minutes",
         runtime_config_topic_heater_high_rh_trigger_minutes(), HEATER_HIGH_RH_MIN_MINUTES, HEATER_HIGH_RH_MAX_MINUTES,
         HEATER_HIGH_RH_STEP_MINUTES, "min", cur.heater_high_rh_trigger_minutes);
+    publish_number_discovery(client, device_id, device_name, "TX power", "tx_power_dbm",
+        runtime_config_topic_tx_power_dbm(), TX_POWER_DBM_MIN, TX_POWER_DBM_MAX, TX_POWER_DBM_STEP,
+        "dBm", cur.tx_power_dbm);
 
     retire_old_max_skip_cycles_discovery(client, device_id);
 }
@@ -1039,32 +1054,35 @@ static bool run_publish_cycle(const PublishParams &params)
                                                       | DISC_DIAG
                                                       | DISC_UPDATE
                                                       | DISC_NUMBERS
-                                                      | DISC_SWITCH);
+                                                      | DISC_SWITCH
+                                                      | DISC_TXPOWER);
         const auto discoveryNeed = hasAny
             ? static_cast<uint16_t>(discoveryWant & ~s_discovery_sent_mask.load()) : uint16_t{0};
 
         // Expected ACKs must match what we actually publish below: one state message plus one
         // discovery message per still-owed sensor (two for DISC_BATT: Battery and Voltage;
         // two for DISC_DIAG: Boot count and Reset reason; two for DISC_UPDATE: update config
-        // and installed-version; fourteen for DISC_NUMBERS, discovery config + current-value
-        // state per HA `number` entity, 7 entities x 2 messages; two for DISC_SWITCH, discovery
+        // and installed-version; sixteen for DISC_NUMBERS, discovery config + current-value
+        // state per HA `number` entity, 8 entities x 2 messages; two for DISC_SWITCH, discovery
         // config + current-value state; two for DISC_HEATER: Heater problem and Heater run
         // count; two for DISC_RADIO: Radio TX time and Radio RX time; four for DISC_LINKQ: TX
         // retries, CCA failures, TX no-ack expiry and Parent link quality; one for DISC_UPLINK:
-        // Uplink signal strength). A fixed count assuming every discovery is sent would leave
-        // BIT_ALL_ACKED forever unset on any cycle that sends fewer, wrongly failing the cycle.
+        // Uplink signal strength; one for DISC_TXPOWER: TX power (active)). A fixed count
+        // assuming every discovery is sent would leave BIT_ALL_ACKED forever unset on any cycle
+        // that sends fewer, wrongly failing the cycle.
         const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
                                  + ((discoveryNeed & DISC_HUM) ? 1 : 0)
                                  + ((discoveryNeed & DISC_BATT) ? 2 : 0)
                                  + ((discoveryNeed & DISC_RSSI) ? 1 : 0)
                                  + ((discoveryNeed & DISC_DIAG) ? 2 : 0)
                                  + ((discoveryNeed & DISC_UPDATE) ? 2 : 0)
-                                 + ((discoveryNeed & DISC_NUMBERS) ? 14 : 0)
+                                 + ((discoveryNeed & DISC_NUMBERS) ? 16 : 0)
                                  + ((discoveryNeed & DISC_SWITCH) ? 2 : 0)
                                  + ((discoveryNeed & DISC_HEATER) ? 2 : 0)
                                  + ((discoveryNeed & DISC_RADIO) ? 2 : 0)
                                  + ((discoveryNeed & DISC_LINKQ) ? 4 : 0)
-                                 + ((discoveryNeed & DISC_UPLINK) ? 1 : 0);
+                                 + ((discoveryNeed & DISC_UPLINK) ? 1 : 0)
+                                 + ((discoveryNeed & DISC_TXPOWER) ? 1 : 0);
         const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
         // Set counters BEFORE publishing so the handler never races ahead
@@ -1151,6 +1169,13 @@ static bool run_publish_cycle(const PublishParams &params)
                 {.name = "Uplink signal strength", .topic_slug = "uplink_rssi",
                  .device_class = "signal_strength", .state_class = "measurement", .unit = "dBm",
                  .precision = 0, .key = "ur", .diagnostic = true});
+        // The dBm actually in effect right now -- distinct from the cfg/tx_power_dbm number's
+        // own retained echo, which can show an outstanding, still-unconfirmed trial value.
+        if (discoveryNeed & DISC_TXPOWER)
+            publish_discovery(client.get(), dev, dev_name,
+                {.name = "TX power (active)", .topic_slug = "tx_power_active",
+                 .state_class = "measurement", .unit = "dBm", .precision = 0, .key = "tp",
+                 .diagnostic = true});
         if (discoveryNeed & DISC_UPDATE)
             publish_update_discovery(client.get(), dev, dev_name);
         if (discoveryNeed & DISC_NUMBERS)
@@ -1201,6 +1226,11 @@ static bool run_publish_cycle(const PublishParams &params)
             if (stateLen > 0)
                 stateLen = format_append(stateBuf, stateLen - 1, STATE_DIAG_SUFFIX_FMT,
                                          s_cfg.boot_count, s_cfg.reset_reason);
+            // TX power in effect right now -- also boot-constant availability (always some
+            // value, table max at the very least), so also re-sent every state message.
+            if (stateLen > 0)
+                stateLen = format_append(stateBuf, stateLen - 1, STATE_TXPOWER_SUFFIX_FMT,
+                                         static_cast<int>(runtime_config_tx_power_active_dbm()));
 
             std::array<char, TOPIC_BUF> stateTopicBuf;
             const size_t stateTopicLen = format_into(stateTopicBuf, STATE_TOPIC_FMT, dev);

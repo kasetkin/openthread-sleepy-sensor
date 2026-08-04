@@ -18,6 +18,8 @@
 // PSA Crypto is the hash API in mbedtls 4.x (IDF 6.0) — mbedtls/sha256.h went private.
 #include "psa/crypto.h"
 
+#include "runtime_config.h"
+
 static const char *TAG = "ota-updater";
 
 // ── tuning ────────────────────────────────────────────────────────────────────
@@ -437,6 +439,11 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<float> batte
     // child left at the OTA poll rate burns the battery orders of magnitude faster than
     // its steady-state cadence.
     s_link->onOtaWindowBegin();
+    // TX power stays at table max for the whole OTA window -- a power experiment must never be
+    // what breaks a firmware update. Not folded into onOtaWindowBegin() itself: that seam is a
+    // per-transport poll-period concern, while this bookkeeping is transport-agnostic and
+    // already lives entirely in runtime_config.cpp.
+    runtime_config_tx_power_pin_max_for_ota();
 
     // ── pull chunks strictly in order, subscribes pipelined ──────────────────
     // A 2-deep subscription window keeps the next chunk queued at the broker/parent while
@@ -539,6 +546,10 @@ void ota_run_session(esp_mqtt_client_handle_t client, std::optional<float> batte
     // Back to sleepy link mode in BOTH outcomes — on success the parent should see a clean
     // MLE mode transition before we drop off for the reboot.
     s_link->onOtaWindowEnd();
+    // Restores whatever TX power was actually active before the pin above -- see
+    // runtime_config_tx_power_pin_max_for_ota()'s doc comment. Runs on every abort path, same
+    // guarantee as onOtaWindowEnd() right above it.
+    runtime_config_tx_power_unpin_after_ota();
 
     if (!ok) {
         // A session that fetched even one chunk is forward progress thanks to resume; only

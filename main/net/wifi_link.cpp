@@ -152,6 +152,16 @@ static void refresh()
     esp_wifi_connect();
 }
 
+static esp_err_t set_tx_power_dbm(int8_t dbm)
+{
+    // esp_wifi's API is quarter-dBm, not whole dBm -- a real conversion so cfg/tx_power_dbm
+    // means roughly the same physical thing on both transports.
+    const esp_err_t err = esp_wifi_set_max_tx_power(static_cast<int8_t>(dbm * 4));
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "esp_wifi_set_max_tx_power(%d dBm = %d) failed: 0x%x", dbm, dbm * 4, err);
+    return err;
+}
+
 // Wi-Fi fills only the downlink RSSI. The rest of LinkStats is 802.15.4/OpenThread-specific
 // (radio TX/RX time accounting, MAC retry counters, the parent's own view of our link) and has
 // no Wi-Fi equivalent this device can read, so those fields stay absent and the corresponding
@@ -184,5 +194,6 @@ NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
     link.onOtaWindowEnd = noop;
     link.refresh = refresh;
     link.readLinkStats = readApLinkStats;
+    link.setTxPowerDbm = set_tx_power_dbm;
     return link;
 }

@@ -97,6 +97,15 @@ static uint32_t parse_as_uint32_or(std::string_view content, std::string_view ke
     return def;
 }
 
+static int32_t parse_as_int32_or(std::string_view content, std::string_view key, int32_t def)
+{
+    if (const auto v = parse_as_int32(content, key))
+        return *v;
+    ESP_LOGW("main", "device_config.yaml missing/invalid '%.*s', falling back to %ld",
+             static_cast<int>(key.size()), key.data(), static_cast<long>(def));
+    return def;
+}
+
 // device_config.yaml expresses the heater schedule in wall-clock minutes; the LP program counts
 // poll cycles (see lp_sensor_core_config_t). Ceiling division so any non-zero schedule is at
 // least one cycle; 0 passes through as the "disabled" sentinel.
@@ -374,7 +383,15 @@ extern "C" void app_main(void)
 
     // Gate each sensor cycle on the network link being ready (OT: Thread CHILD role) so the
     // task never light-sleeps before attachment (which would stall OpenThread's MLE attach).
-    sensorTask->configureAttachGate(s_link.waitForReady);
+    // Wrapped (rather than passing s_link.waitForReady directly) so TX power's "always transmit
+    // at table max until the very first successful attach" rule has exactly one place to live --
+    // see runtime_config_tx_power_note_first_attach()'s doc comment.
+    sensorTask->configureAttachGate([](uint32_t timeoutMs) {
+        const bool ready = s_link.waitForReady(timeoutMs);
+        if (ready)
+            runtime_config_tx_power_note_first_attach();
+        return ready;
+    });
 
     // On a failed publish the sensor task asks the link to refresh (OT: re-scan Thread
     // network data for a changed NAT64 prefix; Wi-Fi: kick a reconnect), so it recovers
@@ -395,6 +412,10 @@ extern "C" void app_main(void)
         parse_as_uint32_or(device_config_yaml(), "heater_period_minutes", 1440), "htr_period_min");
     const uint32_t heater_high_rh_trigger_minutes = runtime_config_nvs_override(
         parse_as_uint32_or(device_config_yaml(), "heater_high_rh_trigger_minutes", 60), "htr_hi_rh_trig");
+    const int32_t tx_power_known_good_dbm = runtime_config_nvs_override(
+        parse_as_int32_or(device_config_yaml(), "tx_power_dbm",
+                          static_cast<int32_t>(TX_POWER_TABLE_MAX_DBM)),
+        "txp_known_good");
 
     const lp_sensor_core_config_t lpConfig {
         .temp_offset_c = runtime_config_nvs_override(
@@ -436,7 +457,8 @@ extern "C" void app_main(void)
     // applied above (already NVS-override-resolved), and builds the <device_id>/cfg/* topic
     // strings HA drives via MQTT number/switch entities.
     runtime_config_init(mqtt_name_and_id, lp_poll_interval_sec, lpConfig, max_publish_gap_sec,
-                         heater_period_minutes, heater_high_rh_trigger_minutes, ext_antenna_on);
+                         heater_period_minutes, heater_high_rh_trigger_minutes, ext_antenna_on,
+                         tx_power_known_good_dbm, &s_link);
 
     xTaskCreate([](void *) static
     {

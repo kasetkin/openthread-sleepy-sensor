@@ -77,6 +77,21 @@ inline std::optional<uint32_t> parse_as_uint32(std::string_view content, std::st
 }
 
 // See parse_as_float()'s comment -- same missing/malformed-vs-legitimate-value distinction.
+// Signed counterpart to parse_as_uint32() -- needed for keys (like tx_power_dbm) whose value
+// can legitimately be negative; std::from_chars handles the leading '-' natively.
+inline std::optional<int32_t> parse_as_int32(std::string_view content, std::string_view key)
+{
+    const std::string s = yaml_get_string(content, key);
+    if (s.empty())
+        return std::nullopt;
+    int32_t value = 0;
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return std::nullopt;
+    return value;
+}
+
+// See parse_as_float()'s comment -- same missing/malformed-vs-legitimate-value distinction.
 // Accepts only the literal strings "true" and "false".
 inline std::optional<bool> parse_as_bool(std::string_view content, std::string_view key)
 {

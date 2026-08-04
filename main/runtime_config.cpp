@@ -44,6 +44,26 @@ static uint32_t s_heater_period_minutes = 0;
 static uint32_t s_heater_high_rh_trigger_minutes = 0;
 static bool s_ext_antenna_on = false;
 
+// ── TX power (Phase B) ───────────────────────────────────────────────────────────────────────
+// Runtime state is genuinely dBm-range (int8_t), unlike the wider int32_t used at the
+// MQTT-parse/HA-facing boundary (PendingCfg, RuntimeConfigValues) -- narrowed once, right after
+// the clamp, and never again. s_tx_power_has_pending true means a trial is outstanding and not
+// yet confirmed; s_tx_power_known_good is what a revert falls back to.
+static const NetworkLink *s_link = nullptr;
+static std::string s_topic_tx_power_dbm;
+static int8_t s_tx_power_known_good = TX_POWER_TABLE_MAX_DBM;
+static int8_t s_tx_power_pending = TX_POWER_TABLE_MAX_DBM;
+static bool s_tx_power_has_pending = false;
+static uint32_t s_tx_power_unconfirmed_cycles = 0;
+// What the radio is ACTUALLY set to right now -- stays at table max until the first successful
+// attach (see runtime_config_tx_power_note_first_attach()), independent of any persisted state.
+static int8_t s_tx_power_active_dbm = TX_POWER_TABLE_MAX_DBM;
+static bool s_tx_power_first_attach_done = false;
+// Deliberately shorter than UNCONFIRMED_OTA_REBOOT_AFTER_CYCLES (5, sensorstask.h): a bad TX
+// power is higher-severity than an unconfirmed OTA image -- no reboot/rollback fixes it, only
+// physical access does -- so the grace window should be the tighter of the two.
+static constexpr uint32_t TX_POWER_REVERT_AFTER_CYCLES = 3;
+
 // Every value HA has sent since the last runtime_config_apply_pending() call, guarded by
 // s_mutex. Mirrors ota_updater.cpp's Manifest/s_mutex pattern: the event-handler-context
 // writer takes the mutex only for a fast, non-blocking struct copy.
@@ -57,6 +77,7 @@ struct PendingCfg
     bool heater_period_set = false;
     bool heater_high_rh_set = false;
     bool ext_antenna_set = false;
+    bool tx_power_dbm_set = false;
 
     float temp_offset_c = 0.0f;
     float temp_min_change_c = 0.0f;
@@ -66,6 +87,7 @@ struct PendingCfg
     uint32_t heater_period_minutes = 0;
     uint32_t heater_high_rh_trigger_minutes = 0;
     bool ext_antenna_on = false;
+    int32_t tx_power_dbm = 0;
 };
 static PendingCfg s_pending;
 static SemaphoreHandle_t s_mutex = nullptr;
@@ -83,6 +105,12 @@ static bool parse_float(const char *data, size_t len, float &out)
 }
 
 static bool parse_uint32(const char *data, size_t len, uint32_t &out)
+{
+    const auto [ptr, ec] = std::from_chars(data, data + len, out);
+    return ec == std::errc{} && ptr == data + len;
+}
+
+static bool parse_int32(const char *data, size_t len, int32_t &out)
 {
     const auto [ptr, ec] = std::from_chars(data, data + len, out);
     return ec == std::errc{} && ptr == data + len;
@@ -120,7 +148,8 @@ void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
                           const lp_sensor_core_config_t &boot_config,
                           uint32_t max_publish_gap_sec,
                           uint32_t heater_period_minutes, uint32_t heater_high_rh_trigger_minutes,
-                          bool ext_antenna_on)
+                          bool ext_antenna_on, int32_t tx_power_known_good_dbm,
+                          const NetworkLink *link)
 {
     s_poll_interval_sec = poll_interval_sec;
     s_shadow = boot_config;
@@ -128,6 +157,14 @@ void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
     s_heater_period_minutes = heater_period_minutes;
     s_heater_high_rh_trigger_minutes = heater_high_rh_trigger_minutes;
     s_ext_antenna_on = ext_antenna_on;
+
+    s_link = link;
+    s_tx_power_known_good = static_cast<int8_t>(
+        std::clamp(tx_power_known_good_dbm, TX_POWER_DBM_MIN, TX_POWER_DBM_MAX));
+    // Radio genuinely stays at table max until the first successful attach -- see
+    // runtime_config_tx_power_note_first_attach() -- regardless of whatever known-good/pending
+    // state gets loaded from NVS below.
+    s_tx_power_active_dbm = TX_POWER_TABLE_MAX_DBM;
 
     const auto full = [&](std::string_view suffix) {
         return std::format("{}/{}", device_id, suffix);
@@ -141,6 +178,22 @@ void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
     s_topic_heater_period_minutes          = full(CFG_SUFFIX_HEATER_PERIOD_MIN);
     s_topic_heater_high_rh_trigger_minutes = full(CFG_SUFFIX_HEATER_HIGH_RH_MIN);
     s_topic_ext_antenna                    = full(CFG_SUFFIX_EXT_ANTENNA);
+    s_topic_tx_power_dbm                   = full(CFG_SUFFIX_TX_POWER_DBM);
+
+    // A trial left outstanding by a previous boot -- runtime_config_tx_power_note_first_attach()
+    // decides what to do with it (never resumed, always treated as failed).
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        uint8_t pendFlag = 0;
+        if (nvs_get_u8(nvs, "txp_pend_flag", &pendFlag) == ESP_OK && pendFlag) {
+            int8_t pending = TX_POWER_TABLE_MAX_DBM;
+            if (nvs_get_i8(nvs, "txp_pending", &pending) == ESP_OK) {
+                s_tx_power_pending = pending;
+                s_tx_power_has_pending = true;
+            }
+        }
+        nvs_close(nvs);
+    }
 
     if (!s_mutex)
         s_mutex = xSemaphoreCreateMutex();
@@ -155,6 +208,7 @@ const char *runtime_config_topic_max_publish_gap_sec()            { return s_top
 const char *runtime_config_topic_heater_period_minutes()          { return s_topic_heater_period_minutes.c_str(); }
 const char *runtime_config_topic_heater_high_rh_trigger_minutes() { return s_topic_heater_high_rh_trigger_minutes.c_str(); }
 const char *runtime_config_topic_ext_antenna()                    { return s_topic_ext_antenna.c_str(); }
+const char *runtime_config_topic_tx_power_dbm()                   { return s_topic_tx_power_dbm.c_str(); }
 
 void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
                                   const char *data, size_t data_len)
@@ -241,6 +295,15 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         s_pending.ext_antenna_on = value;
         s_pending.ext_antenna_set = true;
         xSemaphoreGive(s_mutex);
+    } else if (topic_is(topic, topic_len, s_topic_tx_power_dbm)) {
+        int32_t v;
+        if (!parse_int32(data, data_len, v))
+            return;
+        v = std::clamp(v, TX_POWER_DBM_MIN, TX_POWER_DBM_MAX);
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_pending.tx_power_dbm = v;
+        s_pending.tx_power_dbm_set = true;
+        xSemaphoreGive(s_mutex);
     }
 }
 
@@ -286,6 +349,18 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
         ++applied;
     }
 
+    // A fresh trial always resets the unconfirmed-cycle counter -- see
+    // runtime_config_tx_power_note_cycle_result() for how it's driven from here on.
+    if (snap.tx_power_dbm_set) {
+        const int8_t dbm = static_cast<int8_t>(snap.tx_power_dbm);
+        s_tx_power_pending = dbm;
+        s_tx_power_has_pending = true;
+        s_tx_power_unconfirmed_cycles = 0;
+        if (s_link && s_link->setTxPowerDbm && s_link->setTxPowerDbm(dbm) == ESP_OK)
+            s_tx_power_active_dbm = dbm;
+        ++applied;
+    }
+
     if (applied == 0)
         return 0;
 
@@ -312,6 +387,10 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
             nvs_set_u32(nvs, "htr_hi_rh_trig", snap.heater_high_rh_trigger_minutes);
         if (snap.ext_antenna_set)
             nvs_set_u8(nvs, "ext_antenna", snap.ext_antenna_on ? 1 : 0);
+        if (snap.tx_power_dbm_set) {
+            nvs_set_i8(nvs, "txp_pending", static_cast<int8_t>(snap.tx_power_dbm));
+            nvs_set_u8(nvs, "txp_pend_flag", 1);
+        }
         if (nvs_commit(nvs) != ESP_OK)
             ESP_LOGE(TAG, "nvs_commit failed — change applied live but may not survive a reboot");
         nvs_close(nvs);
@@ -336,6 +415,7 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
         if (snap.heater_period_set)   { appendNum(val, snap.heater_period_minutes); echo(s_topic_heater_period_minutes.c_str()); }
         if (snap.heater_high_rh_set)  { appendNum(val, snap.heater_high_rh_trigger_minutes); echo(s_topic_heater_high_rh_trigger_minutes.c_str()); }
         if (snap.ext_antenna_set)     { val = snap.ext_antenna_on ? "ON" : "OFF"; echo(s_topic_ext_antenna.c_str()); }
+        if (snap.tx_power_dbm_set)    { appendNum(val, snap.tx_power_dbm); echo(s_topic_tx_power_dbm.c_str()); }
     }
 
     ESP_LOGI(TAG, "applied %d runtime config change(s)", applied);
@@ -388,6 +468,21 @@ bool runtime_config_nvs_override(bool yaml_or_default, const char *nvs_key)
     return value != 0;
 }
 
+int32_t runtime_config_nvs_override(int32_t yaml_or_default, const char *nvs_key)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK)
+        return yaml_or_default;
+    int32_t value = 0;
+    const esp_err_t err = nvs_get_i32(nvs, nvs_key, &value);
+    nvs_close(nvs);
+    if (err != ESP_OK)
+        return yaml_or_default;
+    ESP_LOGI(TAG, "'%s': NVS override %ld (yaml/default was %ld)",
+             nvs_key, static_cast<long>(value), static_cast<long>(yaml_or_default));
+    return value;
+}
+
 RuntimeConfigValues runtime_config_current_values()
 {
     return RuntimeConfigValues{
@@ -399,5 +494,91 @@ RuntimeConfigValues runtime_config_current_values()
         .heater_period_minutes = s_heater_period_minutes,
         .heater_high_rh_trigger_minutes = s_heater_high_rh_trigger_minutes,
         .ext_antenna_on = s_ext_antenna_on,
+        .tx_power_dbm = s_tx_power_has_pending ? int32_t(s_tx_power_pending) : int32_t(s_tx_power_known_good),
     };
+}
+
+int8_t runtime_config_tx_power_active_dbm()
+{
+    return s_tx_power_active_dbm;
+}
+
+void runtime_config_tx_power_note_first_attach()
+{
+    if (s_tx_power_first_attach_done)
+        return;
+    s_tx_power_first_attach_done = true;
+
+    if (s_tx_power_has_pending) {
+        // A trial left outstanding by a PREVIOUS boot -- a boot happening at all isn't evidence
+        // the value was safe (it could itself be a symptom of a bad TX power, or unrelated), so
+        // it's discarded rather than resumed with a fresh grace window.
+        ESP_LOGW(TAG, "TX power: discarding unconfirmed trial (%d dBm) left over from a previous "
+                      "boot, falling back to known-good (%d dBm)",
+                 s_tx_power_pending, s_tx_power_known_good);
+        s_tx_power_has_pending = false;
+        s_tx_power_unconfirmed_cycles = 0;
+        nvs_handle_t nvs;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_set_u8(nvs, "txp_pend_flag", 0);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+    }
+
+    const int8_t dbm = s_tx_power_has_pending ? s_tx_power_pending : s_tx_power_known_good;
+    if (s_link && s_link->setTxPowerDbm && s_link->setTxPowerDbm(dbm) == ESP_OK)
+        s_tx_power_active_dbm = dbm;
+}
+
+void runtime_config_tx_power_note_cycle_result(bool ok)
+{
+    if (!s_tx_power_has_pending)
+        return;
+
+    if (ok) {
+        ESP_LOGI(TAG, "TX power: trial (%d dBm) confirmed, promoted to known-good",
+                 s_tx_power_pending);
+        s_tx_power_known_good = s_tx_power_pending;
+        s_tx_power_has_pending = false;
+        s_tx_power_unconfirmed_cycles = 0;
+        nvs_handle_t nvs;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_set_i8(nvs, "txp_known_good", s_tx_power_known_good);
+            nvs_set_u8(nvs, "txp_pend_flag", 0);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+        return;
+    }
+
+    if (++s_tx_power_unconfirmed_cycles < TX_POWER_REVERT_AFTER_CYCLES)
+        return;
+
+    ESP_LOGE(TAG, "TX power: trial (%d dBm) unconfirmed for %lu cycles — reverting to known-good "
+                  "(%d dBm)",
+             s_tx_power_pending, static_cast<unsigned long>(s_tx_power_unconfirmed_cycles),
+             s_tx_power_known_good);
+    s_tx_power_has_pending = false;
+    s_tx_power_unconfirmed_cycles = 0;
+    if (s_link && s_link->setTxPowerDbm && s_link->setTxPowerDbm(s_tx_power_known_good) == ESP_OK)
+        s_tx_power_active_dbm = s_tx_power_known_good;
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, "txp_pend_flag", 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
+
+void runtime_config_tx_power_pin_max_for_ota()
+{
+    if (s_link && s_link->setTxPowerDbm)
+        s_link->setTxPowerDbm(TX_POWER_TABLE_MAX_DBM);
+}
+
+void runtime_config_tx_power_unpin_after_ota()
+{
+    if (s_link && s_link->setTxPowerDbm)
+        s_link->setTxPowerDbm(s_tx_power_active_dbm);
 }

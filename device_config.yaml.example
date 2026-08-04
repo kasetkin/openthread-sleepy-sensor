@@ -51,6 +51,12 @@ heater_period_minutes: "1440"
 # MQTT tunable: <device_id>/cfg/heater_high_rh_trigger_minutes
 heater_high_rh_trigger_minutes: "60"
 
+# TX power ceiling in dBm, applied to the 802.15.4/Wi-Fi radio. -15 to 20; 20 (table max) is
+# this device's behavior before this feature existed. A value too low to sustain the uplink
+# auto-reverts within a few cycles -- see the README's "Radio TX power" section.
+# MQTT tunable: <device_id>/cfg/tx_power_dbm
+tx_power_dbm: "20"
+
 # Battery measurement. When "true", the HP core reads the battery voltage on GPIO2 (through the
 # resistor divider below) right before each publish and adds it to the MQTT state message;
 # readings never trigger a publish by themselves. Only the literal strings "true"/"false" are

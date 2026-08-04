@@ -6,6 +6,7 @@
 
 #include "mqtt_client.h"
 #include "lp_sensor_core.h"
+#include "network_link.h"
 
 // HA-tunable device parameters over MQTT, applied without a reflash. Split of responsibilities
 // with mqtt_sender.cpp (which owns the per-cycle client), mirroring ota_updater.h/.cpp's shape:
@@ -33,7 +34,8 @@ inline constexpr std::string_view CFG_SUFFIX_MAX_PUBLISH_GAP_SEC = "cfg/max_publ
 inline constexpr std::string_view CFG_SUFFIX_HEATER_PERIOD_MIN  = "cfg/heater_period_minutes";
 inline constexpr std::string_view CFG_SUFFIX_HEATER_HIGH_RH_MIN = "cfg/heater_high_rh_trigger_minutes";
 inline constexpr std::string_view CFG_SUFFIX_EXT_ANTENNA        = "cfg/ext_antenna";
-// One SUBSCRIBE for all 8 topics, not 8 -- minimizes SUBSCRIBE-packet overhead in the brief
+inline constexpr std::string_view CFG_SUFFIX_TX_POWER_DBM       = "cfg/tx_power_dbm";
+// One SUBSCRIBE for all 9 topics, not 9 -- minimizes SUBSCRIBE-packet overhead in the brief
 // per-cycle awake window (see run_publish_cycle()'s existing manifest/install subscribes).
 inline constexpr std::string_view CFG_SUFFIX_WILDCARD           = "cfg/#";
 
@@ -71,6 +73,15 @@ inline constexpr uint32_t HEATER_PERIOD_STEP_MINUTES = 1;
 inline constexpr uint32_t HEATER_HIGH_RH_MIN_MINUTES = 0;
 inline constexpr uint32_t HEATER_HIGH_RH_MAX_MINUTES = 1440;
 inline constexpr uint32_t HEATER_HIGH_RH_STEP_MINUTES = 1;
+// dBm is always integral (the PHY table itself quantizes to whole dBm), so this stays a signed
+// integer end to end rather than float -- see runtime_config.cpp's design note.
+inline constexpr int32_t TX_POWER_DBM_MIN = -15;
+inline constexpr int32_t TX_POWER_DBM_MAX = 20;
+inline constexpr int32_t TX_POWER_DBM_STEP = 1;
+// The radio's PHY-table ceiling AND the always-safe fallback: current pre-feature behavior,
+// applied before the first successful attach, during every OTA window, and whenever no
+// known-good value has ever been confirmed.
+inline constexpr int8_t TX_POWER_TABLE_MAX_DBM = 20;
 
 // Call once from main.cpp, right after lp_sensor_core_start() succeeds. `boot_config` seeds
 // this module's shadow of the 7 numeric fields (lp_sensor_core_apply_config() always writes
@@ -82,19 +93,25 @@ inline constexpr uint32_t HEATER_HIGH_RH_STEP_MINUTES = 1;
 // are the same boot-resolved values `boot_config`/enableExtAntenna() were already built from, in
 // their HA-facing units (minutes/seconds, not LP cycles; boot_config only carries the
 // cycle-converted form) -- needed so runtime_config_current_values() has a real value to report
-// from the very first boot.
+// from the very first boot. `tx_power_known_good_dbm` is the boot-resolved TX power ceiling
+// (NVS override -> device_config.yaml -> table max); `link` lets this module call
+// NetworkLink::setTxPowerDbm() itself for the post-attach apply / live-change / OTA-pin-restore
+// paths -- see the TX power section below.
 void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
                           const lp_sensor_core_config_t &boot_config,
                           uint32_t max_publish_gap_sec,
                           uint32_t heater_period_minutes, uint32_t heater_high_rh_trigger_minutes,
-                          bool ext_antenna_on);
+                          bool ext_antenna_on, int32_t tx_power_known_good_dbm,
+                          const NetworkLink *link);
 
-// The 8 HA-tunable parameters' current resolved value, in HA-facing units (heater fields in
+// The 9 HA-tunable parameters' current resolved value, in HA-facing units (heater fields in
 // minutes, max_publish_gap in seconds -- neither in LP cycles) -- whichever is freshest of the
 // boot default/NVS override or the latest MQTT change accepted since. Used by mqtt_sender.cpp to
 // publish each cfg/* topic's retained state alongside its discovery config (see
 // publish_number_discovery()/publish_switch_discovery()), so HA never shows a number/switch
-// entity as "Unknown" simply because it has never been commanded.
+// entity as "Unknown" simply because it has never been commanded. tx_power_dbm here can show an
+// outstanding, still-unconfirmed trial -- see runtime_config_tx_power_active_dbm() below for
+// "what's actually in effect right now".
 struct RuntimeConfigValues
 {
     float temp_offset_c;
@@ -105,6 +122,7 @@ struct RuntimeConfigValues
     uint32_t heater_period_minutes;
     uint32_t heater_high_rh_trigger_minutes;
     bool ext_antenna_on;
+    int32_t tx_power_dbm;
 };
 RuntimeConfigValues runtime_config_current_values();
 
@@ -118,6 +136,35 @@ const char *runtime_config_topic_max_publish_gap_sec();
 const char *runtime_config_topic_heater_period_minutes();
 const char *runtime_config_topic_heater_high_rh_trigger_minutes();
 const char *runtime_config_topic_ext_antenna();
+const char *runtime_config_topic_tx_power_dbm();
+
+// ── TX power (Phase B) ──────────────────────────────────────────────────────────────────────
+// A tx_power_dbm value low enough to break the uplink would strand the device (its only
+// recovery path, OTA over MQTT over Thread, needs exactly the link a bad value just broke), so
+// unlike the other 8 cfg/* fields this one goes through a pending/known-good/revert state
+// machine before a change is trusted. See runtime_config.cpp for the full design.
+
+// "TX power (active)" diagnostic value -- separate from RuntimeConfigValues::tx_power_dbm
+// (which can show an unconfirmed trial): whatever dBm the ordinary policy last actually applied.
+int8_t runtime_config_tx_power_active_dbm();
+
+// Call once, idempotently, the first time (this boot) NetworkLink::waitForReady() succeeds. Safe
+// to call on every subsequent successful attach too -- only the first call this boot does
+// anything. Before this fires the radio stays at its native table-max power regardless of any
+// persisted state. A trial left outstanding by a PREVIOUS boot is treated as failed, not resumed.
+void runtime_config_tx_power_note_first_attach();
+
+// Call once per sensor-task wake to report this cycle's outcome for TX-power confirm/revert
+// purposes. Needs TWO tap points in sensorstask.cpp -- both a Thread attach failure and an
+// MQTT publish failure are evidence a bad TX power broke the link; see sensorstask.cpp's call
+// sites. No-op if no trial is outstanding.
+void runtime_config_tx_power_note_cycle_result(bool ok);
+
+// OTA-window bracket -- call adjacent to NetworkLink::onOtaWindowBegin()/onOtaWindowEnd() in
+// ota_updater.cpp, not folded into those seams (TX-power pin/restore is transport-agnostic
+// bookkeeping that belongs here, not duplicated per-transport).
+void runtime_config_tx_power_pin_max_for_ota();
+void runtime_config_tx_power_unpin_after_ota();
 
 // Route every MQTT_EVENT_DATA here (esp-mqtt event-handler context), alongside the sibling
 // ota_on_mqtt_data() call. Parses the (small, single-event, never chunked) payload,
@@ -142,3 +189,4 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client);
 float    runtime_config_nvs_override(float yaml_or_default, const char *nvs_key);
 uint32_t runtime_config_nvs_override(uint32_t yaml_or_default, const char *nvs_key);
 bool     runtime_config_nvs_override(bool yaml_or_default, const char *nvs_key);
+int32_t  runtime_config_nvs_override(int32_t yaml_or_default, const char *nvs_key);
