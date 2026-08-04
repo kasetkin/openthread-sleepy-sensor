@@ -6,6 +6,12 @@ percentages match what HA's own battery sensor shows, then fits % vs. elapsed
 time across all samples (robust to the ~2 mV ADC quantization noise) to derive
 mean mW / mA the same way docs/power-usage-from-usb.ods does it by hand.
 
+Before trusting the result, confirm the export window is OTA-free (check the HA
+update entity's history): an OTA's few high-power minutes are enough to skew a
+multi-day average by 20%+, as happened on 2026-08-01ish (0.40-0.46 mA measured
+with OTA activity inside the window vs. 0.335 mA on an OTA-free window covering
+much of the same period).
+
     tools/battery_power_from_history.py
 """
 import csv

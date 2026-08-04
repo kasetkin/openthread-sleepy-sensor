@@ -300,3 +300,37 @@ and `CONFIG_OPENTHREAD_LINK_METRICS` and read once per publish window as per-cyc
 change no radio behaviour; they exist so the TX-power decision can be made from measurements
 rather than guessed. Note also that `CONFIG_OPENTHREAD_PARENT_SEARCH_RSS_THRESHOLD=-65` operates
 on *downlink* RSSI and does **not** interact with our transmit power.
+
+### Measured result: the gate says build the knob
+
+With the instrumentation flashed and running long enough to gather real data, the `ΔI_avg =
+ΔI_peak(P) × t_tx / cycle_period` decision above resolves against actual numbers instead of the
+hypothetical ~5 ms/~50 ms cycle examples. From a 133.4 h, OTA-free HA export (2026-07-29 →
+2026-08-04):
+
+- **Radio TX duty cycle**: `sum(Radio TX time) / wall-clock window` = 207,195 ms / 480,205 s =
+  **0.043 %** (mean 87.6 ms of TX-on time per cycle, ~2365 cycles).
+- **Battery baseline**: 0.3354 mA / 1.367 mW, cross-checked two independent ways in the same
+  window (a from-scratch fit of `voltage` against the etalon curve, and the firmware's own
+  reported `battery` % sensor) agreeing to 3 significant figures — **~361 days** implied runtime
+  on a full 3200 mAh pack. An earlier pass that happened to include an OTA update inside the
+  averaging window read ~20–27 % higher — OTA's few high-power minutes are enough to skew a
+  multi-day average, so any future re-measurement should confirm the window is OTA-free first.
+
+| Step | Saves | % of total battery current |
+|---|---|---|
+| 20 → 12 dBm | ~50.9 µA | **15.2 %** |
+| 20 → 0 dBm | ~80.3 µA | **23.9 %** |
+| 20 → −15 dBm | ~91.9 µA | **27.4 %** |
+
+Even the conservative 12 dBm step clears a >5 % "worth building" bar by 3×, so the runtime knob
+(`cfg/tx_power_dbm`, with the brick-hazard revert-on-failure design already worked out) is next.
+
+The same export refines the Phase C ("auto" mode) design: `TX retries` stayed clean (0.048/cycle
+mean, only 4.1 % of cycles had any) and `TX no-ack expiry` was zero for the whole window, but `CCA
+failures` hit **≥1 on 56.6 % of cycles** — frequent channel contention independent of our TX power
+(likely Wi-Fi coexistence), so an adaptive controller must not gate its step-down on "zero CCA
+failures for N cycles" as originally sketched; retries and no-ack expiry are the clean signals to
+gate on instead. `Uplink signal strength` averaged **−48.6 dBm**, ~15 dB above the −85 dBm target
+margin Phase C would step down toward — comfortable headroom. `Parent link quality` stayed almost
+entirely absent (2 samples in 2365 cycles), confirming it's too sparse to gate on alone.
