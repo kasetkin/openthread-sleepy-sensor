@@ -1,6 +1,6 @@
 {
   "name": "ESP32 Sensor OpenThread MQTT",
-  "image": "espressif/idf:v6.0.1",
+  "image": "espressif/idf:v6.0.2",
   "runArgs": [
     // "--device=/dev/ttyACM0",
     // "--device=/dev/ttyUSB0",
