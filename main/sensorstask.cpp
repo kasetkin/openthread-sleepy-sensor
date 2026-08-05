@@ -8,6 +8,7 @@
 #include <esp_log.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 
 #include "common_utils.h"
 #include "mqtt_sender.h"
@@ -199,6 +200,10 @@ void SensorsTask::executeTask()
                     // cycle. Any failure degrades to publishing without the battery fields (HA
                     // then keeps the entities' previous values).
                     if (m_settings.readVoltageViaAdc) {
+                        // Diagnostic for the light-sleep power investigation's hp_awake_time
+                        // residual -- brackets the whole create->read->delete chain, not just
+                        // the reads, since init/calibration is a real per-cycle cost too.
+                        const int64_t adcStartUs = esp_timer_get_time();
                         if (initAdc() == ESP_OK) {
                             if (const auto milliVolts = readBatteryVoltageMilliV()) {
                                 v.batteryVoltageMilliV = *milliVolts;
@@ -212,6 +217,7 @@ void SensorsTask::executeTask()
                         } else {
                             ESP_LOGW(TAG, "battery ADC init failed, publishing without battery");
                         }
+                        v.adcTimeUs = static_cast<uint32_t>(esp_timer_get_time() - adcStartUs);
                     }
 
                     ESP_LOGI(TAG, "publishing LP-flagged value: %.2fC / %.2f%%RH",

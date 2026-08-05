@@ -381,7 +381,8 @@ extern "C" void app_main(void)
     {
         mqtt_send_sensor_data(values.envTemperature, values.envHumidity,
                               values.batteryPercent, values.batteryVoltageMilliV,
-                              values.heaterProblem, values.heaterRunCount);
+                              values.heaterProblem, values.heaterRunCount,
+                              values.adcTimeUs);
     });
 
     // Gate each sensor cycle on the network link being ready (OT: Thread CHILD role) so the

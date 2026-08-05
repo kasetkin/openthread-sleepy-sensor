@@ -14,6 +14,7 @@
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "mqtt_client.h"
@@ -67,6 +68,13 @@ enum DiscoveryBit : uint16_t {
     DISC_UPLINK  = 1 << 11,  // Uplink signal strength (the parent's RSSI measurement of US)
     DISC_TXPOWER = 1 << 12,  // TX power (active) diagnostic -- boot-constant, so always available
     DISC_AWAKE   = 1 << 13,  // HP awake time diagnostic -- boot-constant, so always available
+    // MQTT connect-wait diagnostic -- boot-constant, always available (every cycle attempts a
+    // connect). Battery ADC time is a sibling diagnostic added at the same time but deliberately
+    // does NOT get its own bit -- it piggybacks on DISC_BATT below, since it's only ever
+    // meaningful exactly when battery is (same code block, sensorstask.cpp). NOTE: only
+    // `1 << 15` remains free in this uint16_t after this entry -- widen to uint32_t before
+    // adding another one, don't silently exhaust the type.
+    DISC_MQTTCONN = 1 << 14,
 };
 
 static MqttConfig s_cfg;
@@ -120,6 +128,35 @@ struct MqttCtx
     std::atomic<int>   expected_acks{0};
     std::atomic<int>   received_acks{0};
 };
+
+// ── persistent client for the common (non-OTA) case ────────────────────────────
+// See project_light_sleep_power_investigation memory for the full research trail (esp-mqtt
+// source + espressif/esp-idf#11883) behind reusing this handle across cycles instead of a
+// fresh init()+destroy() every time. esp_mqtt_client_stop()/start() alone never touch the
+// buffers/transport list/outbox/config-string duplicates esp_mqtt_client_init() allocates --
+// only esp_mqtt_client_destroy() frees them (confirmed against esp-mqtt source) -- so reusing
+// the handle eliminates that allocation/heap-fragmentation churn on every cycle. Does NOT
+// eliminate the per-cycle FreeRTOS task-creation cost: esp_mqtt_client_start() unconditionally
+// spawns a fresh internal task every call regardless of whether the outer handle is reused.
+//
+// s_persistentCtx/s_persistentEg are ALSO file-scope persistent, not per-cycle stack locals
+// like the temporary OTA client's MqttCtx below -- this is load-bearing, not just tidiness:
+// esp-mqtt's event registration (esp_event_handler_register_with()) ADDS a handler entry
+// rather than replacing one, so re-registering a fresh per-cycle &ctx against a REUSED client
+// would accumulate dangling-pointer registrations pointing at freed stack frames once that
+// cycle's run_publish_cycle() returns. The event handler is registered exactly once, in
+// start_persistent_client() below, the first time the client is created.
+//
+// Never used for an actual OTA session -- see run_ota_if_due() below, which always connects
+// its own separate, OTA_MQTT_RX_BUFFER_SIZE-buffered temporary client instead, so the chunked
+// OTA protocol's "one full chunk per MQTT_EVENT_DATA event" invariant can never be broken by
+// a manifest+install-request pair that happens to arrive on this persistent connection
+// mid-cycle (a real race: subscribing to the OTA topics here is how such a pair is learned
+// about in the first place).
+static constexpr size_t SENSOR_MQTT_RX_BUFFER_SIZE = 2048;
+static EventGroupHandle_t s_persistentEg = nullptr;
+static MqttCtx s_persistentCtx;
+static esp_mqtt_client_handle_t s_persistentClient = nullptr;
 
 // One HA sensor entity's discovery config, declaratively. publish_discovery() appends only
 // the parts whose field is set, so entities without a device_class or unit (Boot count,
@@ -218,9 +255,12 @@ static constexpr std::string_view STATE_FMT_BOTH  = "{{\"t\":{:.3g},\"h\":{:.3g}
 static constexpr std::string_view STATE_FMT_TEMP  = "{{\"t\":{:.3g}}}";
 static constexpr std::string_view STATE_FMT_HUMID = "{{\"h\":{:.3g}}}";
 // Appended over the base state JSON's closing '}' when battery data is present (percent, then
-// volts) -- re-closes the object, so the result stays valid JSON. Kept as a suffix instead of
-// battery variants of the three STATE_FMT_* strings above: that would double them to six.
-static constexpr std::string_view STATE_BATT_SUFFIX_FMT = ",\"b\":{:.2f},\"v\":{:.3f}}}";
+// volts, then the ADC chain's own wall-clock time) -- re-closes the object, so the result stays
+// valid JSON. Kept as a suffix instead of battery variants of the three STATE_FMT_* strings
+// above: that would double them to six. adc_time_us is always set alongside the battery fields
+// by construction (sensorstask.cpp sets it inside the same readVoltageViaAdc block, timing the
+// whole create->read->delete chain) -- value_or(0) at the call site is defensive, not expected.
+static constexpr std::string_view STATE_BATT_SUFFIX_FMT = ",\"b\":{:.2f},\"v\":{:.3f},\"at\":{:.2f}}}";
 // Same overwrite-the-'}' chaining for the diagnostic values: link RSSI in dBm (only when the
 // transport has a reading this cycle), then boot count + reset reason (boot-constant, so
 // appended on every state message -- HA's expire_after would otherwise flag the two entities
@@ -246,6 +286,11 @@ static constexpr std::string_view STATE_TXPOWER_SUFFIX_FMT = ",\"tp\":{}}}";
 // same boot-constant availability, always appended. Float ms, not integer: a quiet cycle's
 // awake time is meaningfully sub-millisecond-precise at this scale (see STATE_RADIO_SUFFIX_FMT).
 static constexpr std::string_view STATE_AWAKE_SUFFIX_FMT = ",\"aw\":{:.2f}}}";
+// Wall-clock time spent waiting for start_client()'s TCP+MQTT CONNECT/CONNACK this cycle --
+// same boot-constant availability as STATE_AWAKE_SUFFIX_FMT above (every cycle attempts a
+// connect), always appended. Diagnostic for the light-sleep power investigation's
+// hp_awake_time residual (see project_light_sleep_power_investigation memory).
+static constexpr std::string_view STATE_MQTTCONN_SUFFIX_FMT = ",\"mc\":{:.2f}}}";
 
 // history_log.h backlog replay -- not part of HA discovery/state, a plain device -> broker
 // event stream an HA-side automation consumes (see README's "Blackout data buffering &
@@ -293,7 +338,9 @@ static constexpr size_t MAX_NAME_LEN         = std::max({sizeof("Temperature"), 
                                                          sizeof("Parent link quality"),
                                                          sizeof("Uplink signal strength"),
                                                          sizeof("TX power (active)"),
-                                                         sizeof("HP awake time")}) - 1;
+                                                         sizeof("HP awake time"),
+                                                         sizeof("Battery ADC time"),
+                                                         sizeof("MQTT connect time")}) - 1;
 static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max({sizeof("temperature"), sizeof("humidity"),
                                                          sizeof("battery"), sizeof("voltage"),
                                                          sizeof("signal_strength"), sizeof("problem")}) - 1;
@@ -308,7 +355,9 @@ static constexpr size_t MAX_TOPIC_SLUG_LEN   = std::max({MAX_DEVICE_CLASS_LEN + 
                                                          sizeof("link_quality_out"),
                                                          sizeof("uplink_rssi"),
                                                          sizeof("tx_power_active"),
-                                                         sizeof("hp_awake_time")}) - 1;
+                                                         sizeof("hp_awake_time"),
+                                                         sizeof("battery_adc_time"),
+                                                         sizeof("mqtt_connect_time")}) - 1;
 static constexpr size_t MAX_STATE_CLASS_LEN  = std::max({sizeof("measurement"),
                                                          sizeof("total_increasing")}) - 1;
 static constexpr size_t MAX_UNIT_LEN         = std::max({sizeof("°C"), sizeof("%"), sizeof("V"),
@@ -439,7 +488,7 @@ static constexpr size_t STATE_BUF = std::max({
     STATE_FMT_BOTH.size()  + 2 * MAX_FORMATTED_FLOAT_LEN,
     STATE_FMT_TEMP.size()  + MAX_FORMATTED_FLOAT_LEN,
     STATE_FMT_HUMID.size() + MAX_FORMATTED_FLOAT_LEN,
-}) + STATE_BATT_SUFFIX_FMT.size() + MAX_BATTERY_PCT_LEN + MAX_FORMATTED_FLOAT_LEN
+}) + STATE_BATT_SUFFIX_FMT.size() + MAX_BATTERY_PCT_LEN + 2 * MAX_FORMATTED_FLOAT_LEN
    + STATE_RSSI_SUFFIX_FMT.size() + MAX_RSSI_LEN
    + STATE_DIAG_SUFFIX_FMT.size() + MAX_BOOT_COUNT_LEN + MQTT_MAX_RESET_REASON_LEN
    + STATE_HEATER_SUFFIX_FMT.size() + MAX_ON_OFF_LEN + MAX_HEATER_RUN_COUNT_LEN
@@ -448,6 +497,7 @@ static constexpr size_t STATE_BUF = std::max({
    + STATE_UPLINK_SUFFIX_FMT.size() + MAX_RSSI_LEN
    + STATE_TXPOWER_SUFFIX_FMT.size() + MAX_TXPOWER_LEN
    + STATE_AWAKE_SUFFIX_FMT.size() + MAX_FORMATTED_FLOAT_LEN
+   + STATE_MQTTCONN_SUFFIX_FMT.size() + MAX_FORMATTED_FLOAT_LEN
    + 1;  // +1 NUL
 
 // Same lemma, applied to one backfill array: BACKFILL_ENTRY_REST_FMT (the wider of the two --
@@ -546,7 +596,10 @@ static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
 }
 
 // ── start a fresh client; clears event bits before connecting ─────────────────
-static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
+// Shared config, parameterized only by the RX buffer size (OTA_MQTT_RX_BUFFER_SIZE for the
+// temporary OTA client below, SENSOR_MQTT_RX_BUFFER_SIZE for the persistent one) -- every
+// other field is identical between the two clients.
+static esp_mqtt_client_config_t build_client_config(const char *uri, size_t rx_buffer_size)
 {
     esp_mqtt_client_config_t cfg = {};
     cfg.broker.address.uri       = uri;
@@ -558,9 +611,9 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
     // PINGRESP is queued behind megabytes of in-flight image on an ordered TCP stream, and
     // esp-mqtt parses one message at a time besides, so ANY finite keepalive shorter than the
     // whole transfer kills the download partway (hardware-observed: 3 silent "starting"-then-
-    // dead attempts). Liveness never rested on keepalive anyway: this per-cycle client's every
-    // wait is explicitly bounded (connect 5 s/15 s, ACK 4 s, sensorstask's 15 s publish cap,
-    // OTA's own 30 s no-progress watchdog), and the client is destroyed at cycle end.
+    // dead attempts). Liveness never rested on keepalive anyway: every wait on either client is
+    // explicitly bounded (connect 5 s/15 s, ACK 4 s, sensorstask's 15 s publish cap, OTA's own
+    // 30 s no-progress watchdog).
     cfg.session.disable_keepalive = true;
     // Outbox retransmission OFF in practice (default is a hair-trigger 1 s). Over TCP a
     // packet is never lost, only ACKed late — and during an OTA download SUBACKs queue for
@@ -570,12 +623,14 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
     // chunk" x9 storms and 20 s chunk timeouts). Our own bounded waits (4 s publish-ACK,
     // 20 s chunk) remain the real failure detectors.
     cfg.session.message_retransmit_timeout = 30000;
-    // RX buffer sized so a max-size OTA image chunk arrives as ONE MQTT_EVENT_DATA event —
-    // the property the chunked OTA protocol rests on (see ota_updater.h). Out-buffer stays
-    // small separately: the largest outbound message is a ~700 B discovery config, and
-    // leaving out_size 0 would clone the big RX size. Heap cost only while a per-cycle
-    // client lives.
-    cfg.buffer.size              = OTA_MQTT_RX_BUFFER_SIZE;
+    // rx_buffer_size is OTA_MQTT_RX_BUFFER_SIZE for the temporary OTA client (so a max-size
+    // image chunk arrives as ONE MQTT_EVENT_DATA event -- the property the chunked OTA
+    // protocol rests on, see ota_updater.h) or the much smaller SENSOR_MQTT_RX_BUFFER_SIZE for
+    // the persistent client (CONNACK + 3 SUBACKs + a small retained OTA-manifest/cfg echo, not
+    // chunk data -- see its doc comment). Out-buffer stays a single small size either way: the
+    // largest outbound message is a ~700 B discovery config, and leaving out_size 0 would
+    // clone the (possibly much bigger) RX size.
+    cfg.buffer.size              = rx_buffer_size;
     cfg.buffer.out_size          = 2048;
 
     if (s_cfg.use_tls) {
@@ -598,14 +653,56 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
     // plaintext: a full asymmetric handshake over a WAN link (searching/verifying against
     // the public CA bundle on this core) takes longer than a plaintext TCP connect+CONNACK.
     cfg.network.timeout_ms            = s_cfg.use_tls ? 8000 : 3000;
-    cfg.network.disable_auto_reconnect = true;  // we manage reconnects ourselves (one task per cycle)
+    cfg.network.disable_auto_reconnect = true;  // we manage reconnects ourselves
+    return cfg;
+}
 
-    ESP_LOGI(TAG, "connecting to %s (tls=%d)", uri, static_cast<int>(s_cfg.use_tls));
+// Starts a fresh, temporary, OTA_MQTT_RX_BUFFER_SIZE-buffered client -- used only by
+// run_ota_if_due() below, never by the common (non-OTA) path. Owned by the caller via
+// MqttClientPtr, destroyed (stop()+destroy()) at the end of its scope -- unlike the
+// persistent client, an actual OTA session is rare enough that paying full init/destroy cost
+// every time is fine, and it must never share the persistent client's smaller buffer (see
+// project_light_sleep_power_investigation memory for why that specific mixup would break the
+// chunked protocol).
+static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
+{
+    esp_mqtt_client_config_t cfg = build_client_config(uri, OTA_MQTT_RX_BUFFER_SIZE);
+    ESP_LOGI(TAG, "connecting (OTA) to %s (tls=%d)", uri, static_cast<int>(s_cfg.use_tls));
     xEventGroupClearBits(ctx.eg, BIT_CONNECTED | BIT_ALL_ACKED | BIT_ERROR);
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(client, MQTT_EVENT_ANY, mqtt_event_handler, &ctx);
     esp_mqtt_client_start(client);
     return client;
+}
+
+// Lazily creates (once) and returns the persistent, small-buffered client used for every
+// non-OTA cycle -- see its doc comment (s_persistentClient et al., above) for the full design
+// reasoning. Every call after the first just reuses the existing handle: esp_mqtt_client_set_uri()
+// is called every time regardless (not just on first init), since the broker URI can change at
+// runtime if OpenThread's NAT64 prefix moves underneath a long-lived client. Returns nullptr on
+// a first-time init failure (out of memory) -- the caller's connect-wait will then simply see
+// no BIT_CONNECTED, same as any other failed connect.
+static esp_mqtt_client_handle_t start_persistent_client(const char *uri)
+{
+    if (!s_persistentClient) {
+        s_persistentEg = xEventGroupCreate();
+        if (!s_persistentEg)
+            return nullptr;
+        s_persistentCtx.eg = s_persistentEg;
+
+        esp_mqtt_client_config_t cfg = build_client_config(uri, SENSOR_MQTT_RX_BUFFER_SIZE);
+        s_persistentClient = esp_mqtt_client_init(&cfg);
+        if (!s_persistentClient)
+            return nullptr;
+        esp_mqtt_client_register_event(s_persistentClient, MQTT_EVENT_ANY, mqtt_event_handler, &s_persistentCtx);
+    } else {
+        esp_mqtt_client_set_uri(s_persistentClient, uri);
+    }
+
+    ESP_LOGI(TAG, "connecting (persistent) to %s (tls=%d)", uri, static_cast<int>(s_cfg.use_tls));
+    xEventGroupClearBits(s_persistentEg, BIT_CONNECTED | BIT_ALL_ACKED | BIT_ERROR);
+    esp_mqtt_client_start(s_persistentClient);
+    return s_persistentClient;
 }
 
 // The trailing hex-MAC chars addOTMacSuffix() (main.cpp) appends to every device_id. A
@@ -916,12 +1013,32 @@ static void replay_history_if_pending(esp_mqtt_client_handle_t client, std::stri
 // resumes IN THIS CYCLE for as long as sessions keep dying by connection loss while making
 // progress. v4 ended the cycle on the first abort, so every ~1 s radio hiccup cost the
 // 0.5-3 min wait for the next LP-flagged publish cycle (~half the measured 17.6 min total).
-// Replaces the caller's client on reconnect; the caller's normal teardown then destroys
-// whichever client is current. On success ota_run_session() reboots and never returns.
-static void run_ota_if_due(MqttClientPtr &client, MqttCtx &ctx, std::optional<float> battery_percent)
+// Self-contained: connects its own temporary, OTA_MQTT_RX_BUFFER_SIZE-buffered client (see
+// start_client() above) rather than sharing whatever client the rest of this cycle used for
+// its own purposes -- the persistent client's smaller buffer must never carry chunk data (see
+// start_persistent_client()'s doc comment for the race this avoids: a manifest+install-request
+// pair can be learned about via the persistent connection's own subscribe, but the actual
+// chunk-pulling always happens on this dedicated connection instead). No-op if no update is
+// due. On success ota_run_session() reboots and never returns.
+static void run_ota_if_due(const std::string &uri, std::optional<float> battery_percent)
 {
     if (!ota_update_due())
         return;
+
+    MqttCtx ctx;
+    EventGroupPtr eg(xEventGroupCreate(), &vEventGroupDelete);
+    if (!eg)
+        return;
+    ctx.eg = eg.get();
+
+    MqttClientPtr client(start_client(uri.c_str(), ctx));
+    EventBits_t bits = xEventGroupWaitBits(ctx.eg, BIT_CONNECTED | BIT_ERROR,
+                                           pdFALSE, pdFALSE,
+                                           pdMS_TO_TICKS(s_cfg.use_tls ? 15000 : 5000));
+    if (!(bits & BIT_CONNECTED)) {
+        ESP_LOGW(TAG, "OTA connect failed — resuming on a later cycle");
+        return;
+    }
     ota_run_session(client.get(), battery_percent);
 
     // Loop only on CONNECTION loss: a battery deferral, config error or silent chunk
@@ -931,13 +1048,13 @@ static void run_ota_if_due(MqttClientPtr &client, MqttCtx &ctx, std::optional<fl
     while (ota_update_due() && ota_session_ended_by_connection_loss()) {
         ESP_LOGI(TAG, "OTA interrupted by connection loss — reconnecting in-cycle to resume");
         client.reset();  // stop+destroy the dead client first
-        const std::string uri = s_link->brokerUri(s_cfg.broker_address, s_cfg.port, s_cfg.use_tls);
-        if (uri.empty())
+        const std::string reconnectUri = s_link->brokerUri(s_cfg.broker_address, s_cfg.port, s_cfg.use_tls);
+        if (reconnectUri.empty())
             return;
-        client.reset(start_client(uri.c_str(), ctx));
-        const EventBits_t bits = xEventGroupWaitBits(ctx.eg, BIT_CONNECTED | BIT_ERROR,
-                                                     pdFALSE, pdFALSE,
-                                                     pdMS_TO_TICKS(s_cfg.use_tls ? 15000 : 5000));
+        client.reset(start_client(reconnectUri.c_str(), ctx));
+        bits = xEventGroupWaitBits(ctx.eg, BIT_CONNECTED | BIT_ERROR,
+                                   pdFALSE, pdFALSE,
+                                   pdMS_TO_TICKS(s_cfg.use_tls ? 15000 : 5000));
         if (!(bits & BIT_CONNECTED)) {
             ESP_LOGW(TAG, "OTA reconnect failed — resuming on a later cycle");
             return;
@@ -955,6 +1072,7 @@ struct PublishParams
 	std::optional<int>   battery_millivolts;
 	std::optional<bool>     heater_problem;
 	std::optional<uint32_t> heater_run_count;
+	std::optional<uint32_t> adc_time_us;
 };
 
 // Runs one connect -> publish -> disconnect cycle and reports whether the state message was
@@ -977,12 +1095,11 @@ static bool run_publish_cycle(const PublishParams &params)
     const bool hasHeater = params.heater_problem.has_value() && params.heater_run_count.has_value();
     const float temp = params.temperature.value_or(0.0f);
     const float hum  = params.humidity.value_or(0.0f);
-
-    // Declaration order matters: destruction runs in reverse, and client's teardown (below)
-    // still needs ctx.eg (a borrowed copy of eg's handle) to be valid, so eg must outlive it.
-    EventGroupPtr eg(xEventGroupCreate(), &vEventGroupDelete);
-    MqttCtx ctx;
-    ctx.eg = eg.get();
+    // Battery is deliberately absent from hasAny: it only ever rides along on a
+    // temperature/humidity publish (see mqtt_send_sensor_data()'s doc comment), so it can
+    // neither trigger a cycle nor carry one alone. Computed up front, not just inside the
+    // connected branch below -- it feeds the skip-the-persistent-connection decision next.
+    const bool hasAny = hasTemp || hasHumid;
 
     s_link->onPublishWindowBegin();  // OT: fast polls so NAT64 prefix + TCP ACKs arrive promptly; Wi-Fi: no-op
 
@@ -1002,315 +1119,358 @@ static bool run_publish_cycle(const PublishParams &params)
         return false;
     }
 
-    MqttClientPtr client(start_client(uri.c_str(), ctx));
-    // TLS needs more time than plaintext: a full handshake over a WAN link (vs. plaintext's
-    // bare TCP connect+CONNACK) can take several seconds on this core.
-    const uint32_t connect_wait_ms = s_cfg.use_tls ? 15000 : 5000;
-    const EventBits_t bits = xEventGroupWaitBits(eg.get(), BIT_CONNECTED | BIT_ERROR,
-                                                 pdFALSE, pdFALSE, pdMS_TO_TICKS(connect_wait_ms));
-
-    // ── publish if connected ──────────────────────────────────────────────────
     // ok stays false unless we connect, publish a state message, AND the broker ACKs it.
     // This is the signal the sensor task uses for the LED and the reboot supervisor, so it
     // must mean "data actually reached the broker", not merely "the task ran".
     bool ok = false;
-    if (bits & BIT_CONNECTED) {
-        const std::string_view dev = s_cfg.device_id;
-        const std::string_view dev_name = s_cfg.device_name;
 
-        // OTA check rides the publish window: subscribing now means the broker's retained
-        // manifest/install replies (if it holds any) arrive while we're waiting for the
-        // publish ACKs below — near-zero added awake time on the common no-update cycle.
-        // QoS 0: retained delivery over an already-reliable TCP link. See ota_updater.h.
-        esp_mqtt_client_subscribe(client.get(), ota_topic_manifest(), 0);
-        esp_mqtt_client_subscribe(client.get(), ota_topic_install(), 0);
-        // <id>/cfg/# -- one SUBSCRIBE packet for all 8 HA-tunable-parameter topics (see
-        // runtime_config.h), same "ride the publish window" reasoning as the OTA subscribes.
-        esp_mqtt_client_subscribe(client.get(), runtime_config_topic_wildcard(), 0);
+    // An already-known-due OTA cycle with nothing else to publish skips the persistent
+    // connection entirely -- OTA owns the radio/publish path for this wake (mirrors
+    // sensorstask.cpp's "OTA download in progress -- skip ALL sensor work" philosophy on the
+    // LP-core side), and going straight to run_ota_if_due()'s own dedicated connection avoids a
+    // pointless double-connect. When hasAny is true the persistent connection still runs first
+    // regardless of OTA-due-ness, same as always -- real sensor data must never be dropped
+    // just because an update also happens to be pending this same wake.
+    if (!(ota_update_due() && !hasAny)) {
+        // TLS needs more time than plaintext: a full handshake over a WAN link (vs. plaintext's
+        // bare TCP connect+CONNACK) can take several seconds on this core.
+        const uint32_t connect_wait_ms = s_cfg.use_tls ? 15000 : 5000;
+        // Diagnostic for the light-sleep power investigation's hp_awake_time residual (see
+        // project_light_sleep_power_investigation memory) -- brackets exactly the connect
+        // attempt below, success or failure either way.
+        const int64_t mqttConnectStartUs = esp_timer_get_time();
+        const esp_mqtt_client_handle_t client = start_persistent_client(uri.c_str());
+        const EventBits_t bits = client
+            ? xEventGroupWaitBits(s_persistentEg, BIT_CONNECTED | BIT_ERROR,
+                                  pdFALSE, pdFALSE, pdMS_TO_TICKS(connect_wait_ms))
+            : EventBits_t{0};
+        const uint32_t mqttConnectUs = static_cast<uint32_t>(esp_timer_get_time() - mqttConnectStartUs);
 
-        // Battery is deliberately absent from hasAny: it only ever rides along on a
-        // temperature/humidity publish (see mqtt_send_sensor_data()'s doc comment), so it can
-        // neither trigger a cycle nor carry one alone.
-        const bool hasAny = hasTemp || hasHumid;
+        if (bits & BIT_CONNECTED) {
+            MqttCtx &ctx = s_persistentCtx;
+            const EventGroupHandle_t eg = s_persistentEg;
+            const std::string_view dev = s_cfg.device_id;
+            const std::string_view dev_name = s_cfg.device_name;
 
-        // Link telemetry is read here, not passed in with the sensor values: it's transport
-        // state, and inside the publish window the radio is awake with the connect exchange
-        // just refreshed (OT: "last packet from parent" is the CONNACK's frame). Read exactly
-        // ONCE per cycle -- the counter-derived fields are per-cycle deltas, so a second call
-        // would split this cycle's radio time across the two.
-        const std::optional<LinkStats> link =
-            s_link->readLinkStats ? s_link->readLinkStats() : std::nullopt;
-        const std::optional<int> rssi = link ? link->rssiDbm : std::nullopt;
-        // Same "read exactly once per cycle" discipline as readLinkStats() above -- called
-        // unconditionally (not gated on stateLen later) so a truncated/failed buffer never
-        // skips resetting the accumulator and silently merges two cycles' awake time into one.
-        const uint32_t hpAwakeUs = hp_awake_stats_get_and_reset_us();
-        // Grouped exactly as the DISC_RADIO/DISC_LINKQ/DISC_UPLINK bits are, so a group is
-        // owed only when every entity in it can actually be fed this cycle.
-        const bool hasRadioStats = link && link->radioTxTimeUs && link->radioRxTimeUs;
-        const bool hasLinkQuality = link && link->txRetries && link->txCcaFailures
-                                 && link->txNoAckExpiry && link->linkQualityOut;
-        const bool hasUplinkRssi = link && link->uplinkRssiDbm;
+            // OTA check rides the publish window: subscribing now means the broker's retained
+            // manifest/install replies (if it holds any) arrive while we're waiting for the
+            // publish ACKs below — near-zero added awake time on the common no-update cycle.
+            // QoS 0: retained delivery over an already-reliable TCP link. See ota_updater.h.
+            esp_mqtt_client_subscribe(client, ota_topic_manifest(), 0);
+            esp_mqtt_client_subscribe(client, ota_topic_install(), 0);
+            // <id>/cfg/# -- one SUBSCRIBE packet for all 8 HA-tunable-parameter topics (see
+            // runtime_config.h), same "ride the publish window" reasoning as the OTA subscribes.
+            esp_mqtt_client_subscribe(client, runtime_config_topic_wildcard(), 0);
 
-        // Discovery configs still owed this boot for the values present in THIS cycle.
-        // DISC_UPDATE (the HA update entity + installed-version pair) and DISC_DIAG (the
-        // boot-constant Boot count + Reset reason pair) aren't tied to any sensor value,
-        // so they're owed on whichever publishing cycle comes first.
-        const auto discoveryWant = static_cast<uint16_t>((hasTemp ? DISC_TEMP : 0)
-                                                      | (hasHumid ? DISC_HUM : 0)
-                                                      | (hasBatt ? DISC_BATT : 0)
-                                                      | (rssi ? DISC_RSSI : 0)
-                                                      | (hasHeater ? DISC_HEATER : 0)
-                                                      | (hasRadioStats ? DISC_RADIO : 0)
-                                                      | (hasLinkQuality ? DISC_LINKQ : 0)
-                                                      | (hasUplinkRssi ? DISC_UPLINK : 0)
-                                                      | DISC_DIAG
-                                                      | DISC_UPDATE
-                                                      | DISC_NUMBERS
-                                                      | DISC_SWITCH
-                                                      | DISC_TXPOWER
-                                                      | DISC_AWAKE);
-        const auto discoveryNeed = hasAny
-            ? static_cast<uint16_t>(discoveryWant & ~s_discovery_sent_mask.load()) : uint16_t{0};
+            // Link telemetry is read here, not passed in with the sensor values: it's transport
+            // state, and inside the publish window the radio is awake with the connect exchange
+            // just refreshed (OT: "last packet from parent" is the CONNACK's frame). Read exactly
+            // ONCE per cycle -- the counter-derived fields are per-cycle deltas, so a second call
+            // would split this cycle's radio time across the two.
+            const std::optional<LinkStats> link =
+                s_link->readLinkStats ? s_link->readLinkStats() : std::nullopt;
+            const std::optional<int> rssi = link ? link->rssiDbm : std::nullopt;
+            // Same "read exactly once per cycle" discipline as readLinkStats() above -- called
+            // unconditionally (not gated on stateLen later) so a truncated/failed buffer never
+            // skips resetting the accumulator and silently merges two cycles' awake time into one.
+            const uint32_t hpAwakeUs = hp_awake_stats_get_and_reset_us();
+            // Grouped exactly as the DISC_RADIO/DISC_LINKQ/DISC_UPLINK bits are, so a group is
+            // owed only when every entity in it can actually be fed this cycle.
+            const bool hasRadioStats = link && link->radioTxTimeUs && link->radioRxTimeUs;
+            const bool hasLinkQuality = link && link->txRetries && link->txCcaFailures
+                                     && link->txNoAckExpiry && link->linkQualityOut;
+            const bool hasUplinkRssi = link && link->uplinkRssiDbm;
 
-        // Expected ACKs must match what we actually publish below: one state message plus one
-        // discovery message per still-owed sensor (two for DISC_BATT: Battery and Voltage;
-        // two for DISC_DIAG: Boot count and Reset reason; two for DISC_UPDATE: update config
-        // and installed-version; sixteen for DISC_NUMBERS, discovery config + current-value
-        // state per HA `number` entity, 8 entities x 2 messages; two for DISC_SWITCH, discovery
-        // config + current-value state; two for DISC_HEATER: Heater problem and Heater run
-        // count; two for DISC_RADIO: Radio TX time and Radio RX time; four for DISC_LINKQ: TX
-        // retries, CCA failures, TX no-ack expiry and Parent link quality; one for DISC_UPLINK:
-        // Uplink signal strength; one for DISC_TXPOWER: TX power (active); one for DISC_AWAKE:
-        // HP awake time). A fixed count assuming every discovery is sent would leave
-        // BIT_ALL_ACKED forever unset on any cycle that sends fewer, wrongly failing the cycle.
-        const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
-                                 + ((discoveryNeed & DISC_HUM) ? 1 : 0)
-                                 + ((discoveryNeed & DISC_BATT) ? 2 : 0)
-                                 + ((discoveryNeed & DISC_RSSI) ? 1 : 0)
-                                 + ((discoveryNeed & DISC_DIAG) ? 2 : 0)
-                                 + ((discoveryNeed & DISC_UPDATE) ? 2 : 0)
-                                 + ((discoveryNeed & DISC_NUMBERS) ? 16 : 0)
-                                 + ((discoveryNeed & DISC_SWITCH) ? 2 : 0)
-                                 + ((discoveryNeed & DISC_HEATER) ? 2 : 0)
-                                 + ((discoveryNeed & DISC_RADIO) ? 2 : 0)
-                                 + ((discoveryNeed & DISC_LINKQ) ? 4 : 0)
-                                 + ((discoveryNeed & DISC_UPLINK) ? 1 : 0)
-                                 + ((discoveryNeed & DISC_TXPOWER) ? 1 : 0)
-                                 + ((discoveryNeed & DISC_AWAKE) ? 1 : 0);
-        const int expected = (hasAny ? 1 : 0) + discovery_msgs;
+            // Discovery configs still owed this boot for the values present in THIS cycle.
+            // DISC_UPDATE (the HA update entity + installed-version pair) and DISC_DIAG (the
+            // boot-constant Boot count + Reset reason pair) aren't tied to any sensor value,
+            // so they're owed on whichever publishing cycle comes first.
+            const auto discoveryWant = static_cast<uint16_t>((hasTemp ? DISC_TEMP : 0)
+                                                          | (hasHumid ? DISC_HUM : 0)
+                                                          | (hasBatt ? DISC_BATT : 0)
+                                                          | (rssi ? DISC_RSSI : 0)
+                                                          | (hasHeater ? DISC_HEATER : 0)
+                                                          | (hasRadioStats ? DISC_RADIO : 0)
+                                                          | (hasLinkQuality ? DISC_LINKQ : 0)
+                                                          | (hasUplinkRssi ? DISC_UPLINK : 0)
+                                                          | DISC_DIAG
+                                                          | DISC_UPDATE
+                                                          | DISC_NUMBERS
+                                                          | DISC_SWITCH
+                                                          | DISC_TXPOWER
+                                                          | DISC_AWAKE
+                                                          | DISC_MQTTCONN);
+            const auto discoveryNeed = hasAny
+                ? static_cast<uint16_t>(discoveryWant & ~s_discovery_sent_mask.load()) : uint16_t{0};
 
-        // Set counters BEFORE publishing so the handler never races ahead
-        ctx.expected_acks.store(expected);
-        ctx.received_acks.store(0);
-        xEventGroupClearBits(eg.get(), BIT_ALL_ACKED);
+            // Expected ACKs must match what we actually publish below: one state message plus one
+            // discovery message per still-owed sensor (three for DISC_BATT: Battery, Voltage and
+            // Battery ADC time; two for DISC_DIAG: Boot count and Reset reason; two for DISC_UPDATE:
+            // update config and installed-version; sixteen for DISC_NUMBERS, discovery config +
+            // current-value state per HA `number` entity, 8 entities x 2 messages; two for
+            // DISC_SWITCH, discovery config + current-value state; two for DISC_HEATER: Heater
+            // problem and Heater run count; two for DISC_RADIO: Radio TX time and Radio RX time;
+            // four for DISC_LINKQ: TX retries, CCA failures, TX no-ack expiry and Parent link
+            // quality; one for DISC_UPLINK: Uplink signal strength; one for DISC_TXPOWER: TX power
+            // (active); one for DISC_AWAKE: HP awake time; one for DISC_MQTTCONN: MQTT connect
+            // time). A fixed count assuming every discovery is sent would leave BIT_ALL_ACKED
+            // forever unset on any cycle that sends fewer, wrongly failing the cycle.
+            const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
+                                     + ((discoveryNeed & DISC_HUM) ? 1 : 0)
+                                     + ((discoveryNeed & DISC_BATT) ? 3 : 0)
+                                     + ((discoveryNeed & DISC_RSSI) ? 1 : 0)
+                                     + ((discoveryNeed & DISC_DIAG) ? 2 : 0)
+                                     + ((discoveryNeed & DISC_UPDATE) ? 2 : 0)
+                                     + ((discoveryNeed & DISC_NUMBERS) ? 16 : 0)
+                                     + ((discoveryNeed & DISC_SWITCH) ? 2 : 0)
+                                     + ((discoveryNeed & DISC_HEATER) ? 2 : 0)
+                                     + ((discoveryNeed & DISC_RADIO) ? 2 : 0)
+                                     + ((discoveryNeed & DISC_LINKQ) ? 4 : 0)
+                                     + ((discoveryNeed & DISC_UPLINK) ? 1 : 0)
+                                     + ((discoveryNeed & DISC_TXPOWER) ? 1 : 0)
+                                     + ((discoveryNeed & DISC_AWAKE) ? 1 : 0)
+                                     + ((discoveryNeed & DISC_MQTTCONN) ? 1 : 0);
+            const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
-        // state_class "measurement" is what makes HA record long-term statistics
-        // (5-minute min/max/mean beyond the recorder purge window) for an entity;
-        // Boot count is a monotonic counter, which is exactly "total_increasing".
-        if (discoveryNeed & DISC_TEMP)
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Temperature", .topic_slug = "temperature", .device_class = "temperature",
-                 .state_class = "measurement", .unit = "°C", .precision = 1, .key = "t"});
-        if (discoveryNeed & DISC_HUM)
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Humidity", .topic_slug = "humidity", .device_class = "humidity",
-                 .state_class = "measurement", .unit = "%", .precision = 0, .key = "h"});
-        if (discoveryNeed & DISC_BATT) {
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Battery", .topic_slug = "battery", .device_class = "battery",
-                 .state_class = "measurement", .unit = "%", .precision = 2, .key = "b",
-                 .diagnostic = true});
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Voltage", .topic_slug = "voltage", .device_class = "voltage",
-                 .state_class = "measurement", .unit = "V", .precision = 2, .key = "v",
-                 .diagnostic = true});
-        }
-        if (discoveryNeed & DISC_RSSI)
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Signal strength", .topic_slug = "rssi", .device_class = "signal_strength",
-                 .state_class = "measurement", .unit = "dBm", .precision = 0, .key = "r",
-                 .diagnostic = true});
-        if (discoveryNeed & DISC_DIAG) {
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Boot count", .topic_slug = "boot_count",
-                 .state_class = "total_increasing", .key = "bc", .diagnostic = true});
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Reset reason", .topic_slug = "reset_reason", .key = "rr",
-                 .diagnostic = true});
-        }
-        if (discoveryNeed & DISC_HEATER) {
-            publish_binary_discovery(client.get(), dev, dev_name,
-                {.name = "Heater problem", .topic_slug = "heater_problem", .device_class = "problem",
-                 .key = "hp", .diagnostic = true});
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Heater run count", .topic_slug = "heater_run_count",
-                 .state_class = "total_increasing", .key = "hc", .diagnostic = true});
-        }
-        // Uplink instrumentation. The counter entities are per-cycle deltas, so "measurement"
-        // and not "total_increasing" -- HA would otherwise treat each cycle's small count as a
-        // counter reset. Radio times are the ones that matter most: mean(rt) is the t_tx term
-        // in dI_avg = dI_peak * t_tx / cycle_period, which is what decides whether reducing the
-        // radio's +20 dBm default TX power is worth any link margin at all.
-        if (discoveryNeed & DISC_RADIO) {
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Radio TX time", .topic_slug = "radio_tx_time",
-                 .state_class = "measurement", .unit = "ms", .precision = 1, .key = "rt",
-                 .diagnostic = true});
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Radio RX time", .topic_slug = "radio_rx_time",
-                 .state_class = "measurement", .unit = "ms", .precision = 1, .key = "rx",
-                 .diagnostic = true});
-        }
-        if (discoveryNeed & DISC_LINKQ) {
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "TX retries", .topic_slug = "tx_retries",
-                 .state_class = "measurement", .precision = 0, .key = "tr", .diagnostic = true});
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "CCA failures", .topic_slug = "cca_failures",
-                 .state_class = "measurement", .precision = 0, .key = "cf", .diagnostic = true});
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "TX no-ack expiry", .topic_slug = "tx_no_ack_expiry",
-                 .state_class = "measurement", .precision = 0, .key = "nk", .diagnostic = true});
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Parent link quality", .topic_slug = "link_quality_out",
-                 .state_class = "measurement", .precision = 0, .key = "lq", .diagnostic = true});
-        }
-        // The parent's OWN measurement of our signal -- the opposite direction from "Signal
-        // strength" above, and the only one that responds to our TX power. Absent entirely on a
-        // Thread 1.1 border router (enh-ACK probing unsupported), by design.
-        if (discoveryNeed & DISC_UPLINK)
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "Uplink signal strength", .topic_slug = "uplink_rssi",
-                 .device_class = "signal_strength", .state_class = "measurement", .unit = "dBm",
-                 .precision = 0, .key = "ur", .diagnostic = true});
-        // The dBm actually in effect right now -- distinct from the cfg/tx_power_dbm number's
-        // own retained echo, which can show an outstanding, still-unconfirmed trial value.
-        if (discoveryNeed & DISC_TXPOWER)
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "TX power (active)", .topic_slug = "tx_power_active",
-                 .state_class = "measurement", .unit = "dBm", .precision = 0, .key = "tp",
-                 .diagnostic = true});
-        // Total HP-core wall-clock time NOT in light sleep this cycle -- the piece Radio TX/RX
-        // time doesn't cover (attach check, JSON encode, ACK wait, DFS ramp). Part of the
-        // ~335 uA vs ~35 uA power investigation -- see the plan doc's quantitative model.
-        if (discoveryNeed & DISC_AWAKE)
-            publish_discovery(client.get(), dev, dev_name,
-                {.name = "HP awake time", .topic_slug = "hp_awake_time",
-                 .state_class = "measurement", .unit = "ms", .precision = 2, .key = "aw",
-                 .diagnostic = true});
-        if (discoveryNeed & DISC_UPDATE)
-            publish_update_discovery(client.get(), dev, dev_name);
-        if (discoveryNeed & DISC_NUMBERS)
-            publish_number_discoveries(client.get(), dev, dev_name);
-        if (discoveryNeed & DISC_SWITCH)
-            publish_switch_discovery(client.get(), dev, dev_name);
+            // Set counters BEFORE publishing so the handler never races ahead
+            ctx.expected_acks.store(expected);
+            ctx.received_acks.store(0);
+            xEventGroupClearBits(eg, BIT_ALL_ACKED);
 
-        if (hasAny) {
-            std::array<char, STATE_BUF> stateBuf;
-            size_t stateLen = hasTemp && hasHumid
-                ? format_into(stateBuf, STATE_FMT_BOTH, temp, hum)
-                : hasTemp
-                    ? format_into(stateBuf, STATE_FMT_TEMP, temp)
-                    : format_into(stateBuf, STATE_FMT_HUMID, hum);  // hasHumid
-
-            // Battery and RSSI ride along: overwrite the previous JSON's closing '}' with each
-            // suffix, which re-closes the object. On a cycle without a value the keys are simply
-            // absent -- HA keeps the entities' previous values (until expire_after lapses).
-            if (stateLen > 0 && hasBatt) {
-                stateLen = format_append(stateBuf, stateLen - 1, STATE_BATT_SUFFIX_FMT,
-                                         *params.battery_percent,
-                                         static_cast<float>(*params.battery_millivolts) / 1000.0f);
+            // state_class "measurement" is what makes HA record long-term statistics
+            // (5-minute min/max/mean beyond the recorder purge window) for an entity;
+            // Boot count is a monotonic counter, which is exactly "total_increasing".
+            if (discoveryNeed & DISC_TEMP)
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Temperature", .topic_slug = "temperature", .device_class = "temperature",
+                     .state_class = "measurement", .unit = "°C", .precision = 1, .key = "t"});
+            if (discoveryNeed & DISC_HUM)
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Humidity", .topic_slug = "humidity", .device_class = "humidity",
+                     .state_class = "measurement", .unit = "%", .precision = 0, .key = "h"});
+            if (discoveryNeed & DISC_BATT) {
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Battery", .topic_slug = "battery", .device_class = "battery",
+                     .state_class = "measurement", .unit = "%", .precision = 2, .key = "b",
+                     .diagnostic = true});
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Voltage", .topic_slug = "voltage", .device_class = "voltage",
+                     .state_class = "measurement", .unit = "V", .precision = 2, .key = "v",
+                     .diagnostic = true});
+                // Piggybacks DISC_BATT rather than getting its own bit -- only ever meaningful
+                // exactly when battery is (same create->read->delete block, sensorstask.cpp).
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Battery ADC time", .topic_slug = "battery_adc_time",
+                     .state_class = "measurement", .unit = "ms", .precision = 2, .key = "at",
+                     .diagnostic = true});
             }
-            if (stateLen > 0 && rssi)
-                stateLen = format_append(stateBuf, stateLen - 1, STATE_RSSI_SUFFIX_FMT, *rssi);
-            if (stateLen > 0 && hasHeater)
-                stateLen = format_append(stateBuf, stateLen - 1, STATE_HEATER_SUFFIX_FMT,
-                                         *params.heater_problem ? "ON" : "OFF",
-                                         *params.heater_run_count);
-            // us -> ms as float: a quiet sleepy cycle's radio time lands in the hundreds of
-            // microseconds, which integer milliseconds would flatten to 0 and destroy exactly
-            // the measurement these entities exist to make.
-            if (stateLen > 0 && hasRadioStats)
-                stateLen = format_append(stateBuf, stateLen - 1, STATE_RADIO_SUFFIX_FMT,
-                                         static_cast<float>(*link->radioTxTimeUs) / 1000.0f,
-                                         static_cast<float>(*link->radioRxTimeUs) / 1000.0f);
-            if (stateLen > 0 && hasLinkQuality)
-                stateLen = format_append(stateBuf, stateLen - 1, STATE_LINKQ_SUFFIX_FMT,
-                                         *link->txRetries, *link->txCcaFailures,
-                                         *link->txNoAckExpiry,
-                                         static_cast<unsigned>(*link->linkQualityOut));
-            if (stateLen > 0 && hasUplinkRssi)
-                stateLen = format_append(stateBuf, stateLen - 1, STATE_UPLINK_SUFFIX_FMT,
-                                         *link->uplinkRssiDbm);
-            // Boot count and reset reason are boot-constant, so they're re-sent on every state
-            // message -- otherwise their entities would go stale-then-unavailable under
-            // expire_after while the rest of the device keeps reporting.
-            if (stateLen > 0)
-                stateLen = format_append(stateBuf, stateLen - 1, STATE_DIAG_SUFFIX_FMT,
-                                         s_cfg.boot_count, s_cfg.reset_reason);
-            // TX power in effect right now -- also boot-constant availability (always some
-            // value, table max at the very least), so also re-sent every state message.
-            if (stateLen > 0)
-                stateLen = format_append(stateBuf, stateLen - 1, STATE_TXPOWER_SUFFIX_FMT,
-                                         static_cast<int>(runtime_config_tx_power_active_dbm()));
-            // HP awake time -- also boot-constant availability, re-sent every state message.
-            if (stateLen > 0)
-                stateLen = format_append(stateBuf, stateLen - 1, STATE_AWAKE_SUFFIX_FMT,
-                                         static_cast<float>(hpAwakeUs) / 1000.0f);
-
-            std::array<char, TOPIC_BUF> stateTopicBuf;
-            const size_t stateTopicLen = format_into(stateTopicBuf, STATE_TOPIC_FMT, dev);
-
-            if (stateLen > 0 && stateTopicLen > 0) {
-                esp_mqtt_client_publish(client.get(), stateTopicBuf.data(), stateBuf.data(),
-                                        static_cast<int>(stateLen), 1, 0);
-                ESP_LOGI(TAG, "sent %s", stateBuf.data());
-
-                // QoS-1 acks over a healthy Thread link return well under a second; cap short
-                // so we stop fast-polling (and sleep) promptly instead of idling the radio.
-                ok = (xEventGroupWaitBits(eg.get(), BIT_ALL_ACKED, pdFALSE, pdTRUE,
-                                          pdMS_TO_TICKS(4000)) & BIT_ALL_ACKED) != 0;
-                // Mark discovery sent only on a confirmed cycle: on a failed one the configs may
-                // never have reached the broker, and the next successful cycle resends them.
-                if (ok)
-                    s_discovery_sent_mask.fetch_or(discoveryNeed);
+            if (discoveryNeed & DISC_RSSI)
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Signal strength", .topic_slug = "rssi", .device_class = "signal_strength",
+                     .state_class = "measurement", .unit = "dBm", .precision = 0, .key = "r",
+                     .diagnostic = true});
+            if (discoveryNeed & DISC_DIAG) {
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Boot count", .topic_slug = "boot_count",
+                     .state_class = "total_increasing", .key = "bc", .diagnostic = true});
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Reset reason", .topic_slug = "reset_reason", .key = "rr",
+                     .diagnostic = true});
             }
+            if (discoveryNeed & DISC_HEATER) {
+                publish_binary_discovery(client, dev, dev_name,
+                    {.name = "Heater problem", .topic_slug = "heater_problem", .device_class = "problem",
+                     .key = "hp", .diagnostic = true});
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Heater run count", .topic_slug = "heater_run_count",
+                     .state_class = "total_increasing", .key = "hc", .diagnostic = true});
+            }
+            // Uplink instrumentation. The counter entities are per-cycle deltas, so "measurement"
+            // and not "total_increasing" -- HA would otherwise treat each cycle's small count as a
+            // counter reset. Radio times are the ones that matter most: mean(rt) is the t_tx term
+            // in dI_avg = dI_peak * t_tx / cycle_period, which is what decides whether reducing the
+            // radio's +20 dBm default TX power is worth any link margin at all.
+            if (discoveryNeed & DISC_RADIO) {
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Radio TX time", .topic_slug = "radio_tx_time",
+                     .state_class = "measurement", .unit = "ms", .precision = 1, .key = "rt",
+                     .diagnostic = true});
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Radio RX time", .topic_slug = "radio_rx_time",
+                     .state_class = "measurement", .unit = "ms", .precision = 1, .key = "rx",
+                     .diagnostic = true});
+            }
+            if (discoveryNeed & DISC_LINKQ) {
+                publish_discovery(client, dev, dev_name,
+                    {.name = "TX retries", .topic_slug = "tx_retries",
+                     .state_class = "measurement", .precision = 0, .key = "tr", .diagnostic = true});
+                publish_discovery(client, dev, dev_name,
+                    {.name = "CCA failures", .topic_slug = "cca_failures",
+                     .state_class = "measurement", .precision = 0, .key = "cf", .diagnostic = true});
+                publish_discovery(client, dev, dev_name,
+                    {.name = "TX no-ack expiry", .topic_slug = "tx_no_ack_expiry",
+                     .state_class = "measurement", .precision = 0, .key = "nk", .diagnostic = true});
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Parent link quality", .topic_slug = "link_quality_out",
+                     .state_class = "measurement", .precision = 0, .key = "lq", .diagnostic = true});
+            }
+            // The parent's OWN measurement of our signal -- the opposite direction from "Signal
+            // strength" above, and the only one that responds to our TX power. Absent entirely on a
+            // Thread 1.1 border router (enh-ACK probing unsupported), by design.
+            if (discoveryNeed & DISC_UPLINK)
+                publish_discovery(client, dev, dev_name,
+                    {.name = "Uplink signal strength", .topic_slug = "uplink_rssi",
+                     .device_class = "signal_strength", .state_class = "measurement", .unit = "dBm",
+                     .precision = 0, .key = "ur", .diagnostic = true});
+            // The dBm actually in effect right now -- distinct from the cfg/tx_power_dbm number's
+            // own retained echo, which can show an outstanding, still-unconfirmed trial value.
+            if (discoveryNeed & DISC_TXPOWER)
+                publish_discovery(client, dev, dev_name,
+                    {.name = "TX power (active)", .topic_slug = "tx_power_active",
+                     .state_class = "measurement", .unit = "dBm", .precision = 0, .key = "tp",
+                     .diagnostic = true});
+            // Total HP-core wall-clock time NOT in light sleep this cycle -- the piece Radio TX/RX
+            // time doesn't cover (attach check, JSON encode, ACK wait, DFS ramp). Part of the
+            // ~335 uA vs ~35 uA power investigation -- see the plan doc's quantitative model.
+            if (discoveryNeed & DISC_AWAKE)
+                publish_discovery(client, dev, dev_name,
+                    {.name = "HP awake time", .topic_slug = "hp_awake_time",
+                     .state_class = "measurement", .unit = "ms", .precision = 2, .key = "aw",
+                     .diagnostic = true});
+            // Wall-clock time waiting for the TCP+MQTT CONNECT/CONNACK above this cycle -- same
+            // power-investigation motivation as DISC_AWAKE above, isolating one of its two
+            // likeliest non-radio contributors (see project_light_sleep_power_investigation memory).
+            if (discoveryNeed & DISC_MQTTCONN)
+                publish_discovery(client, dev, dev_name,
+                    {.name = "MQTT connect time", .topic_slug = "mqtt_connect_time",
+                     .state_class = "measurement", .unit = "ms", .precision = 2, .key = "mc",
+                     .diagnostic = true});
+            if (discoveryNeed & DISC_UPDATE)
+                publish_update_discovery(client, dev, dev_name);
+            if (discoveryNeed & DISC_NUMBERS)
+                publish_number_discoveries(client, dev, dev_name);
+            if (discoveryNeed & DISC_SWITCH)
+                publish_switch_discovery(client, dev, dev_name);
+
+            if (hasAny) {
+                std::array<char, STATE_BUF> stateBuf;
+                size_t stateLen = hasTemp && hasHumid
+                    ? format_into(stateBuf, STATE_FMT_BOTH, temp, hum)
+                    : hasTemp
+                        ? format_into(stateBuf, STATE_FMT_TEMP, temp)
+                        : format_into(stateBuf, STATE_FMT_HUMID, hum);  // hasHumid
+
+                // Battery and RSSI ride along: overwrite the previous JSON's closing '}' with each
+                // suffix, which re-closes the object. On a cycle without a value the keys are simply
+                // absent -- HA keeps the entities' previous values (until expire_after lapses).
+                if (stateLen > 0 && hasBatt) {
+                    stateLen = format_append(stateBuf, stateLen - 1, STATE_BATT_SUFFIX_FMT,
+                                             *params.battery_percent,
+                                             static_cast<float>(*params.battery_millivolts) / 1000.0f,
+                                             static_cast<float>(params.adc_time_us.value_or(0)) / 1000.0f);
+                }
+                if (stateLen > 0 && rssi)
+                    stateLen = format_append(stateBuf, stateLen - 1, STATE_RSSI_SUFFIX_FMT, *rssi);
+                if (stateLen > 0 && hasHeater)
+                    stateLen = format_append(stateBuf, stateLen - 1, STATE_HEATER_SUFFIX_FMT,
+                                             *params.heater_problem ? "ON" : "OFF",
+                                             *params.heater_run_count);
+                // us -> ms as float: a quiet sleepy cycle's radio time lands in the hundreds of
+                // microseconds, which integer milliseconds would flatten to 0 and destroy exactly
+                // the measurement these entities exist to make.
+                if (stateLen > 0 && hasRadioStats)
+                    stateLen = format_append(stateBuf, stateLen - 1, STATE_RADIO_SUFFIX_FMT,
+                                             static_cast<float>(*link->radioTxTimeUs) / 1000.0f,
+                                             static_cast<float>(*link->radioRxTimeUs) / 1000.0f);
+                if (stateLen > 0 && hasLinkQuality)
+                    stateLen = format_append(stateBuf, stateLen - 1, STATE_LINKQ_SUFFIX_FMT,
+                                             *link->txRetries, *link->txCcaFailures,
+                                             *link->txNoAckExpiry,
+                                             static_cast<unsigned>(*link->linkQualityOut));
+                if (stateLen > 0 && hasUplinkRssi)
+                    stateLen = format_append(stateBuf, stateLen - 1, STATE_UPLINK_SUFFIX_FMT,
+                                             *link->uplinkRssiDbm);
+                // Boot count and reset reason are boot-constant, so they're re-sent on every state
+                // message -- otherwise their entities would go stale-then-unavailable under
+                // expire_after while the rest of the device keeps reporting.
+                if (stateLen > 0)
+                    stateLen = format_append(stateBuf, stateLen - 1, STATE_DIAG_SUFFIX_FMT,
+                                             s_cfg.boot_count, s_cfg.reset_reason);
+                // TX power in effect right now -- also boot-constant availability (always some
+                // value, table max at the very least), so also re-sent every state message.
+                if (stateLen > 0)
+                    stateLen = format_append(stateBuf, stateLen - 1, STATE_TXPOWER_SUFFIX_FMT,
+                                             static_cast<int>(runtime_config_tx_power_active_dbm()));
+                // HP awake time -- also boot-constant availability, re-sent every state message.
+                if (stateLen > 0)
+                    stateLen = format_append(stateBuf, stateLen - 1, STATE_AWAKE_SUFFIX_FMT,
+                                             static_cast<float>(hpAwakeUs) / 1000.0f);
+                // MQTT connect-wait time -- also boot-constant availability, re-sent every state
+                // message (every cycle that reaches here attempted a connect, successful or not).
+                if (stateLen > 0)
+                    stateLen = format_append(stateBuf, stateLen - 1, STATE_MQTTCONN_SUFFIX_FMT,
+                                             static_cast<float>(mqttConnectUs) / 1000.0f);
+
+                std::array<char, TOPIC_BUF> stateTopicBuf;
+                const size_t stateTopicLen = format_into(stateTopicBuf, STATE_TOPIC_FMT, dev);
+
+                if (stateLen > 0 && stateTopicLen > 0) {
+                    esp_mqtt_client_publish(client, stateTopicBuf.data(), stateBuf.data(),
+                                            static_cast<int>(stateLen), 1, 0);
+                    ESP_LOGI(TAG, "sent %s", stateBuf.data());
+
+                    // QoS-1 acks over a healthy Thread link return well under a second; cap short
+                    // so we stop fast-polling (and sleep) promptly instead of idling the radio.
+                    ok = (xEventGroupWaitBits(eg, BIT_ALL_ACKED, pdFALSE, pdTRUE,
+                                              pdMS_TO_TICKS(4000)) & BIT_ALL_ACKED) != 0;
+                    // Mark discovery sent only on a confirmed cycle: on a failed one the configs may
+                    // never have reached the broker, and the next successful cycle resends them.
+                    if (ok)
+                        s_discovery_sent_mask.fetch_or(discoveryNeed);
+                }
+            } else {
+                // Not a warning any more: with a pending update, sensorstask deliberately fires
+                // value-less cycles every backstop wake so the OTA check below runs promptly.
+                ESP_LOGI(TAG, "no sensor values this cycle%s", ota_update_due() ? " (OTA-only cycle)" : "");
+            }
+
+            // Same bar as the OTA check below: a data-carrying cycle needs connected AND state
+            // ACKed, an OTA-only cycle just needs CONNECTED. Runs before OTA -- replay is quick
+            // (a handful of small batches) and shouldn't wait behind a multi-minute OTA session,
+            // and running it first means the backlog reaches HA promptly even if that OTA session
+            // then reboots the device.
+            if (ok || !hasAny)
+                replay_history_if_pending(client, dev, ctx, eg);
+
+            // Runtime config changes (see runtime_config.h) are quick -- a handful of small
+            // retained publishes, no ACK wait -- so they're serviced here, ahead of OTA, rather
+            // than risk being delayed behind a potentially multi-minute OTA session.
+            if (ok || !hasAny)
+                runtime_config_apply_pending(client);
         } else {
-            // Not a warning any more: with a pending update, sensorstask deliberately fires
-            // value-less cycles every backstop wake so the OTA check below runs promptly.
-            ESP_LOGI(TAG, "no sensor values this cycle%s", ota_update_due() ? " (OTA-only cycle)" : "");
+            ESP_LOGE(TAG, "MQTT connection failed, skipping cycle");
         }
 
-        // Same bar as the OTA check below: a data-carrying cycle needs connected AND state
-        // ACKed, an OTA-only cycle just needs CONNECTED. Runs before OTA -- replay is quick
-        // (a handful of small batches) and shouldn't wait behind a multi-minute OTA session,
-        // and running it first means the backlog reaches HA promptly even if that OTA session
-        // then reboots the device.
-        if (ok || !hasAny)
-            replay_history_if_pending(client.get(), dev, ctx, eg.get());
-
-        // Runtime config changes (see runtime_config.h) are quick -- a handful of small
-        // retained publishes, no ACK wait -- so they're serviced here, ahead of OTA, rather
-        // than risk being delayed behind a potentially multi-minute OTA session.
-        if (ok || !hasAny)
-            runtime_config_apply_pending(client.get());
-
-        // A staged update only starts from a healthy cycle: for a data-carrying cycle that
-        // means connected AND state ACKed (a flaky link fails fast above instead of kicking
-        // off a doomed download); an OTA-only cycle carries nothing to ACK, so CONNECTED is
-        // the bar. On success this reboots and never returns; on failure it has restored
-        // the sleepy link mode (and possibly replaced `client`) before normal teardown.
-        if (ok || !hasAny)
-            run_ota_if_due(client, ctx, params.battery_percent);
-    } else {
-        ESP_LOGE(TAG, "MQTT connection failed, skipping cycle");
+        // Never destroyed -- see start_persistent_client()'s doc comment. Unconditional
+        // (whether this cycle's connect succeeded or failed): esp-mqtt's internal task, once
+        // started, parks itself in a periodically-waking reconnect-wait loop rather than
+        // exiting on its own (traced in mqtt_client.c's MQTT_STATE_WAIT_RECONNECT case) --
+        // left running between cycles it would repeatedly defeat automatic light sleep.
+        if (client)
+            esp_mqtt_client_stop(client);
     }
+
+    // A staged update only starts from a healthy cycle: for a data-carrying cycle that means
+    // connected AND state ACKed (a flaky link fails fast above instead of kicking off a doomed
+    // download); an OTA-only cycle carries nothing to ACK, so !hasAny alone clears the bar.
+    // Self-contained (see run_ota_if_due()'s doc comment) -- connects its own dedicated,
+    // OTA-sized client regardless of whether the persistent-client branch above ran at all. On
+    // success this reboots and never returns.
+    if (ok || !hasAny)
+        run_ota_if_due(uri, params.battery_percent);
 
     s_link->onPublishWindowEnd();  // OT: back to slow poll until next sensor cycle; Wi-Fi: no-op
     return ok;
-    // client, ctx, then eg are destroyed here (in that order) as this ordinary function returns
-    // -- esp_mqtt_client_stop()+destroy(), then (trivially) ctx, then vEventGroupDelete().
 }
 
 static void mqtt_publish_task(void *arg)
@@ -1352,7 +1512,8 @@ void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link)
 
 void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity,
                            std::optional<float> battery_percent, std::optional<int> battery_millivolts,
-                           std::optional<bool> heater_problem, std::optional<uint32_t> heater_run_count)
+                           std::optional<bool> heater_problem, std::optional<uint32_t> heater_run_count,
+                           std::optional<uint32_t> adc_time_us)
 {
     if (s_task_running.exchange(true)) {
         ESP_LOGW(TAG, "previous publish cycle still running, skipping");
@@ -1364,7 +1525,8 @@ void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float
 
     std::unique_ptr<PublishParams> params(new PublishParams{temperature, humidity,
                                                             battery_percent, battery_millivolts,
-                                                            heater_problem, heater_run_count});
+                                                            heater_problem, heater_run_count,
+                                                            adc_time_us});
     if (xTaskCreate(mqtt_publish_task, "mqtt_pub", 12288, params.get(), 5, nullptr) != pdPASS) {
         ESP_LOGE(TAG, "failed to create mqtt_pub task");
         s_task_running.store(false);

@@ -61,12 +61,15 @@ void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link);
 // configs) and never trigger a cycle by themselves: if both temperature and humidity are
 // empty, nothing is published regardless of these. Pass both battery values or neither -- a
 // lone one is ignored; heater_problem/heater_run_count are likewise set together or not at
-// all (absent until the LP core has ever completed a heater run).
+// all (absent until the LP core has ever completed a heater run). adc_time_us rides along on
+// the battery pair (published only when both battery values are also present) -- diagnostic
+// for the light-sleep power investigation's hp_awake_time residual.
 void mqtt_send_sensor_data(std::optional<float> temperature, std::optional<float> humidity,
                            std::optional<float> battery_percent = std::nullopt,
                            std::optional<int> battery_millivolts = std::nullopt,
                            std::optional<bool> heater_problem = std::nullopt,
-                           std::optional<uint32_t> heater_run_count = std::nullopt);
+                           std::optional<uint32_t> heater_run_count = std::nullopt,
+                           std::optional<uint32_t> adc_time_us = std::nullopt);
 
 // True while a publish cycle started by mqtt_send_sensor_data() is still in flight.
 // Lets a caller tell "a publish is happening" apart from "nothing was sent this cycle".
