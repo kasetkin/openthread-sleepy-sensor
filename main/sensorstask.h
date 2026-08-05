@@ -19,11 +19,6 @@ struct SensorsValues
 public:
     std::optional<int> batteryVoltageMilliV;
     std::optional<float> batteryPercent;
-    /// Wall-clock time spent in the create->read->delete ADC chain this cycle (initAdc() +
-    /// readBatteryVoltageMilliV() + deinitAdc()) -- diagnostic for the light-sleep power
-    /// investigation's hp_awake_time residual (see project_light_sleep_power_investigation
-    /// memory). Set together with the battery fields, same "no data yet" convention.
-    std::optional<uint32_t> adcTimeUs;
     std::optional<float> envTemperature;
     std::optional<float> envHumidity;
     std::optional<float> barometricPressure;
