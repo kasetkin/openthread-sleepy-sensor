@@ -70,9 +70,9 @@ enum DiscoveryBit : uint16_t {
     DISC_TXPOWER = 1 << 12,  // TX power (active) diagnostic -- boot-constant, so always available
     DISC_AWAKE   = 1 << 13,  // HP awake time diagnostic -- boot-constant, so always available
     DISC_MQTTCONN = 1 << 14, // MQTT connect-wait diagnostic -- boot-constant, always available
-    // Five per-cycle phase-timing diagnostics grouped under one bit (client start/subscribe/
-    // discovery-publish/state-publish/client-stop -- see the phase-timer block above
-    // run_publish_cycle()), same "always computed/available together" grouping already used for
+    // Six per-cycle phase-timing diagnostics grouped under one bit (client start/subscribe/
+    // discovery-publish/state-publish/state-publish-raw/client-stop -- see the phase-timer block
+    // above run_publish_cycle()), same "always computed/available together" grouping already used for
     // DISC_RADIO/DISC_LINKQ/DISC_BATT. Investigative, expected to be retired once the light-
     // sleep power investigation's ~530ms hp_awake_time residual is understood -- see
     // project_light_sleep_power_investigation memory.
@@ -292,12 +292,14 @@ static constexpr std::string_view STATE_AWAKE_SUFFIX_FMT = ",\"aw\":{:.2f}}}";
 // connect), always appended. Diagnostic for the light-sleep power investigation's
 // hp_awake_time residual (see project_light_sleep_power_investigation memory).
 static constexpr std::string_view STATE_MQTTCONN_SUFFIX_FMT = ",\"mc\":{:.2f}}}";
-// Previous cycle's 5-phase, sleep-compensated awake-time breakdown (see s_lastClientStartAwakeUs
+// Previous cycle's 6-phase, sleep-compensated awake-time breakdown (see s_lastClientStartAwakeUs
 // et al.'s doc comment for why it's one cycle delayed) -- client start, subscribe, discovery
-// publish, state publish, client stop, in that chronological order. Same boot-constant
-// availability as STATE_AWAKE_SUFFIX_FMT/STATE_MQTTCONN_SUFFIX_FMT above.
+// publish, state publish, state publish (raw wall-clock, sleep-UNcompensated -- diff against
+// "sp" to see how much of that window is real light sleep, same "mc vs cs" pairing as
+// STATE_MQTTCONN_SUFFIX_FMT vs "cs" above), client stop, in that chronological order. Same
+// boot-constant availability as STATE_AWAKE_SUFFIX_FMT/STATE_MQTTCONN_SUFFIX_FMT above.
 static constexpr std::string_view STATE_PHASES_SUFFIX_FMT =
-    ",\"cs\":{:.2f},\"sb\":{:.2f},\"cd\":{:.2f},\"sp\":{:.2f},\"cp\":{:.2f}}}";
+    ",\"cs\":{:.2f},\"sb\":{:.2f},\"cd\":{:.2f},\"sp\":{:.2f},\"sr\":{:.2f},\"cp\":{:.2f}}}";
 
 // history_log.h backlog replay -- not part of HA discovery/state, a plain device -> broker
 // event stream an HA-side automation consumes (see README's "Blackout data buffering &
@@ -351,6 +353,7 @@ static constexpr size_t MAX_NAME_LEN         = std::max({sizeof("Temperature"), 
                                                          sizeof("MQTT subscribe"),
                                                          sizeof("MQTT discovery publish"),
                                                          sizeof("MQTT state publish"),
+                                                         sizeof("MQTT state publish (raw)"),
                                                          sizeof("MQTT client stop")}) - 1;
 static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max({sizeof("temperature"), sizeof("humidity"),
                                                          sizeof("battery"), sizeof("voltage"),
@@ -372,6 +375,7 @@ static constexpr size_t MAX_TOPIC_SLUG_LEN   = std::max({MAX_DEVICE_CLASS_LEN + 
                                                          sizeof("mqtt_subscribe_time"),
                                                          sizeof("mqtt_discovery_time"),
                                                          sizeof("mqtt_state_publish_time"),
+                                                         sizeof("mqtt_state_publish_raw_time"),
                                                          sizeof("mqtt_client_stop_time")}) - 1;
 static constexpr size_t MAX_STATE_CLASS_LEN  = std::max({sizeof("measurement"),
                                                          sizeof("total_increasing")}) - 1;
@@ -513,7 +517,7 @@ static constexpr size_t STATE_BUF = std::max({
    + STATE_TXPOWER_SUFFIX_FMT.size() + MAX_TXPOWER_LEN
    + STATE_AWAKE_SUFFIX_FMT.size() + MAX_FORMATTED_FLOAT_LEN
    + STATE_MQTTCONN_SUFFIX_FMT.size() + MAX_FORMATTED_FLOAT_LEN
-   + STATE_PHASES_SUFFIX_FMT.size() + 5 * MAX_FORMATTED_FLOAT_LEN
+   + STATE_PHASES_SUFFIX_FMT.size() + 6 * MAX_FORMATTED_FLOAT_LEN
    + 1;  // +1 NUL
 
 // Same lemma, applied to one backfill array: BACKFILL_ENTRY_REST_FMT (the wider of the two --
@@ -1134,13 +1138,14 @@ static uint32_t phase_awake_us_get_and_reset()
     return static_cast<uint32_t>(std::max<int64_t>(0, elapsed - static_cast<int64_t>(slept)));
 }
 
-// Previous cycle's complete 5-phase breakdown, embedded into THIS cycle's state message.
-// Necessarily one cycle delayed: "MQTT state publish" and "MQTT client stop" both measure
-// events that happen AFTER the state message they'd otherwise ride on has already been sent --
-// you can't report how long stop() took in a message published before stop() was even called.
-// Reported as one consistent, all-five-together delayed set rather than mixing "live" (client
-// start/subscribe/discovery, measured earlier in the same cycle) and "delayed" fields in one
-// message, which would be more confusing than a uniform one-cycle lag. Written all at once at
+// Previous cycle's complete 6-phase breakdown, embedded into THIS cycle's state message.
+// Necessarily one cycle delayed: "MQTT state publish" (both the sleep-compensated and raw
+// variants) and "MQTT client stop" all measure events that happen AFTER the state message
+// they'd otherwise ride on has already been sent -- you can't report how long stop() took in a
+// message published before stop() was even called. Reported as one consistent, all-six-together
+// delayed set rather than mixing "live" (client start/subscribe/discovery, measured earlier in
+// the same cycle) and "delayed" fields in one message, which would be more confusing than a
+// uniform one-cycle lag. Written all at once at
 // the end of run_publish_cycle()'s persistent-client branch; read while building that same
 // branch's state message, chronologically earlier in the same single-threaded call, so no
 // synchronization is needed.
@@ -1148,6 +1153,12 @@ static uint32_t s_lastClientStartAwakeUs = 0;
 static uint32_t s_lastSubscribeAwakeUs = 0;
 static uint32_t s_lastDiscoveryAwakeUs = 0;
 static uint32_t s_lastStatePublishAwakeUs = 0;
+// Raw (sleep-UNcompensated) wall-clock companion to s_lastStatePublishAwakeUs above -- brackets
+// the exact same span (see run_publish_cycle()'s CP4 block), same "mc vs cs" pairing as
+// mqttConnectUs vs clientStartAwakeUs. Exists solely to answer whether the QoS-1 ACK wait
+// sleeps as well as the connect wait does (mc/cs showed ~81% asleep there) -- see
+// project_light_sleep_power_investigation memory's ranked next-steps.
+static uint32_t s_lastStatePublishRawUs = 0;
 static uint32_t s_lastClientStopAwakeUs = 0;
 
 // ── publish task — owns the client lifecycle ──────────────────────────────────
@@ -1244,6 +1255,7 @@ static bool run_publish_cycle(const PublishParams &params)
         uint32_t subscribeAwakeUs = 0;
         uint32_t discoveryAwakeUs = 0;
         uint32_t statePublishAwakeUs = 0;
+        uint32_t statePublishRawUs = 0;
 
         if (bits & BIT_CONNECTED) {
             MqttCtx &ctx = s_persistentCtx;
@@ -1315,9 +1327,10 @@ static bool run_publish_cycle(const PublishParams &params)
             // four for DISC_LINKQ: TX retries, CCA failures, TX no-ack expiry and Parent link
             // quality; one for DISC_UPLINK: Uplink signal strength; one for DISC_TXPOWER: TX power
             // (active); one for DISC_AWAKE: HP awake time; one for DISC_MQTTCONN: MQTT connect
-            // time; five for DISC_PHASES: MQTT client start/subscribe/discovery publish/state
-            // publish/client stop). A fixed count assuming every discovery is sent would leave
-            // BIT_ALL_ACKED forever unset on any cycle that sends fewer, wrongly failing the cycle.
+            // time; six for DISC_PHASES: MQTT client start/subscribe/discovery publish/state
+            // publish/state publish (raw)/client stop). A fixed count assuming every discovery is
+            // sent would leave BIT_ALL_ACKED forever unset on any cycle that sends fewer, wrongly
+            // failing the cycle.
             const int discovery_msgs = ((discoveryNeed & DISC_TEMP) ? 1 : 0)
                                      + ((discoveryNeed & DISC_HUM) ? 1 : 0)
                                      + ((discoveryNeed & DISC_BATT) ? 2 : 0)
@@ -1333,7 +1346,7 @@ static bool run_publish_cycle(const PublishParams &params)
                                      + ((discoveryNeed & DISC_TXPOWER) ? 1 : 0)
                                      + ((discoveryNeed & DISC_AWAKE) ? 1 : 0)
                                      + ((discoveryNeed & DISC_MQTTCONN) ? 1 : 0)
-                                     + ((discoveryNeed & DISC_PHASES) ? 5 : 0);
+                                     + ((discoveryNeed & DISC_PHASES) ? 6 : 0);
             const int expected = (hasAny ? 1 : 0) + discovery_msgs;
 
             // Set counters BEFORE publishing so the handler never races ahead
@@ -1444,11 +1457,15 @@ static bool run_publish_cycle(const PublishParams &params)
                     {.name = "MQTT connect time", .topic_slug = "mqtt_connect_time",
                      .state_class = "measurement", .unit = "ms", .precision = 2, .key = "mc",
                      .diagnostic = true});
-            // Five-way sleep-compensated phase breakdown of the same connect/publish/stop
-            // sequence -- see the phase-timer block above run_publish_cycle() and
-            // s_lastClientStartAwakeUs's doc comment for the one-cycle publish delay.
-            // Investigative; expect these five to be retired once the ~530ms hp_awake_time
-            // residual is understood (see project_light_sleep_power_investigation memory).
+            // Six-way phase breakdown of the same connect/publish/stop sequence -- see the
+            // phase-timer block above run_publish_cycle() and s_lastClientStartAwakeUs's doc
+            // comment for the one-cycle publish delay. Five of the six are sleep-compensated;
+            // "MQTT state publish (raw)" is the deliberate exception -- its raw (sleep-
+            // UNcompensated) wall-clock time, paired against "MQTT state publish" the same way
+            // "MQTT connect time" (mc) pairs against "MQTT client start" (cs), to answer whether
+            // the QoS-1 ACK wait sleeps as well as the connect wait does. Investigative; expect
+            // all six to be retired once the ~530ms hp_awake_time residual is understood (see
+            // project_light_sleep_power_investigation memory).
             if (discoveryNeed & DISC_PHASES) {
                 publish_discovery(client, dev, dev_name,
                     {.name = "MQTT client start", .topic_slug = "mqtt_client_start_time",
@@ -1467,6 +1484,10 @@ static bool run_publish_cycle(const PublishParams &params)
                      .state_class = "measurement", .unit = "ms", .precision = 2, .key = "sp",
                      .diagnostic = true});
                 publish_discovery(client, dev, dev_name,
+                    {.name = "MQTT state publish (raw)", .topic_slug = "mqtt_state_publish_raw_time",
+                     .state_class = "measurement", .unit = "ms", .precision = 2, .key = "sr",
+                     .diagnostic = true});
+                publish_discovery(client, dev, dev_name,
                     {.name = "MQTT client stop", .topic_slug = "mqtt_client_stop_time",
                      .state_class = "measurement", .unit = "ms", .precision = 2, .key = "cp",
                      .diagnostic = true});
@@ -1480,6 +1501,11 @@ static bool run_publish_cycle(const PublishParams &params)
             // CP3 -- "MQTT discovery publish" phase (covers whichever discoveryNeed bits were
             // actually owed this cycle -- usually near-zero once everything's been sent once).
             discoveryAwakeUs = phase_awake_us_get_and_reset();
+
+            // Raw (sleep-UNcompensated) wall-clock companion to CP4/statePublishAwakeUs below --
+            // brackets the exact same span, same "mc vs cs" pairing as mqttConnectStartUs/
+            // mqttConnectUs above. See s_lastStatePublishRawUs's doc comment for why this exists.
+            const int64_t statePublishRawStartUs = esp_timer_get_time();
 
             if (hasAny) {
                 std::array<char, STATE_BUF> stateBuf;
@@ -1538,7 +1564,7 @@ static bool run_publish_cycle(const PublishParams &params)
                 if (stateLen > 0)
                     stateLen = format_append(stateBuf, stateLen - 1, STATE_MQTTCONN_SUFFIX_FMT,
                                              static_cast<float>(mqttConnectUs) / 1000.0f);
-                // Previous cycle's 5-phase breakdown -- see s_lastClientStartAwakeUs's doc
+                // Previous cycle's 6-phase breakdown -- see s_lastClientStartAwakeUs's doc
                 // comment for why this is one cycle delayed rather than this cycle's own values.
                 if (stateLen > 0)
                     stateLen = format_append(stateBuf, stateLen - 1, STATE_PHASES_SUFFIX_FMT,
@@ -1546,6 +1572,7 @@ static bool run_publish_cycle(const PublishParams &params)
                                              static_cast<float>(s_lastSubscribeAwakeUs) / 1000.0f,
                                              static_cast<float>(s_lastDiscoveryAwakeUs) / 1000.0f,
                                              static_cast<float>(s_lastStatePublishAwakeUs) / 1000.0f,
+                                             static_cast<float>(s_lastStatePublishRawUs) / 1000.0f,
                                              static_cast<float>(s_lastClientStopAwakeUs) / 1000.0f);
 
                 std::array<char, TOPIC_BUF> stateTopicBuf;
@@ -1573,6 +1600,7 @@ static bool run_publish_cycle(const PublishParams &params)
             // CP4 -- "MQTT state publish" phase. Called regardless of hasAny -- reports ~0 on a
             // quiet/OTA-only cycle, which is the correct value there.
             statePublishAwakeUs = phase_awake_us_get_and_reset();
+            statePublishRawUs = static_cast<uint32_t>(esp_timer_get_time() - statePublishRawStartUs);
 
             // Same bar as the OTA check below: a data-carrying cycle needs connected AND state
             // ACKed, an OTA-only cycle just needs CONNECTED. Runs before OTA -- replay is quick
@@ -1604,12 +1632,13 @@ static bool run_publish_cycle(const PublishParams &params)
         // normally near-zero-cost no-ops).
         const uint32_t clientStopAwakeUs = phase_awake_us_get_and_reset();
 
-        // This cycle's complete 5-phase set, stored for the NEXT cycle's state message (see
+        // This cycle's complete 6-phase set, stored for the NEXT cycle's state message (see
         // s_lastClientStartAwakeUs's doc comment for why the delay is necessary).
         s_lastClientStartAwakeUs = clientStartAwakeUs;
         s_lastSubscribeAwakeUs = subscribeAwakeUs;
         s_lastDiscoveryAwakeUs = discoveryAwakeUs;
         s_lastStatePublishAwakeUs = statePublishAwakeUs;
+        s_lastStatePublishRawUs = statePublishRawUs;
         s_lastClientStopAwakeUs = clientStopAwakeUs;
     }
 
