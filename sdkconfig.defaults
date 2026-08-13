@@ -105,20 +105,6 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 # end of ESP System Settings
 
 #
-# CPU frequency (power experiment, see project_light_sleep_power_investigation memory)
-# DFS stays disabled (common_utils.cpp pins min_freq_mhz == max_freq_mhz to this value) -- this
-# is a straight 160->80MHz A/B test of the CPU-active portions of the awake window (client
-# start/subscribe/discovery/state-publish/client-stop phases), not an attempt to add proper DFS.
-# Datasheet Table 5-10 shows the saving is sub-linear (CPU-active 27mA->19mA, -30%, not -50%),
-# so whether this nets positive depends on how much of that time is genuinely compute-bound vs
-# already-asleep -- that's what the existing phase-timing diagnostics (cs/sb/cd/sp/sr/cp,
-# hp_awake_time) plus a multi-day battery_power_from_history.py fit are for. Revert to
-# ESP_DEFAULT_CPU_FREQ_MHZ_160 if this doesn't win.
-#
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y
-# end of CPU frequency
-
-#
 # Logging
 # Default "RTOS" timestamps are xTaskGetTickCount()-based, and this project's own light-sleep
 # wrapper (correctLightSleep(), main/common_utils.cpp) calls esp_light_sleep_start() directly
