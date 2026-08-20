@@ -118,15 +118,6 @@ struct NetworkLink
     // engage CSL (see openthread_link.cpp's cslStatus() for why that's deliberate). Not folded
     // into LinkStats: it's attach-scoped state, not a per-cycle telemetry delta.
     std::function<std::string_view()> cslStatus;
-
-    // This cycle's real outcome (a confirmed, broker-ACKed publish -- the SAME boolean
-    // runtime_config_tx_power_note_cycle_result() receives at its 3 call sites in
-    // sensorstask.cpp, NOT sensorstask's broader cycleOk, which also counts a quiet "nothing to
-    // publish" cycle as healthy -- this needs proof of an actual round trip). OT: drives CSL's
-    // engage/trust/revert state machine entirely internally (openthread_link.cpp) -- a separate
-    // state machine from TX power's even though both are fed from the same tap points.
-    // Wi-Fi: no-op, no CSL equivalent.
-    std::function<void(bool ok)> noteCycleResult;
 };
 
 struct NetworkLinkConfig

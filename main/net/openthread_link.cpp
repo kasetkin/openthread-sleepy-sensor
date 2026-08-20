@@ -13,7 +13,6 @@
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
 #include "esp_openthread_netif_glue.h"
-#include "esp_timer.h"
 
 #include "common_utils.h"
 #include "secrets.h"
@@ -75,61 +74,18 @@ static void set_poll_period(uint32_t ms)
     esp_openthread_lock_release();
 }
 
-// Stage A operating point: the exact period/timeout incident 2 already proved the border router
-// accepts, reused so Stage A isolates ONLY the "is engaging CSL alone safe long-term" question,
-// not also re-testing negotiation itself. CSL_PERIOD_US is the uint16-encoding ceiling
-// (otLinkSetCslPeriod stores the period as a uint16_t count of 160us units internally --
-// 65535 * 160 -- larger requests silently clamp to this rather than erroring).
-static constexpr uint32_t CSL_PERIOD_US   = 10485600u;
-static constexpr uint32_t CSL_TIMEOUT_SEC = 31u;
-
-// esp_timer_get_time(): sleep-immune (RTC-backed), matches this project's
-// CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM choice -- FreeRTOS tick counts do NOT account for time
-// spent in light sleep here.
-static int64_t s_csl_engaged_at_us = 0;
-static bool s_csl_engaged = false;
-
-// Stage A: requests CSL exactly once per boot, on the first cycle that already proved a REAL
-// broker round trip (see NetworkLink::noteCycleResult's doc comment for why this must be a
-// confirmed publish, not sensorstask's broader cycleOk). Deliberately does nothing else -- no
-// read of otLinkIsCslEnabled(), no touch of otLinkSetPollPeriod(). Two prior hardware incidents
-// (see [[hardware_radio_mode_change_near_attach]] / the CSL integration memory) both broke
-// downlink shortly after engaging CSL and then immediately trusting/acting on it in the same
-// call; this stage exists specifically to isolate whether the mere request, left alone, is safe
-// on its own before any trust/revert logic is written. Idempotent via a static bool, mirroring
-// runtime_config_tx_power_note_first_attach()'s contract.
-static void engage_csl_once()
-{
-    if (s_csl_engaged)
-        return;
-    s_csl_engaged = true;
-    s_csl_engaged_at_us = esp_timer_get_time();
-
-    esp_openthread_lock_acquire(portMAX_DELAY);
-    otInstance *ot = esp_openthread_get_instance();
-    const otError periodErr = otLinkSetCslPeriod(ot, CSL_PERIOD_US);
-    const otError timeoutErr = otLinkSetCslTimeout(ot, CSL_TIMEOUT_SEC);
-    esp_openthread_lock_release();
-
-    ESP_LOGW(TAG, "CSL Stage A: engaged after first confirmed publish -- period=%lu us timeout=%lu s "
-                  "(period_err=%d timeout_err=%d); poll-period override untouched",
-             (unsigned long)CSL_PERIOD_US, (unsigned long)CSL_TIMEOUT_SEC,
-             (int)periodErr, (int)timeoutErr);
-}
-
-// Called once per sensor cycle with the real outcome (see NetworkLink::noteCycleResult). Stage A
-// only ever engages; Stage B would extend this same function with trust/revert logic once Stage
-// A's soak is clean -- see the CSL integration plan before adding anything here.
-static void note_cycle_result(bool ok)
-{
-    if (ok)
-        engage_csl_once();
-}
-
 // Whether the current Thread parent advertises CSL support (Mle::IsCslSupported(): attached AND
-// parent is Thread 1.2+), and whether CSL is actually engaged locally (otLinkIsCslEnabled()) --
-// both are pure getters, no side effects. See engage_csl_once() above for the one place CSL
-// actually gets requested, and why it's deliberately NOT wired to trigger from here.
+// parent is Thread 1.2+) -- read-only, engages nothing. Deliberately NOT calling
+// otLinkSetCslPeriod() anywhere: that call is not passive observation -- since a sleepy child is
+// already marked CSL-capable the moment it attaches to a 1.2+ parent, SetPeriod(nonzero)
+// immediately flips Mac::mIsCslEnabled and reprograms the radio's real receive schedule via
+// otPlatRadioEnableCsl(). Calling that right after attach (this project's first attempt, wired
+// through onFirstAttach) is the same hazard class as the mRxOnWhenIdle mid-attach black-hole
+// documented below: hardware-confirmed across two OTA flashes to leave every publish cycle
+// unable to reach the broker (reset reason "ota_unconfirmed" both times) for the rest of the
+// boot, since nothing ever calls SetPeriod(0) to undo it. Re-enabling real CSL needs a much more
+// careful staging (not at first-attach, with a revert path from the start) -- see the CSL
+// integration plan/memory before trying again.
 static std::string_view cslStatus()
 {
     otInstance *ot = esp_openthread_get_instance();
@@ -137,13 +93,10 @@ static std::string_view cslStatus()
     esp_openthread_lock_acquire(portMAX_DELAY);
     const otDeviceRole role = otThreadGetDeviceRole(ot);
     const bool supported = otLinkIsCslSupported(ot);
-    const bool enabled = otLinkIsCslEnabled(ot);
     esp_openthread_lock_release();
 
     if (role == OT_DEVICE_ROLE_DISABLED || role == OT_DEVICE_ROLE_DETACHED)
         return "detached";
-    if (enabled)
-        return "enabled";
     return supported ? "supported" : "unsupported";
 }
 
@@ -604,6 +557,5 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.readLinkStats = read_link_stats;
     link.setTxPowerDbm = set_tx_power_dbm;
     link.cslStatus = cslStatus;
-    link.noteCycleResult = note_cycle_result;
     return link;
 }

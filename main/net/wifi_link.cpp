@@ -198,6 +198,5 @@ NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
     link.readLinkStats = readApLinkStats;
     link.setTxPowerDbm = set_tx_power_dbm;
     link.cslStatus = cslStatusUnavailable;
-    link.noteCycleResult = [](bool /*ok*/) {};  // plain noop() won't bind -- signature mismatch
     return link;
 }
