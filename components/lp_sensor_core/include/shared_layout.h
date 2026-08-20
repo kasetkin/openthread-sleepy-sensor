@@ -30,11 +30,11 @@ typedef struct {
     //        - the LP program (lp_core/main.cpp) reads this block exactly once, at the top of
     //          its cycle, into local reasoning for that cycle -- it never re-reads a field
     //          mid-cycle, so the SAME field can't change value out from under one decision.
-    //        - the seven fields are never compared cross-field against each other (each is an
-    //          independent threshold/offset/budget), so the one real risk a plain multi-field
-    //          write carries -- the LP core observing an old/new MIX across different fields,
-    //          if a config change lands mid-cycle -- is harmless here: worst case, one LP
-    //          cycle (~one poll interval) applies part of a change (e.g. the old
+    //        - the eight fields are never compared cross-field against each other (each is an
+    //          independent threshold/offset/budget/sample-count), so the one real risk a plain
+    //          multi-field write carries -- the LP core observing an old/new MIX across
+    //          different fields, if a config change lands mid-cycle -- is harmless here: worst
+    //          case, one LP cycle (~one poll interval) applies part of a change (e.g. the old
     //          temp_min_change_c alongside a just-updated rh_offset_pct); the very next cycle
     //          sees the fully-new set. That's a one-cycle-late partial application, never a
     //          corrupted value.
@@ -44,6 +44,10 @@ typedef struct {
     //      not worth it here, unlike result_seq/hp_ack_seq below, which protect fields
     //      written EVERY cycle and/or values that truly must be read together.
     // Mirrors SensorsTaskSettings (main/sensorstask.h) / lp_sensor_core_config_t.
+    // How many raw SHT4x reads main.cpp's measureAveraged() takes (spaced kInterSampleDelayUs
+    // apart) and means into one reported value per cycle -- reduces sample-to-sample noise so
+    // it alone can't cross temp_min_change_c/rh_min_change_pct and trigger a spurious HP wake.
+    uint32_t sensor_samples;
     float    temp_offset_c;
     float    temp_min_change_c;
     float    rh_offset_pct;

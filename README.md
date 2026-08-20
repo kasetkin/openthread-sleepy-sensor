@@ -135,6 +135,7 @@ survives a power cycle.
 | Max publish gap | `max_publish_gap_sec` | 0 .. 21600 s |
 | Heater period | `heater_period_minutes` | 0 .. 10080 min |
 | Heater high-RH trigger | `heater_high_rh_trigger_minutes` | 0 .. 1440 min |
+| Sensor samples | `sensor_samples` | 1 .. 16 |
 | External antenna | *(no YAML key — HA/NVS only)* | on/off |
 
 Each entity is backed by one retained MQTT topic, `<device_id>/cfg/<name>` (see
@@ -145,7 +146,7 @@ same topic: HA publishes a new value there (retained), and after validating/clam
 device applies it and republishes its own retained echo of the value actually in effect, so
 HA's display always matches reality, not just what was requested.
 
-The first 7 rows go straight into the LP core's shared-memory config block (the same one
+The first 8 rows go straight into the LP core's shared-memory config block (the same one
 `lp_sensor_core_init()` populates at boot from `device_config.yaml`) and take effect on the LP
 core's very next wake. The external antenna switch is a GPIO-level analog RF-switch selection
 ([common_utils.h](main/common_utils.h)'s `enableExtAntenna()`) — also applied immediately, no

@@ -54,7 +54,7 @@ enum DiscoveryBit : uint16_t {
     DISC_UPDATE  = 1 << 3,  // HA `update` entity config + retained installed-version -- always published together
     DISC_RSSI    = 1 << 4,  // Signal strength -- owed once a cycle actually carries an RSSI reading
     DISC_DIAG    = 1 << 5,  // Boot count + Reset reason pair -- boot-constant, so always available
-    DISC_NUMBERS = 1 << 6,  // all 7 HA `number` entities (calibration/threshold config) -- always published together
+    DISC_NUMBERS = 1 << 6,  // all 8 HA `number` entities (calibration/threshold config) -- always published together
     DISC_SWITCH  = 1 << 7,  // the ext_antenna HA `switch` entity -- boot-constant, so always available
     DISC_HEATER  = 1 << 8,  // Heater problem + Heater run count pair -- owed once a heater run has ever completed
     // Uplink instrumentation (LinkStats, network_link.h). Split across three bits rather than
@@ -234,7 +234,7 @@ static constexpr std::string_view CMD_PART_CONFIG_CAT = "\"entity_category\":\"c
 // (max-min)/step -- an accidental, range-dependent choice (it put the four fine-step
 // calibration/threshold entities on sliders while the coarser schedule entities landed on
 // boxes) rather than a deliberate one. A box is more usable for typing an exact calibration
-// value than dragging a slider, for all 7 number entities uniformly.
+// value than dragging a slider, for all 9 number entities uniformly.
 static constexpr std::string_view CMD_PART_MODE_BOX = "\"mode\":\"box\",";
 static constexpr std::string_view CMD_PART_MINMAXSTEP = "\"min\":{},\"max\":{},\"step\":{},";
 static constexpr std::string_view CMD_PART_PAYLOADS    = "\"payload_on\":\"{}\",\"payload_off\":\"{}\",";
@@ -912,10 +912,11 @@ static void retire_old_battery_adc_time_discovery(esp_mqtt_client_handle_t clien
     esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 1, 1);
 }
 
-// Issues all 8 publish_number_discovery() calls -- the ONE place these entities' HA-visible
+// Issues all 9 publish_number_discovery() calls -- the ONE place these entities' HA-visible
 // names/units/ranges are decided; ranges come straight from runtime_config.h so the clamp
 // applied on the device side can never drift from what HA's UI advertises. Current values come
-// from runtime_config_current_values(), fetched once here.
+// from runtime_config_current_values(), fetched once here. NUMBER_ENTITY_COUNT below must track
+// the number of calls made here -- see its own comment.
 static void publish_number_discoveries(esp_mqtt_client_handle_t client, std::string_view device_id,
                                        std::string_view device_name)
 {
@@ -945,9 +946,20 @@ static void publish_number_discoveries(esp_mqtt_client_handle_t client, std::str
     publish_number_discovery(client, device_id, device_name, "TX power", "tx_power_dbm",
         runtime_config_topic_tx_power_dbm(), TX_POWER_DBM_MIN, TX_POWER_DBM_MAX, TX_POWER_DBM_STEP,
         "dBm", cur.tx_power_dbm);
+    publish_number_discovery(client, device_id, device_name, "Sensor samples", "sensor_samples",
+        runtime_config_topic_sensor_samples(), SENSOR_SAMPLES_MIN, SENSOR_SAMPLES_MAX,
+        SENSOR_SAMPLES_STEP, nullptr, cur.sensor_samples);
 
     retire_old_max_skip_cycles_discovery(client, device_id);
 }
+
+// How many HA `number` entities publish_number_discoveries() above issues -- must track that
+// function's call count exactly. Named/derived here instead of a bare literal at the
+// DISC_NUMBERS ACK-counting site below (run_publish_cycle()'s discovery_msgs computation) so
+// the next entity added to that function only needs to update this one number, not hunt down a
+// magic-number ACK count that silently desyncs BIT_ALL_ACKED if missed.
+static constexpr int NUMBER_ENTITY_COUNT = 9;
+static constexpr int NUMBER_ENTITY_MSGS = NUMBER_ENTITY_COUNT * 2;  // discovery config + current-value state, each
 
 // The ext_antenna HA `switch` entity's discovery config -- same state_topic==command_topic
 // shape as the number entities above, with ON/OFF payloads instead of a numeric range. Also
@@ -1269,7 +1281,7 @@ static bool run_publish_cycle(const PublishParams &params)
             // QoS 0: retained delivery over an already-reliable TCP link. See ota_updater.h.
             esp_mqtt_client_subscribe(client, ota_topic_manifest(), 0);
             esp_mqtt_client_subscribe(client, ota_topic_install(), 0);
-            // <id>/cfg/# -- one SUBSCRIBE packet for all 8 HA-tunable-parameter topics (see
+            // <id>/cfg/# -- one SUBSCRIBE packet for all 10 HA-tunable-parameter topics (see
             // runtime_config.h), same "ride the publish window" reasoning as the OTA subscribes.
             esp_mqtt_client_subscribe(client, runtime_config_topic_wildcard(), 0);
             // CP2 -- "MQTT subscribe" phase.
@@ -1320,9 +1332,9 @@ static bool run_publish_cycle(const PublishParams &params)
             // Expected ACKs must match what we actually publish below: one state message plus one
             // discovery message per still-owed sensor (two for DISC_BATT: Battery and Voltage;
             // two for DISC_DIAG: Boot count and Reset reason; two for DISC_UPDATE:
-            // update config and installed-version; sixteen for DISC_NUMBERS, discovery config +
-            // current-value state per HA `number` entity, 8 entities x 2 messages; two for
-            // DISC_SWITCH, discovery config + current-value state; two for DISC_HEATER: Heater
+            // update config and installed-version; NUMBER_ENTITY_MSGS for DISC_NUMBERS, discovery
+            // config + current-value state per HA `number` entity, NUMBER_ENTITY_COUNT entities x 2
+            // messages; two for DISC_SWITCH, discovery config + current-value state; two for DISC_HEATER: Heater
             // problem and Heater run count; two for DISC_RADIO: Radio TX time and Radio RX time;
             // four for DISC_LINKQ: TX retries, CCA failures, TX no-ack expiry and Parent link
             // quality; one for DISC_UPLINK: Uplink signal strength; one for DISC_TXPOWER: TX power
@@ -1337,7 +1349,7 @@ static bool run_publish_cycle(const PublishParams &params)
                                      + ((discoveryNeed & DISC_RSSI) ? 1 : 0)
                                      + ((discoveryNeed & DISC_DIAG) ? 2 : 0)
                                      + ((discoveryNeed & DISC_UPDATE) ? 2 : 0)
-                                     + ((discoveryNeed & DISC_NUMBERS) ? 16 : 0)
+                                     + ((discoveryNeed & DISC_NUMBERS) ? NUMBER_ENTITY_MSGS : 0)
                                      + ((discoveryNeed & DISC_SWITCH) ? 2 : 0)
                                      + ((discoveryNeed & DISC_HEATER) ? 2 : 0)
                                      + ((discoveryNeed & DISC_RADIO) ? 2 : 0)

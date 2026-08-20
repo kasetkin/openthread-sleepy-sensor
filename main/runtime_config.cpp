@@ -26,6 +26,7 @@ static std::string s_topic_max_publish_gap_sec;
 static std::string s_topic_heater_period_minutes;
 static std::string s_topic_heater_high_rh_trigger_minutes;
 static std::string s_topic_ext_antenna;
+static std::string s_topic_sensor_samples;
 
 static uint32_t s_poll_interval_sec = 20;
 // Always-current shadow of the 7 calibration/threshold/heater-schedule fields, seeded from
@@ -34,9 +35,12 @@ static uint32_t s_poll_interval_sec = 20;
 // other fields' current values, not stale defaults.
 static lp_sensor_core_config_t s_shadow{};
 
-// The 4 of the 8 HA-tunable parameters NOT already trackable from s_shadow in HA-facing units:
+// The 5 of the 10 HA-tunable parameters NOT already trackable from s_shadow in HA-facing units:
 // the heater fields and max_publish_gap_sec live in s_shadow as LP cycles (not the minutes/
-// seconds HA displays), and antenna selection isn't part of s_shadow at all. Seeded at init,
+// seconds HA displays), antenna selection isn't part of s_shadow at all, and TX power has its
+// own dedicated state machine below (s_tx_power_*) rather than living in s_shadow at all.
+// (sensor_samples is NOT one of these 5 -- it has no unit conversion, so it's read straight off
+// s_shadow.sensor_samples like temp_offset_c etc.) Seeded at init,
 // updated in apply_pending() alongside the existing shadow/NVS/echo updates for these fields --
 // backs runtime_config_current_values().
 static uint32_t s_max_publish_gap_sec = 0;
@@ -78,6 +82,7 @@ struct PendingCfg
     bool heater_high_rh_set = false;
     bool ext_antenna_set = false;
     bool tx_power_dbm_set = false;
+    bool sensor_samples_set = false;
 
     float temp_offset_c = 0.0f;
     float temp_min_change_c = 0.0f;
@@ -88,6 +93,7 @@ struct PendingCfg
     uint32_t heater_high_rh_trigger_minutes = 0;
     bool ext_antenna_on = false;
     int32_t tx_power_dbm = 0;
+    uint32_t sensor_samples = 0;
 };
 static PendingCfg s_pending;
 static SemaphoreHandle_t s_mutex = nullptr;
@@ -179,6 +185,7 @@ void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
     s_topic_heater_high_rh_trigger_minutes = full(CFG_SUFFIX_HEATER_HIGH_RH_MIN);
     s_topic_ext_antenna                    = full(CFG_SUFFIX_EXT_ANTENNA);
     s_topic_tx_power_dbm                   = full(CFG_SUFFIX_TX_POWER_DBM);
+    s_topic_sensor_samples                 = full(CFG_SUFFIX_SENSOR_SAMPLES);
 
     // A trial left outstanding by a previous boot -- runtime_config_tx_power_note_first_attach()
     // decides what to do with it (never resumed, always treated as failed).
@@ -209,6 +216,7 @@ const char *runtime_config_topic_heater_period_minutes()          { return s_top
 const char *runtime_config_topic_heater_high_rh_trigger_minutes() { return s_topic_heater_high_rh_trigger_minutes.c_str(); }
 const char *runtime_config_topic_ext_antenna()                    { return s_topic_ext_antenna.c_str(); }
 const char *runtime_config_topic_tx_power_dbm()                   { return s_topic_tx_power_dbm.c_str(); }
+const char *runtime_config_topic_sensor_samples()                 { return s_topic_sensor_samples.c_str(); }
 
 void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
                                   const char *data, size_t data_len)
@@ -304,6 +312,15 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         s_pending.tx_power_dbm = v;
         s_pending.tx_power_dbm_set = true;
         xSemaphoreGive(s_mutex);
+    } else if (topic_is(topic, topic_len, s_topic_sensor_samples)) {
+        uint32_t v;
+        if (!parse_uint32(data, data_len, v))
+            return;
+        v = std::clamp(v, SENSOR_SAMPLES_MIN, SENSOR_SAMPLES_MAX);
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_pending.sensor_samples = v;
+        s_pending.sensor_samples_set = true;
+        xSemaphoreGive(s_mutex);
     }
 }
 
@@ -322,6 +339,7 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
     if (snap.temp_min_change_set)  { s_shadow.temp_min_change_c = snap.temp_min_change_c; lpChanged = true; ++applied; }
     if (snap.rh_offset_set)        { s_shadow.rh_offset_pct = snap.rh_offset_pct; lpChanged = true; ++applied; }
     if (snap.rh_min_change_set)    { s_shadow.rh_min_change_pct = snap.rh_min_change_pct; lpChanged = true; ++applied; }
+    if (snap.sensor_samples_set)   { s_shadow.sensor_samples = snap.sensor_samples; lpChanged = true; ++applied; }
     if (snap.max_publish_gap_sec_set) {
         s_shadow.max_skip_cycles = publish_gap_sec_to_skip_cycles(snap.max_publish_gap_sec, s_poll_interval_sec);
         s_max_publish_gap_sec = snap.max_publish_gap_sec;
@@ -391,6 +409,8 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
             nvs_set_i8(nvs, "txp_pending", static_cast<int8_t>(snap.tx_power_dbm));
             nvs_set_u8(nvs, "txp_pend_flag", 1);
         }
+        if (snap.sensor_samples_set)
+            nvs_set_u32(nvs, "sensor_samples", snap.sensor_samples);
         if (nvs_commit(nvs) != ESP_OK)
             ESP_LOGE(TAG, "nvs_commit failed — change applied live but may not survive a reboot");
         nvs_close(nvs);
@@ -416,6 +436,7 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
         if (snap.heater_high_rh_set)  { appendNum(val, snap.heater_high_rh_trigger_minutes); echo(s_topic_heater_high_rh_trigger_minutes.c_str()); }
         if (snap.ext_antenna_set)     { val = snap.ext_antenna_on ? "ON" : "OFF"; echo(s_topic_ext_antenna.c_str()); }
         if (snap.tx_power_dbm_set)    { appendNum(val, snap.tx_power_dbm); echo(s_topic_tx_power_dbm.c_str()); }
+        if (snap.sensor_samples_set)  { appendNum(val, snap.sensor_samples); echo(s_topic_sensor_samples.c_str()); }
     }
 
     ESP_LOGI(TAG, "applied %d runtime config change(s)", applied);
@@ -495,6 +516,7 @@ RuntimeConfigValues runtime_config_current_values()
         .heater_high_rh_trigger_minutes = s_heater_high_rh_trigger_minutes,
         .ext_antenna_on = s_ext_antenna_on,
         .tx_power_dbm = s_tx_power_has_pending ? int32_t(s_tx_power_pending) : int32_t(s_tx_power_known_good),
+        .sensor_samples = s_shadow.sensor_samples,
     };
 }
 

@@ -14,6 +14,9 @@ extern "C" {
 // temp_offset/temp_min_change keys directly -- written once into LP shared memory by
 // lp_sensor_core_init(), before the LP program ever runs.
 typedef struct {
+    // How many raw SHT4x reads to average into one reported value per LP cycle -- see
+    // shared_layout.h's lp_shared_state_t::sensor_samples for the full reasoning.
+    uint32_t sensor_samples;
     float    temp_offset_c;
     float    temp_min_change_c;
     float    rh_offset_pct;

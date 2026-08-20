@@ -421,6 +421,8 @@ extern "C" void app_main(void)
         "txp_known_good");
 
     const lp_sensor_core_config_t lpConfig {
+        .sensor_samples = runtime_config_nvs_override(
+            parse_as_uint32_or(device_config_yaml(), "sensor_samples", 4u), "sensor_samples"),
         .temp_offset_c = runtime_config_nvs_override(
             parse_as_float_or(device_config_yaml(), "temp_offset", 0.0f), "temp_offset"),
         .temp_min_change_c = runtime_config_nvs_override(
@@ -434,10 +436,11 @@ extern "C" void app_main(void)
         .heater_period_cycles = minutes_to_lp_cycles(heater_period_minutes, lp_poll_interval_sec),
         .high_rh_trigger_cycles = minutes_to_lp_cycles(heater_high_rh_trigger_minutes, lp_poll_interval_sec),
     };
-    ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, temp_offset=%.2f temp_min_change=%.2f "
-                  "rh_offset=%.2f rh_min_change=%.2f max_publish_gap_sec=%lu (%lu cycles) "
-                  "heater_period=%lu cycles high_rh_trigger=%lu cycles",
+    ESP_LOGI(TAG, "LP sensor core: poll interval %lu s, sensor_samples=%lu temp_offset=%.2f "
+                  "temp_min_change=%.2f rh_offset=%.2f rh_min_change=%.2f max_publish_gap_sec=%lu "
+                  "(%lu cycles) heater_period=%lu cycles high_rh_trigger=%lu cycles",
              static_cast<unsigned long>(lp_poll_interval_sec),
+             static_cast<unsigned long>(lpConfig.sensor_samples),
              static_cast<double>(lpConfig.temp_offset_c), static_cast<double>(lpConfig.temp_min_change_c),
              static_cast<double>(lpConfig.rh_offset_pct), static_cast<double>(lpConfig.rh_min_change_pct),
              static_cast<unsigned long>(max_publish_gap_sec),

@@ -13,7 +13,7 @@
 //   - mqtt_sender subscribes to the wildcard below each cycle, routes every MQTT_EVENT_DATA
 //     here, and calls runtime_config_apply_pending() after the cycle's own publish work.
 //   - this module owns the pending-change state, the NVS persistence, the live application
-//     (LP shared-memory config block for the 7 numeric fields, enableExtAntenna() for the 8th),
+//     (LP shared-memory config block for the 8 numeric fields, enableExtAntenna() for the 9th),
 //     and the boot-time NVS-override resolver main.cpp uses.
 //
 // Every topic is retained (the device is not a long-lived MQTT client -- see mqtt_sender.cpp --
@@ -35,8 +35,9 @@ inline constexpr std::string_view CFG_SUFFIX_HEATER_PERIOD_MIN  = "cfg/heater_pe
 inline constexpr std::string_view CFG_SUFFIX_HEATER_HIGH_RH_MIN = "cfg/heater_high_rh_trigger_minutes";
 inline constexpr std::string_view CFG_SUFFIX_EXT_ANTENNA        = "cfg/ext_antenna";
 inline constexpr std::string_view CFG_SUFFIX_TX_POWER_DBM       = "cfg/tx_power_dbm";
-// One SUBSCRIBE for all 9 topics, not 9 -- minimizes SUBSCRIBE-packet overhead in the brief
-// per-cycle awake window (see run_publish_cycle()'s existing manifest/install subscribes).
+inline constexpr std::string_view CFG_SUFFIX_SENSOR_SAMPLES     = "cfg/sensor_samples";
+// One SUBSCRIBE for all 10 topics, not one per topic -- minimizes SUBSCRIBE-packet overhead in
+// the brief per-cycle awake window (see run_publish_cycle()'s existing manifest/install subscribes).
 inline constexpr std::string_view CFG_SUFFIX_WILDCARD           = "cfg/#";
 
 inline constexpr std::string_view EXT_ANTENNA_PAYLOAD_ON  = "ON";
@@ -82,9 +83,16 @@ inline constexpr int32_t TX_POWER_DBM_STEP = 1;
 // applied before the first successful attach, during every OTA window, and whenever no
 // known-good value has ever been confirmed.
 inline constexpr int8_t TX_POWER_TABLE_MAX_DBM = 20;
+// How many raw SHT4x reads the LP core averages into one reported value per poll (see
+// shared_layout.h's sensor_samples comment). MAX=16 is a generous UI ceiling, not a
+// recommendation -- each extra sample costs one more ~100ms inter-sample delay
+// (lp_core/main.cpp's kInterSampleDelayUs) worth of LP-core active time per poll.
+inline constexpr uint32_t SENSOR_SAMPLES_MIN = 1;
+inline constexpr uint32_t SENSOR_SAMPLES_MAX = 16;
+inline constexpr uint32_t SENSOR_SAMPLES_STEP = 1;
 
 // Call once from main.cpp, right after lp_sensor_core_start() succeeds. `boot_config` seeds
-// this module's shadow of the 7 numeric fields (lp_sensor_core_apply_config() always writes
+// this module's shadow of the 8 numeric fields (lp_sensor_core_apply_config() always writes
 // the full struct, so a partial live change still needs the other fields' current values);
 // `poll_interval_sec` is the boot's fixed LP poll interval, needed to convert a live
 // heater-minutes change to LP cycles the same way main.cpp's minutes_to_lp_cycles() does at
@@ -104,7 +112,7 @@ void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
                           bool ext_antenna_on, int32_t tx_power_known_good_dbm,
                           const NetworkLink *link);
 
-// The 9 HA-tunable parameters' current resolved value, in HA-facing units (heater fields in
+// The 10 HA-tunable parameters' current resolved value, in HA-facing units (heater fields in
 // minutes, max_publish_gap in seconds -- neither in LP cycles) -- whichever is freshest of the
 // boot default/NVS override or the latest MQTT change accepted since. Used by mqtt_sender.cpp to
 // publish each cfg/* topic's retained state alongside its discovery config (see
@@ -123,6 +131,7 @@ struct RuntimeConfigValues
     uint32_t heater_high_rh_trigger_minutes;
     bool ext_antenna_on;
     int32_t tx_power_dbm;
+    uint32_t sensor_samples;
 };
 RuntimeConfigValues runtime_config_current_values();
 
@@ -137,6 +146,7 @@ const char *runtime_config_topic_heater_period_minutes();
 const char *runtime_config_topic_heater_high_rh_trigger_minutes();
 const char *runtime_config_topic_ext_antenna();
 const char *runtime_config_topic_tx_power_dbm();
+const char *runtime_config_topic_sensor_samples();
 
 // ── TX power (Phase B) ──────────────────────────────────────────────────────────────────────
 // A tx_power_dbm value low enough to break the uplink would strand the device (its only

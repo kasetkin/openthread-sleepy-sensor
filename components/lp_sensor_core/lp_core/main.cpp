@@ -60,6 +60,14 @@ constexpr uint32_t kHeaterHighLongDelayUs = 1100000;
 
 constexpr int32_t kI2cTimeoutCycles = 5000;        // matches the reference lp_i2c example
 
+// Spacing between the N reads measureAveraged() takes for one periodic (non-heater) cycle
+// reading. Not a datasheet requirement -- the SHT4x has no periodic/continuous mode at all
+// (unlike the SHT3x, easy to conflate the two), only single-shot commands with the kMeasureDelayUs
+// conversion wait above and no specified minimum idle time between plain reads. 100ms is ~10x
+// that mandatory conversion wait: deliberate margin against any unspecified self-heating/bus-
+// settling between back-to-back plain reads, not a value the datasheet mandates.
+constexpr uint32_t kInterSampleDelayUs = 100000;
+
 // --- heater tuning constants. The heater SCHEDULE (periodic self-test interval, sustained
 // high-RH duration before creep mitigation) is runtime config now:
 // g_shared.heater_period_cycles / .high_rh_trigger_cycles, written once by
@@ -133,6 +141,37 @@ bool measure(uint8_t cmd, uint32_t delayUs, float &tempC, float &humPct)
     // Same conversion as sht4x_compute_values() in components/sht4x/sht4x.c.
     tempC = rawTemp * 175.0f / 65535.0f - 45.0f;
     humPct = clampf(rawHum * 125.0f / 65535.0f - 6.0f, 0.0f, 100.0f);
+    return true;
+}
+
+// Averages up to `samples` periodic (non-heater) readings into one tempC/humPct, reducing
+// sample-to-sample noise by roughly 1/sqrt(successful-sample-count) before calibration/
+// threshold logic ever sees the value -- see shared_layout.h's sensor_samples comment. Any
+// individual read's CRC failure just drops that sample from the average (this board's GPIO6/7
+// I2C pads have a documented history of marginal signal integrity); only a run where EVERY
+// sample fails is reported as a failed cycle, same "any success = OK" rule the pre-averaging
+// N=1 code already had. Heater baseline/pulse/cooldown/final-clean reads in
+// runHeaterMaintenance() below are deliberately NOT averaged -- that path already has its own
+// delta-T-based signal logic and is a rare, distinct event, not the noise source this exists for.
+bool measureAveraged(uint32_t samples, float &tempC, float &humPct)
+{
+    if (samples == 0) samples = 1;  // defensive floor; the HP-side config path always clamps to >=1
+    float sumT = 0.0f, sumH = 0.0f;
+    uint32_t ok = 0;
+    for (uint32_t i = 0; i < samples; i++) {
+        if (i > 0)
+            ulp_lp_core_delay_us(kInterSampleDelayUs);
+        float t, h;
+        if (measure(kCmdMeasureHigh, kMeasureDelayUs, t, h)) {
+            sumT += t;
+            sumH += h;
+            ok++;
+        }
+    }
+    if (ok == 0)
+        return false;
+    tempC = sumT / static_cast<float>(ok);
+    humPct = sumH / static_cast<float>(ok);
     return true;
 }
 
@@ -218,7 +257,7 @@ extern "C" int main()
     g_shared.result_seq++; // odd: writing
 
     float tempC, humPct;
-    const bool ok = measure(kCmdMeasureHigh, kMeasureDelayUs, tempC, humPct);
+    const bool ok = measureAveraged(g_shared.sensor_samples, tempC, humPct);
 
     g_shared.heartbeat_counter++;
     g_shared.sensor_ok = ok ? 1 : 0;

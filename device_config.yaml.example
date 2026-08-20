@@ -40,6 +40,15 @@ max_publish_gap_sec: "300"
 # Not MQTT tunable (would need re-arming the LP hardware timer live -- deferred).
 lp_poll_interval_sec: "20"
 
+# How many raw SHT4x readings the LP core averages into one reported value per poll, spaced
+# 100ms apart (fixed in firmware, not itself configurable). Averaging cuts sample-to-sample
+# noise by roughly 1/sqrt(N), which stops noise alone from crossing temp_min_change/
+# rh_min_change above and triggering a publish nothing actually changed. Higher N means more
+# LP-core active time per poll (roughly (N-1)*100ms + N*10ms) -- cheap at the default, worth
+# watching at the high end of the 1..16 range if you're chasing battery life.
+# MQTT tunable: <device_id>/cfg/sensor_samples
+sensor_samples: "4"
+
 # Heater maintenance schedule (SHT4x built-in heater), in wall-clock minutes -- converted
 # to LP poll cycles at boot, so these stay correct whatever lp_poll_interval_sec is.
 # heater_period_minutes: interval between periodic heater self-tests (default 24 h).
