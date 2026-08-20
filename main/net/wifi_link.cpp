@@ -147,6 +147,8 @@ static bool waitForBrokerReachable(std::string_view /*broker_address*/, uint32_t
 
 static void noop() {}
 
+static void noopResult(bool /*ok*/) {}
+
 static std::string_view cslStatusUnavailable() { return "n/a"; }
 
 static void refresh()
@@ -191,7 +193,7 @@ NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
     link.brokerUri = brokerUri;
     link.waitForBrokerReachable = waitForBrokerReachable;
     link.onPublishWindowBegin = noop;
-    link.onPublishWindowEnd = noop;
+    link.onPublishWindowEnd = noopResult;
     link.onOtaWindowBegin = noop;   // Wi-Fi STA is already always-RX during the awake window
     link.onOtaWindowEnd = noop;
     link.refresh = refresh;

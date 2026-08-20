@@ -75,9 +75,13 @@ struct NetworkLink
     // guarantee it).
     std::function<bool(std::string_view broker_address, uint32_t timeoutMs)> waitForBrokerReachable;
 
-    // Publish-window hooks (OT: fast/slow poll period; Wi-Fi: no-op).
+    // Publish-window hooks (OT: fast/slow poll period; Wi-Fi: no-op). onPublishWindowEnd takes
+    // this cycle's outcome (connected, published, AND broker-ACKed) -- OT uses it to engage CSL
+    // exactly once, on the first cycle that already proved a full round trip works, rather than
+    // at attach (see openthread_link.cpp's set_idle_poll_period() for why that distinction is
+    // hardware-load-bearing, not cosmetic).
     std::function<void()> onPublishWindowBegin;
-    std::function<void()> onPublishWindowEnd;
+    std::function<void(bool ok)> onPublishWindowEnd;
 
     // OTA-download hooks (OT: a much faster data-poll period so parent-buffered image
     // chunks flow without tripping esp-mqtt's ~1 s mid-message stall abort; Wi-Fi: no-op).
