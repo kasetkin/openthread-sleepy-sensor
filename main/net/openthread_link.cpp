@@ -67,14 +67,19 @@ static constexpr uint32_t POLL_FAST_MS = 500;
 static constexpr uint32_t POLL_OTA_MS  = 50;
 static constexpr uint32_t POLL_SLOW_MS = 70000;
 
-// CSL_PERIOD_US matches POLL_SLOW_MS exactly for an apples-to-apples first comparison against
-// classic polling's idle cadence: 70,000,000 us / 160 us (OT_LINK_CSL_PERIOD_TEN_SYMBOLS_UNIT_IN_USEC)
-// = 437,500 exactly, a valid multiple.
-static constexpr uint32_t CSL_PERIOD_US = POLL_SLOW_MS * 1000;
+// otLinkSetCslPeriod() stores the period as a uint16_t count of 160 us units internally
+// (link_api.cpp: ClampToUint16(aPeriod / OT_US_PER_TEN_SYMBOLS)) -- 65535 * 160 us =
+// 10,485,600 us is a hard ceiling that gets silently CLAMPED to, not rejected, if exceeded
+// (hardware-confirmed: an earlier 70,000,000 us value, meant to match POLL_SLOW_MS's idle
+// cadence exactly, returned OT_ERROR_NONE but never actually ran at 70 s). That cadence is
+// unreachable via this API, so the closest achievable "as infrequent as possible" value is
+// used instead -- CSL wakes more often (~10.5 s) than today's classic idle Data-Poll (70 s),
+// so any power comparison must account for that difference, not assume parity.
+static constexpr uint32_t CSL_PERIOD_US = 65535u * 160u;
 // Three missed CSL windows' worth of silence before OT gives up on the parent and forces a
 // re-attach -- independent of (and doesn't replace) the MLE child timeout, which still governs
 // classic keepalive/detach. A first-pass value, not yet hardware-tuned.
-static constexpr uint32_t CSL_TIMEOUT_SEC = 3 * (POLL_SLOW_MS / 1000);
+static constexpr uint32_t CSL_TIMEOUT_SEC = 3 * CSL_PERIOD_US / 1000000;
 
 static void set_poll_period(uint32_t ms)
 {
