@@ -197,7 +197,6 @@ NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
     link.refresh = refresh;
     link.readLinkStats = readApLinkStats;
     link.setTxPowerDbm = set_tx_power_dbm;
-    link.onFirstAttach = noop;
     link.cslStatus = cslStatusUnavailable;
     return link;
 }

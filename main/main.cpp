@@ -391,11 +391,8 @@ extern "C" void app_main(void)
     // see runtime_config_tx_power_note_first_attach()'s doc comment.
     sensorTask->configureAttachGate([](uint32_t timeoutMs) {
         const bool ready = s_link.waitForReady(timeoutMs);
-        if (ready) {
+        if (ready)
             runtime_config_tx_power_note_first_attach();
-            if (s_link.onFirstAttach)
-                s_link.onFirstAttach();
-        }
         return ready;
     });
 

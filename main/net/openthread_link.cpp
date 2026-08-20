@@ -67,17 +67,6 @@ static constexpr uint32_t POLL_FAST_MS = 500;
 static constexpr uint32_t POLL_OTA_MS  = 50;
 static constexpr uint32_t POLL_SLOW_MS = 70000;
 
-// CSL negotiation (Stage 2): purely additive for now -- POLL_SLOW/FAST/OTA above stays the sole
-// thing governing actual delivery until a later stage clears the idle poll-period override.
-// CSL_PERIOD_US matches POLL_SLOW_MS exactly for an apples-to-apples first comparison against
-// classic polling's idle cadence: 70,000,000 us / 160 us (OT_LINK_CSL_PERIOD_TEN_SYMBOLS_UNIT_IN_USEC)
-// = 437,500 exactly, a valid multiple.
-static constexpr uint32_t CSL_PERIOD_US = POLL_SLOW_MS * 1000;
-// Three missed CSL windows' worth of silence before OT gives up on the parent and forces a
-// re-attach -- independent of (and doesn't replace) the MLE child timeout, which still governs
-// classic keepalive/detach. A first-pass value, not yet hardware-tuned.
-static constexpr uint32_t CSL_TIMEOUT_SEC = 3 * (POLL_SLOW_MS / 1000);
-
 static void set_poll_period(uint32_t ms)
 {
     esp_openthread_lock_acquire(portMAX_DELAY);
@@ -85,54 +74,30 @@ static void set_poll_period(uint32_t ms)
     esp_openthread_lock_release();
 }
 
-static bool s_csl_setup_done = false;
-
-// One-time, idempotent CSL negotiation request -- safe to call on every subsequent successful
-// attach too (mirrors runtime_config_tx_power_note_first_attach()'s contract); OpenThread
-// re-negotiates CSL with whatever the current parent is automatically, so this never needs
-// reissuing across re-attaches within the same boot.
-static void note_first_attach()
-{
-    if (s_csl_setup_done)
-        return;
-    s_csl_setup_done = true;
-
-    esp_openthread_lock_acquire(portMAX_DELAY);
-    otInstance *ot = esp_openthread_get_instance();
-    const otError periodErr = otLinkSetCslPeriod(ot, CSL_PERIOD_US);
-    const otError timeoutErr = otLinkSetCslTimeout(ot, CSL_TIMEOUT_SEC);
-    esp_openthread_lock_release();
-
-    if (periodErr != OT_ERROR_NONE || timeoutErr != OT_ERROR_NONE) {
-        ESP_LOGE(TAG, "CSL setup failed: period=%d timeout=%d",
-                 static_cast<int>(periodErr), static_cast<int>(timeoutErr));
-        return;
-    }
-    ESP_LOGI(TAG, "CSL requested: period=%lu us timeout=%lu s",
-             (unsigned long)CSL_PERIOD_US, (unsigned long)CSL_TIMEOUT_SEC);
-}
-
-// Snapshot of CSL negotiation with the current parent -- Thread-only concept, no Wi-Fi
-// equivalent. Not folded into LinkStats: it's attach-scoped state, not a per-cycle telemetry
-// delta, so a bare accessor (matching hp_awake_stats_get_and_reset_us()'s shape) fits better
-// than that struct's "read once, differenced against last cycle" contract.
+// Whether the current Thread parent advertises CSL support (Mle::IsCslSupported(): attached AND
+// parent is Thread 1.2+) -- read-only, engages nothing. Deliberately NOT calling
+// otLinkSetCslPeriod() anywhere: that call is not passive observation -- since a sleepy child is
+// already marked CSL-capable the moment it attaches to a 1.2+ parent, SetPeriod(nonzero)
+// immediately flips Mac::mIsCslEnabled and reprograms the radio's real receive schedule via
+// otPlatRadioEnableCsl(). Calling that right after attach (this project's first attempt, wired
+// through onFirstAttach) is the same hazard class as the mRxOnWhenIdle mid-attach black-hole
+// documented below: hardware-confirmed across two OTA flashes to leave every publish cycle
+// unable to reach the broker (reset reason "ota_unconfirmed" both times) for the rest of the
+// boot, since nothing ever calls SetPeriod(0) to undo it. Re-enabling real CSL needs a much more
+// careful staging (not at first-attach, with a revert path from the start) -- see the CSL
+// integration plan/memory before trying again.
 static std::string_view cslStatus()
 {
     otInstance *ot = esp_openthread_get_instance();
-    const otDeviceRole role = otThreadGetDeviceRole(ot);
-    if (role == OT_DEVICE_ROLE_DISABLED || role == OT_DEVICE_ROLE_DETACHED)
-        return "detached";
 
     esp_openthread_lock_acquire(portMAX_DELAY);
-    const bool enabled = otLinkIsCslEnabled(ot);
+    const otDeviceRole role = otThreadGetDeviceRole(ot);
     const bool supported = otLinkIsCslSupported(ot);
     esp_openthread_lock_release();
 
-    if (enabled)
-        return "enabled";
-    if (supported)
-        return "supported";
-    return "unsupported";
+    if (role == OT_DEVICE_ROLE_DISABLED || role == OT_DEVICE_ROLE_DETACHED)
+        return "detached";
+    return supported ? "supported" : "unsupported";
 }
 
 static esp_err_t set_tx_power_dbm(int8_t dbm)
@@ -591,7 +556,6 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.refresh = refresh_nat64_prefix;
     link.readLinkStats = read_link_stats;
     link.setTxPowerDbm = set_tx_power_dbm;
-    link.onFirstAttach = note_first_attach;
     link.cslStatus = cslStatus;
     return link;
 }

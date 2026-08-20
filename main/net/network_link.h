@@ -113,16 +113,10 @@ struct NetworkLink
     // Calling it more than once per cycle would split those deltas across the calls.
     std::function<std::optional<LinkStats>()> readLinkStats;
 
-    // Fired once, idempotently, the first time this boot that waitForReady() succeeds -- for
-    // one-time instance-level radio setup that shouldn't be redone on every re-attach (OT: CSL
-    // period/timeout negotiation; Wi-Fi: no-op). Idempotency lives in the implementation, not
-    // the caller -- mirrors runtime_config_tx_power_note_first_attach()'s "safe to call every
-    // successful attach" contract.
-    std::function<void()> onFirstAttach;
-
-    // CSL negotiation snapshot with the current parent: "enabled"/"supported"/"unsupported"/
-    // "detached" (OT), or "n/a" (Wi-Fi -- no Thread-CSL equivalent). Not folded into LinkStats:
-    // it's attach-scoped state, not a per-cycle telemetry delta.
+    // Whether the current Thread parent advertises CSL support: "supported"/"unsupported"/
+    // "detached" (OT), or "n/a" (Wi-Fi -- no Thread-CSL equivalent). Read-only -- does not
+    // engage CSL (see openthread_link.cpp's cslStatus() for why that's deliberate). Not folded
+    // into LinkStats: it's attach-scoped state, not a per-cycle telemetry delta.
     std::function<std::string_view()> cslStatus;
 };
 
