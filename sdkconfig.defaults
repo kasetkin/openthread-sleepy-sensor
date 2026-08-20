@@ -43,6 +43,14 @@ CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
 # IEEE802154_TIMING_OPTIMIZATION and OPENTHREAD_TIMING_OPTIMIZATION.
 CONFIG_OPENTHREAD_RADIO_STATS_ENABLE=y
 CONFIG_OPENTHREAD_LINK_METRICS=y
+# CSL (Coordinated Sampled Listening, Thread 1.2+): lets this child negotiate a scheduled
+# receive window with its parent instead of periodic Data-Poll round trips for idle-time
+# receive -- a candidate replacement for POLL_SLOW_MS's ~70s poll cost. Compile-only for now;
+# nothing calls otLinkSetCslPeriod() yet, so this stage is a size/build check, not a behavior
+# change. Already selects IEEE802154_TIMING_OPTIMIZATION/OPENTHREAD_TIMING_OPTIMIZATION, but
+# CONFIG_OPENTHREAD_LINK_METRICS above already selects both, so nothing new gets pulled in
+# transitively by this flag alone.
+CONFIG_OPENTHREAD_CSL_ENABLE=y
 # end of OpenThread
 
 #

@@ -147,6 +147,8 @@ static bool waitForBrokerReachable(std::string_view /*broker_address*/, uint32_t
 
 static void noop() {}
 
+static std::string_view cslStatusUnavailable() { return "n/a"; }
+
 static void refresh()
 {
     esp_wifi_connect();
@@ -195,5 +197,7 @@ NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
     link.refresh = refresh;
     link.readLinkStats = readApLinkStats;
     link.setTxPowerDbm = set_tx_power_dbm;
+    link.onFirstAttach = noop;
+    link.cslStatus = cslStatusUnavailable;
     return link;
 }

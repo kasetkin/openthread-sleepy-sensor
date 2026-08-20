@@ -26,6 +26,10 @@ inline constexpr size_t MQTT_MAX_DEVICE_ID_LEN =
 // buffer is sized against this, so the two can't silently drift apart.
 inline constexpr size_t MQTT_MAX_RESET_REASON_LEN = sizeof("lp_stall_reboot") - 1;  // longest of resetReasonString()'s literals (main.cpp)
 
+// Longest string NetworkLink::cslStatus() can produce (openthread_link.cpp/wifi_link.cpp) --
+// same "buffer sizing can't drift from the actual literals" role as the bound above.
+inline constexpr size_t MQTT_MAX_CSL_STATUS_LEN = sizeof("unsupported") - 1;
+
 struct MqttConfig {
     std::string      broker_address; // literal IPv4 or IPv6 address, e.g. "192.168.77.250" or "fd12:3456:789a::10"
     uint16_t         port;       // MQTT port, e.g. 1883
