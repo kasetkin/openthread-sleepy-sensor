@@ -401,6 +401,11 @@ extern "C" void app_main(void)
     // without waiting for a reboot.
     sensorTask->configureRefreshNat64(s_link.refresh);
 
+    // Feeds each cycle's real outcome to link-layer state machines that need proof of a working
+    // round trip before trusting a risky setting (OT: CSL engagement -- see
+    // main/net/openthread_link.cpp; Wi-Fi: no-op).
+    sensorTask->configureNoteCycleResult(s_link.noteCycleResult);
+
     // ── bring up the network link ──────────────────────────────────────────────
     ESP_ERROR_CHECK(s_link.start());
 

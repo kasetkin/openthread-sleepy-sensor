@@ -59,6 +59,11 @@ void SensorsTask::configureRefreshNat64(RefreshNat64 refreshNat64)
     m_refreshNat64 = std::move(refreshNat64);
 }
 
+void SensorsTask::configureNoteCycleResult(NoteCycleResult noteCycleResult)
+{
+    m_noteCycleResult = std::move(noteCycleResult);
+}
+
 void SensorsTask::executeTask()
 {
     static const char * TAG = "sensors-task";
@@ -109,6 +114,8 @@ void SensorsTask::executeTask()
             // uplink -- it happens before the publish logic below is ever reached, so it needs
             // its own tap into the confirm/revert counter (see runtime_config.cpp's design note).
             runtime_config_tx_power_note_cycle_result(false);
+            if (m_noteCycleResult)
+                m_noteCycleResult(false);
         } else {
             lp_shared_state_t state{};
             lp_sensor_core_get_state(&state);
@@ -231,6 +238,8 @@ void SensorsTask::executeTask()
                     if (mqtt_wait_for_idle(PUBLISH_TIMEOUT_MS)) {
                         publishedOk = mqtt_last_publish_succeeded();
                         runtime_config_tx_power_note_cycle_result(publishedOk);
+                        if (m_noteCycleResult)
+                            m_noteCycleResult(publishedOk);
                         // Only ack on CONFIRMED delivery -- an attempted-but-failed publish
                         // must leave LP's baseline untouched, so the still-undelivered value
                         // keeps being flagged next cycle instead of silently getting dropped.
@@ -258,6 +267,8 @@ void SensorsTask::executeTask()
                     } else {
                         ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
                         runtime_config_tx_power_note_cycle_result(false);
+                        if (m_noteCycleResult)
+                            m_noteCycleResult(false);
                     }
                 } else {
                     ESP_LOGW(TAG, "mqtt is not working? not sure");
