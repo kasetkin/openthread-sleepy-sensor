@@ -1219,14 +1219,14 @@ static bool run_publish_cycle(const PublishParams &params)
     if (!s_link->waitForBrokerReachable(s_cfg.broker_address, BROKER_REACHABLE_WAIT_MS)) {
         ESP_LOGE(TAG, "broker not reachable within %lu ms, skipping cycle",
                  (unsigned long)BROKER_REACHABLE_WAIT_MS);
-        s_link->onPublishWindowEnd(false);
+        s_link->onPublishWindowEnd();
         return false;
     }
 
     const std::string uri = s_link->brokerUri(s_cfg.broker_address, s_cfg.port, s_cfg.use_tls);
     if (uri.empty()) {
         ESP_LOGE(TAG, "broker_address not set or invalid, cannot connect");
-        s_link->onPublishWindowEnd(false);
+        s_link->onPublishWindowEnd();
         return false;
     }
 
@@ -1669,7 +1669,7 @@ static bool run_publish_cycle(const PublishParams &params)
     if (ok || !hasAny)
         run_ota_if_due(uri, params.battery_percent);
 
-    s_link->onPublishWindowEnd(ok);  // OT: engage CSL once ok, then live-recompute idle poll from it; Wi-Fi: no-op
+    s_link->onPublishWindowEnd();  // OT: back to slow poll until next sensor cycle; Wi-Fi: no-op
     return ok;
 }
 

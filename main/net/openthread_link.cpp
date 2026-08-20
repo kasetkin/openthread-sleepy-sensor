@@ -67,20 +67,6 @@ static constexpr uint32_t POLL_FAST_MS = 500;
 static constexpr uint32_t POLL_OTA_MS  = 50;
 static constexpr uint32_t POLL_SLOW_MS = 70000;
 
-// otLinkSetCslPeriod() stores the period as a uint16_t count of 160 us units internally
-// (link_api.cpp: ClampToUint16(aPeriod / OT_US_PER_TEN_SYMBOLS)) -- 65535 * 160 us =
-// 10,485,600 us is a hard ceiling that gets silently CLAMPED to, not rejected, if exceeded
-// (hardware-confirmed: an earlier 70,000,000 us value, meant to match POLL_SLOW_MS's idle
-// cadence exactly, returned OT_ERROR_NONE but never actually ran at 70 s). That cadence is
-// unreachable via this API, so the closest achievable "as infrequent as possible" value is
-// used instead -- CSL wakes more often (~10.5 s) than today's classic idle Data-Poll (70 s),
-// so any power comparison must account for that difference, not assume parity.
-static constexpr uint32_t CSL_PERIOD_US = 65535u * 160u;
-// Three missed CSL windows' worth of silence before OT gives up on the parent and forces a
-// re-attach -- independent of (and doesn't replace) the MLE child timeout, which still governs
-// classic keepalive/detach. A first-pass value, not yet hardware-tuned.
-static constexpr uint32_t CSL_TIMEOUT_SEC = 3 * CSL_PERIOD_US / 1000000;
-
 static void set_poll_period(uint32_t ms)
 {
     esp_openthread_lock_acquire(portMAX_DELAY);
@@ -88,65 +74,29 @@ static void set_poll_period(uint32_t ms)
     esp_openthread_lock_release();
 }
 
-// Engaged exactly once per boot, on the first cycle that already proved a full connect-publish-
-// broker-ACK round trip works (cycleOk) -- NOT at first attach. otLinkSetCslPeriod(nonzero) is
-// not passive: a sleepy child is auto-marked CSL-capable at attach, so this call immediately
-// reprograms the radio's real receive schedule via otPlatRadioEnableCsl(). Doing that before the
-// boot's first connection attempt (the original design) hardware-bricked two OTA flashes --
-// see the CSL integration plan/memory for the incident. Gating on cycleOk instead means the
-// negotiation "landing window" falls in idle time after a already-proven-working cycle, not on
-// top of the most fragile connection attempt of the boot.
-static bool s_csl_engaged = false;
-
-// Idle-case poll period, decided fresh every cycle from LIVE negotiation state (never
-// persisted): otLinkSetPollPeriod(instance, 0) clears the user override, the only way
-// DataPollSender::GetDefaultPollPeriod()'s CSL-aware branch takes over. Falling back to
-// POLL_SLOW_MS whenever otLinkIsCslEnabled() is false means a parent that drops CSL (or hasn't
-// negotiated it yet) never loses classic polling as a fallback -- self-healing across a parent
-// change without needing a persisted revert.
-static void set_idle_poll_period(bool cycleOk)
-{
-    esp_openthread_lock_acquire(portMAX_DELAY);
-    otInstance *ot = esp_openthread_get_instance();
-
-    if (!s_csl_engaged && cycleOk) {
-        s_csl_engaged = true;
-        const otError periodErr = otLinkSetCslPeriod(ot, CSL_PERIOD_US);
-        const otError timeoutErr = otLinkSetCslTimeout(ot, CSL_TIMEOUT_SEC);
-        if (periodErr != OT_ERROR_NONE || timeoutErr != OT_ERROR_NONE)
-            ESP_LOGE(TAG, "CSL engage failed: period=%d timeout=%d",
-                     static_cast<int>(periodErr), static_cast<int>(timeoutErr));
-        else
-            ESP_LOGI(TAG, "CSL engaged after first successful publish: period=%lu us timeout=%lu s",
-                     (unsigned long)CSL_PERIOD_US, (unsigned long)CSL_TIMEOUT_SEC);
-    }
-
-    const bool cslActive = otLinkIsCslEnabled(ot);
-    const otError err = otLinkSetPollPeriod(ot, cslActive ? 0 : POLL_SLOW_MS);
-    esp_openthread_lock_release();
-
-    if (err != OT_ERROR_NONE)
-        ESP_LOGE(TAG, "Failed to set OT idle poll period (csl_active=%d)", cslActive);
-}
-
-// Snapshot of CSL negotiation with the current parent -- Thread-only concept, no Wi-Fi
-// equivalent. Not folded into LinkStats: it's attach-scoped state, not a per-cycle telemetry
-// delta, so a bare accessor (matching hp_awake_stats_get_and_reset_us()'s shape) fits better
-// than that struct's "read once, differenced against last cycle" contract.
+// Whether the current Thread parent advertises CSL support (Mle::IsCslSupported(): attached AND
+// parent is Thread 1.2+) -- read-only, engages nothing. Deliberately NOT calling
+// otLinkSetCslPeriod() anywhere: two independent hardware attempts both broke downlink shortly
+// after engaging CSL (see [[hardware_radio_mode_change_near_attach]] / the CSL integration
+// memory for both incidents, including a UART-log-confirmed root cause: otLinkIsCslEnabled()
+// flips true SYNCHRONOUSLY within the same SetCslPeriod() call, so any code that engages CSL and
+// then immediately trusts that flag to clear the poll-period fallback -- even "one cycle later"
+// by wall-clock scheduling -- ends up doing both in the same lock-held call, giving the parent's
+// negotiation zero real time to land before the only proven-working receive path gets turned
+// off). Re-enabling real CSL needs an actual multi-cycle wait between "engaged" and "trusted
+// enough to disable the fallback", not just a later trigger point -- see the memory before
+// trying again.
 static std::string_view cslStatus()
 {
     otInstance *ot = esp_openthread_get_instance();
 
     esp_openthread_lock_acquire(portMAX_DELAY);
     const otDeviceRole role = otThreadGetDeviceRole(ot);
-    const bool enabled = otLinkIsCslEnabled(ot);
     const bool supported = otLinkIsCslSupported(ot);
     esp_openthread_lock_release();
 
     if (role == OT_DEVICE_ROLE_DISABLED || role == OT_DEVICE_ROLE_DETACHED)
         return "detached";
-    if (enabled)
-        return "enabled";
     return supported ? "supported" : "unsupported";
 }
 
@@ -596,7 +546,7 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.brokerUri = brokerUri;
     link.waitForBrokerReachable = waitForBrokerReachable;
     link.onPublishWindowBegin = []() { set_poll_period(POLL_FAST_MS); };
-    link.onPublishWindowEnd = [](bool ok) { set_idle_poll_period(ok); };
+    link.onPublishWindowEnd = []() { set_poll_period(POLL_SLOW_MS); };
     // Nested inside a publish window, so the end hook restores the window's fast poll;
     // the window's own end hook then drops back to slow.
     link.onOtaWindowBegin = []() { ESP_LOGI(TAG, "OTA window: poll %lu ms", (unsigned long)POLL_OTA_MS);
