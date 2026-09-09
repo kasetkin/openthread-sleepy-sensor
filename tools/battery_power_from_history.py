@@ -20,6 +20,41 @@ measured at up to 11% on the 2026-08-29->09-07 window, which cooled ~9 K end to 
 See temperature_corrected_fit() for the measured coefficients.
 
     tools/battery_power_from_history.py [--csv PATH]
+
+CAUTION -- the "Average current" line changed on 2026-09-09 and is NOT comparable with any figure
+recorded before then. It used to compute `mean_mw / mean_v`, where `mean_mw` was itself built from
+`PACK_CAPACITY_MAH * 3.7`; expanded, that is
+
+    printed  = dpct/100 * 3200 * 3.7 / (mean_v * hours)      # what it did
+    correct  = dpct/100 * 3200       / hours                 # charge in, charge out
+
+leaving a stray `3.7 / mean_v` that biased every reading LOW. This is the same error
+power_model.runtime_days() records having fixed on its own side; it was still live here.
+
+The correction is NOT a constant scaling -- it depends on the window's mean pack voltage, so it
+shrinks as the pack discharges, and it does not cancel in a window-to-window difference:
+
+    | window                                            | mean_v | was    | now    |
+    | voltage_history.csv (2026-07-24 -> 07-28)         | 4.092  | 0.437  | 0.483  |
+    | voltage_history_2026-07-26_2026-08-04.csv         | 4.083  | 0.463  | 0.511  |
+    | metrics 2026-07-30 -> 08-04 (clean baseline)      | 4.076  | 0.3354 | 0.3695 |
+    | metrics 2026-08-06 -> 08-10                       | 4.025  | 0.601  | 0.654  |
+    | metrics 2026-08-10 -> 08-13                       | 4.010  | 0.709  | 0.769  |
+    | metrics 2026-08-14 -> 08-18                       | 3.983  | 0.800  | 0.862  |
+    | metrics 2026-08-21 -> 08-29 (sensor_samples=16)   | 3.968  | 1.169  | 1.253  |
+    | metrics 2026-08-29 -> 09-07 (sensor_samples=4)    | 3.931  | 0.565  | 0.600  |
+
+All in mA. Two consequences worth carrying forward. The clean baseline is 0.3695 mA, not 0.3354.
+And the ss=16 minus ss=4 delta that LP_ACTIVE_CURRENT_UA was back-solved from moves 604 -> 653 uA,
++8% on that 9 mA guess -- so the back-solve is due a re-run, not just a relabel.
+
+"Average power", "Energy used" and "Implied full-pack runtime" are all UNAFFECTED: the assumed
+3.7 V cancels in the runtime expression, and the other two were always energy quantities.
+
+Independent confirmation that the new number is the right one: fitting Home Assistant's own
+`battery` percentage series for the 2026-08-29 -> 09-07 window -- no voltage curve, no pack
+voltage, no energy conversion anywhere in the path -- gives 600.2 uA, against this script's
+600.0 uA and the 564.7 uA it used to print.
 """
 import argparse
 import statistics
@@ -141,10 +176,13 @@ def decay_fit(readings):
     * `total_hours` is `hours[-1]`, the last elapsed-hours value, not a recomputed span.
     * `pct_start` is the regression INTERCEPT, not `percents[0]` -- the whole point is to be
       robust to the ~2 mV ADC quantization on the endpoints.
-    * `mean_v` spans every reading, and the temperature-corrected fit below divides by this same
-      `mean_v` even though it runs on a smaller joined subset.
+    * `mean_v` spans every reading. It is now REPORTING ONLY: no current on either the plain or
+      the temperature-corrected path divides by it any more. That division is exactly what the
+      2026-09-09 unit fix removed, and reinstating it would put the bias straight back.
     * `runtime_days` keeps the ENERGY form (`PACK_ENERGY_MWH / mean_mw`) because the 3.7 V
-      cancels there exactly; it is unaffected by the current-side unit question.
+      cancels there exactly -- `PACK_ENERGY_MWH / (pct_delta/100 * PACK_ENERGY_MWH / hours)`
+      reduces to `hours / (pct_delta/100)`. It was never affected by the unit bug and must not be
+      "made consistent" with the charge form; leave it alone.
     """
     t0 = readings[0][0]
     hours = [(ts - t0).total_seconds() / 3600.0 for ts, _ in readings]
@@ -160,7 +198,10 @@ def decay_fit(readings):
     mean_v = statistics.mean(voltages)
     mwh_used = pct_delta / 100.0 * PACK_ENERGY_MWH
     mean_mw = mwh_used / total_hours
-    mean_ma = mean_mw / mean_v
+    # Charge in, charge out. A battery-percentage decay is a fraction-of-CAPACITY-per-hour
+    # quantity, and capacity is in mAh -- so the current follows from mAh directly and no voltage
+    # belongs in it. See the CAUTION block in this module's docstring for what this changed.
+    mean_ma = pct_delta / 100.0 * PACK_CAPACITY_MAH / total_hours
     return Decay(readings=readings, hours=hours, percents=percents, n=len(hours), t0=t0,
                  t1=readings[-1][0], total_hours=total_hours, first_v=voltages[0],
                  last_v=voltages[-1], mean_v=mean_v, slope=fit.slope, pct_start=pct_start,
@@ -196,12 +237,13 @@ def temperature_fit(decay, joined):
     corrected_slope, coefficient, residual_sd = temperature_corrected_fit(
         joined.hours, joined.percents, joined.temperatures)
     corrected_mw = -corrected_slope / 100.0 * PACK_ENERGY_MWH
+    corrected_ma = -corrected_slope / 100.0 * PACK_CAPACITY_MAH  # charge form, as above
     temp_fit = statistics.linear_regression(joined.hours, joined.temperatures)
     drift_k = temp_fit.slope * (joined.hours[-1] - joined.hours[0])
     return TemperatureFit(n=len(joined.hours), slope=corrected_slope, coefficient=coefficient,
                           residual_sd=residual_sd, drift_k=drift_k,
                           min_c=min(joined.temperatures), max_c=max(joined.temperatures),
-                          corrected_mw=corrected_mw, corrected_ma=corrected_mw / decay.mean_v)
+                          corrected_mw=corrected_mw, corrected_ma=corrected_ma)
 
 
 def print_decay(decay):
