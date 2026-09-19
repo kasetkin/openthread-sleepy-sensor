@@ -15,6 +15,7 @@
 #include "esp_openthread_netif_glue.h"
 
 #include "common_utils.h"
+#include "ieee802154_rx_at_fix.h"
 #include "secrets.h"
 
 #include <freertos/FreeRTOS.h>
@@ -147,8 +148,9 @@ static bool set_csl_period_us(uint32_t period_us)
 // One line of cumulative MAC counters plus CSL state, to tell apart the ways CSL can break
 // downlink: rx data/dup/err_sec show whether the parent's frames reach us (dup climbing = the
 // parent retransmits because it doesn't accept our enhanced ACKs); tx abort counts transmits
-// cut short when a CSL receive window opens mid-TX (an ESP radio-port quirk). Cumulative so it
-// can't disturb read_link_stats()'s per-cycle deltas -- compare two lines, not one.
+// cut short when a CSL receive window opens mid-TX (an ESP radio-port quirk); rxat_fix counts
+// the driver workaround in ieee802154_rx_at_fix.cpp firing. Cumulative so it can't disturb
+// read_link_stats()'s per-cycle deltas -- compare two lines, not one.
 static void log_csl_diag(const char *reason)
 {
     otInstance *ot = esp_openthread_get_instance();
@@ -159,11 +161,12 @@ static void log_csl_diag(const char *reason)
         mac = *counters;
     const bool enabled = otLinkIsCslEnabled(ot);
     const uint32_t period_us = otLinkGetCslPeriod(ot);
+    const uint32_t rx_at_fixes = ieee802154_rx_at_fix_count();
     esp_openthread_lock_release();
 
     ESP_LOGW(TAG, "CSL %s: enabled=%d period=%lu us | tx=%lu poll=%lu retry=%lu abort=%lu "
                   "cca_fail=%lu no_ack=%lu | rx=%lu data=%lu dup=%lu err_sec=%lu err_fcs=%lu "
-                  "no_frame=%lu",
+                  "no_frame=%lu | rxat_fix=%lu",
              reason, enabled, static_cast<unsigned long>(period_us),
              static_cast<unsigned long>(mac.mTxTotal),
              static_cast<unsigned long>(mac.mTxDataPoll),
@@ -176,7 +179,8 @@ static void log_csl_diag(const char *reason)
              static_cast<unsigned long>(mac.mRxDuplicated),
              static_cast<unsigned long>(mac.mRxErrSec),
              static_cast<unsigned long>(mac.mRxErrFcs),
-             static_cast<unsigned long>(mac.mRxErrNoFrame));
+             static_cast<unsigned long>(mac.mRxErrNoFrame),
+             static_cast<unsigned long>(rx_at_fixes));
 }
 
 // Called once per sensor cycle with its real outcome (see NetworkLink::noteCycleResult).
@@ -204,8 +208,9 @@ static void note_cycle_result(bool ok)
                 s_csl_fail_streak = 0;
                 if (++s_csl_ok_streak >= CSL_TRUST_AFTER_OK_CYCLES) {
                     s_csl_state.store(CslState::Trusted, std::memory_order_relaxed);
-                    ESP_LOGI(TAG, "CSL: trusted after %lu confirmed cycles",
-                             static_cast<unsigned long>(s_csl_ok_streak));
+                    ESP_LOGI(TAG, "CSL: trusted after %lu confirmed cycles (rxat_fix=%lu)",
+                             static_cast<unsigned long>(s_csl_ok_streak),
+                             static_cast<unsigned long>(ieee802154_rx_at_fix_count()));
                 }
                 return;
             }

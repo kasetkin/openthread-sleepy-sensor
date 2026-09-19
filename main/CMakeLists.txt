@@ -11,12 +11,19 @@ set(srcs
   net/network_link.cpp
   net/openthread_link.cpp
   net/wifi_link.cpp
+  net/ieee802154_rx_at_fix.cpp
 )
 
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS "." "net"
-                       PRIV_REQUIRES nvs_flash esp_timer esp_adc esp_driver_gpio esp_driver_uart esp_driver_usb_serial_jtag esp_event openthread espressif__mqtt esp_wifi esp_netif esp_coex mbedtls lp_sensor_core app_update esp_app_format
+                       PRIV_REQUIRES nvs_flash esp_timer esp_adc esp_driver_gpio esp_driver_uart esp_driver_usb_serial_jtag esp_event openthread ieee802154 espressif__mqtt esp_wifi esp_netif esp_coex mbedtls lp_sensor_core app_update esp_app_format
                        EMBED_TXTFILES ../secrets.yaml ../device_config.yaml
                        WHOLE_ARCHIVE)
 set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD 26)
 set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD_REQUIRED ON)
+
+# Workaround for an ESP-IDF 802.15.4 driver bug that makes a CSL receiver deaf after its own
+# data polls -- see net/ieee802154_rx_at_fix.cpp. Remove together with that file.
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+                      "-Wl,--wrap=esp_ieee802154_receive"
+                      "-Wl,--wrap=esp_ieee802154_receive_at")
