@@ -113,11 +113,20 @@ struct NetworkLink
     // Calling it more than once per cycle would split those deltas across the calls.
     std::function<std::optional<LinkStats>()> readLinkStats;
 
-    // Whether the current Thread parent advertises CSL support: "supported"/"unsupported"/
-    // "detached" (OT), or "n/a" (Wi-Fi -- no Thread-CSL equivalent). Read-only -- does not
-    // engage CSL (see openthread_link.cpp's cslStatus() for why that's deliberate). Not folded
-    // into LinkStats: it's attach-scoped state, not a per-cycle telemetry delta.
+    // Thread CSL state (OT): "enabled" (CSL receiver running), "reverted" (engaged this boot,
+    // then switched back off after failed cycles), otherwise whether the current parent could
+    // do CSL at all: "supported"/"unsupported"/"detached". "n/a" on Wi-Fi (no Thread-CSL
+    // equivalent). Read-only. Not folded into LinkStats: it's attach-scoped state, not a
+    // per-cycle telemetry delta.
     std::function<std::string_view()> cslStatus;
+
+    // This cycle's real outcome (a confirmed, broker-ACKed publish -- the SAME boolean
+    // runtime_config_tx_power_note_cycle_result() receives at its 3 call sites in
+    // sensorstask.cpp, NOT sensorstask's broader cycleOk, which also counts a quiet "nothing to
+    // publish" cycle as healthy -- this needs proof of an actual round trip). OT: drives CSL's
+    // engage/trust/revert state machine (openthread_link.cpp) -- separate from TX power's even
+    // though both are fed from the same tap points. Wi-Fi: no-op, no CSL equivalent.
+    std::function<void(bool ok)> noteCycleResult;
 };
 
 struct NetworkLinkConfig
@@ -129,6 +138,11 @@ struct NetworkLinkConfig
     // constructing a Thread-only or Wi-Fi-only config via designated
     // initializers isn't forced to spell out every field (-Wmissing-field-initializers).
     std::string ot_tlv_hex = "";
+
+    // Thread CSL (Coordinated Sampled Listening) receive period in ms, from device_config.yaml's
+    // csl_period_ms; 0 leaves CSL off. Engaged once per boot after the first confirmed publish
+    // -- see openthread_link.cpp. Ignored on Wi-Fi.
+    uint32_t csl_period_ms = 0;
 
     // Wi-Fi WPA2 STA credentials.
     std::string wifi_ssid = "";

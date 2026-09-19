@@ -59,6 +59,11 @@ void SensorsTask::configureRefreshNat64(RefreshNat64 refreshNat64)
     m_refreshNat64 = std::move(refreshNat64);
 }
 
+void SensorsTask::configureNoteCycleResult(NoteCycleResult noteCycleResult)
+{
+    m_noteCycleResult = std::move(noteCycleResult);
+}
+
 void SensorsTask::executeTask()
 {
     static const char * TAG = "sensors-task";
@@ -109,6 +114,8 @@ void SensorsTask::executeTask()
             // uplink -- it happens before the publish logic below is ever reached, so it needs
             // its own tap into the confirm/revert counter (see runtime_config.cpp's design note).
             runtime_config_tx_power_note_cycle_result(false);
+            if (m_noteCycleResult)
+                m_noteCycleResult(false);
         } else {
             lp_shared_state_t state{};
             lp_sensor_core_get_state(&state);
@@ -251,6 +258,11 @@ void SensorsTask::executeTask()
                             // otherwise be silently overwritten by LP's next poll meanwhile.
                             history_log_append(state.cal_temp_c, state.cal_hum_pct);
                         }
+                        // After markAppValidOnFirstConfirmedPublish() on purpose: a link change
+                        // this may trigger (OT: engaging CSL) must never be able to cost a
+                        // freshly OTA'd image its confirmation.
+                        if (m_noteCycleResult)
+                            m_noteCycleResult(publishedOk);
                     } else if (ota_session_in_progress()) {
                         // An OTA download legitimately owns the publish task for minutes;
                         // this is not a stall (see the cycleOk exemption below).
@@ -258,6 +270,8 @@ void SensorsTask::executeTask()
                     } else {
                         ESP_LOGW(TAG, "publish did not finish within %u ms, sleeping anyway", PUBLISH_TIMEOUT_MS);
                         runtime_config_tx_power_note_cycle_result(false);
+                        if (m_noteCycleResult)
+                            m_noteCycleResult(false);
                     }
                 } else {
                     ESP_LOGW(TAG, "mqtt is not working? not sure");

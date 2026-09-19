@@ -304,8 +304,10 @@ extern "C" void app_main(void)
                         mqtt_port_str.data() + mqtt_port_str.size(), mqtt_port);
 
     // ── network link ─────────────────────────────────────────────────────────
+    // csl_period_ms: a missing/malformed key leaves CSL off -- the proven non-CSL behavior.
     s_link = makeNetworkLink(transport_kind, NetworkLinkConfig{
         .ot_tlv_hex = ot_tlv,
+        .csl_period_ms = parse_as_uint32_or(device_config_yaml(), "csl_period_ms", 0u),
         .wifi_ssid = wifi_ssid,
         .wifi_password = wifi_password,
         .wifi_address_family = wifi_address_family,
@@ -400,6 +402,11 @@ extern "C" void app_main(void)
     // network data for a changed NAT64 prefix; Wi-Fi: kick a reconnect), so it recovers
     // without waiting for a reboot.
     sensorTask->configureRefreshNat64(s_link.refresh);
+
+    // Feeds each cycle's real outcome to link-layer state machines that need proof of a working
+    // round trip before trusting a risky setting (OT: CSL engagement -- see
+    // main/net/openthread_link.cpp; Wi-Fi: no-op).
+    sensorTask->configureNoteCycleResult(s_link.noteCycleResult);
 
     // ── bring up the network link ──────────────────────────────────────────────
     ESP_ERROR_CHECK(s_link.start());

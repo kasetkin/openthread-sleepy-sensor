@@ -74,18 +74,162 @@ static void set_poll_period(uint32_t ms)
     esp_openthread_lock_release();
 }
 
-// Whether the current Thread parent advertises CSL support (Mle::IsCslSupported(): attached AND
-// parent is Thread 1.2+) -- read-only, engages nothing. Deliberately NOT calling
-// otLinkSetCslPeriod() anywhere: that call is not passive observation -- since a sleepy child is
-// already marked CSL-capable the moment it attaches to a 1.2+ parent, SetPeriod(nonzero)
-// immediately flips Mac::mIsCslEnabled and reprograms the radio's real receive schedule via
-// otPlatRadioEnableCsl(). Calling that right after attach (this project's first attempt, wired
-// through onFirstAttach) is the same hazard class as the mRxOnWhenIdle mid-attach black-hole
-// documented below: hardware-confirmed across two OTA flashes to leave every publish cycle
-// unable to reach the broker (reset reason "ota_unconfirmed" both times) for the rest of the
-// boot, since nothing ever calls SetPeriod(0) to undo it. Re-enabling real CSL needs a much more
-// careful staging (not at first-attach, with a revert path from the start) -- see the CSL
-// integration plan/memory before trying again.
+// ── CSL (Coordinated Sampled Listening) ───────────────────────────────────────
+// With CSL on, the parent sends our downlink frames into short receive windows we open once per
+// CSL period, instead of holding them until our next data poll: bounded downlink latency, paid
+// for with a wake plus a few ms of RX every period. It does not replace data polling --
+// DataPollSender keeps running either way. Configured by device_config.yaml's csl_period_ms
+// (0 = off).
+//
+// Engaged once per boot, from note_cycle_result(), on the first confirmed publish: never at
+// attach and never inside a publish/OTA window (the MQTT task has already closed its window by
+// the time a cycle result arrives). Three attempts in Aug 2026 lost downlink after engaging
+// (all at a ~10.49 s period), so a fresh engagement is on probation:
+// CSL_REVERT_AFTER_FAILED_CYCLES consecutive failures before CSL_TRUST_AFTER_OK_CYCLES
+// consecutive successes switch it back off for the rest of the boot. Switching off is local and
+// needs no downlink. OT sends the parent no Child Update Request for it, so the parent keeps
+// aiming at our (now closed) CSL windows until its CSL timeout (OT default 100 s) expires --
+// well inside one sensor cycle. Once trusted, a failed cycle is an ordinary outage and never
+// reverts.
+//
+// OT keeps the period across detach/re-attach, so after a re-attach CSL resumes on its own.
+enum class CslState { Off, Probation, Trusted, Reverted };
+
+static constexpr uint32_t CSL_TRUST_AFTER_OK_CYCLES = 3;
+static constexpr uint32_t CSL_REVERT_AFTER_FAILED_CYCLES = 2;
+
+// Written once by makeThreadLink(), before any task runs; read-only afterwards.
+static uint32_t s_csl_period_us = 0;
+// Written by the sensor task (note_cycle_result()), read by the MQTT task (cslStatus()).
+static std::atomic<CslState> s_csl_state{CslState::Off};
+// Sensor task only.
+static uint32_t s_csl_ok_streak = 0;
+static uint32_t s_csl_fail_streak = 0;
+
+// otLinkSetCslPeriod() takes a whole number of 160 us units (OT_ERROR_INVALID_ARGS otherwise)
+// and silently clamps it to a uint16_t count (~10.49 s). Do both here, where the result can be
+// logged, instead of letting a too-long request quietly become a different period.
+static uint32_t csl_period_ms_to_us(uint32_t ms)
+{
+    constexpr uint32_t unit_us = OT_LINK_CSL_PERIOD_TEN_SYMBOLS_UNIT_IN_USEC;
+    constexpr uint64_t max_us = uint64_t{UINT16_MAX} * unit_us;
+    const uint32_t us = static_cast<uint32_t>(std::min<uint64_t>(uint64_t{ms} * 1000u, max_us));
+    return us / unit_us * unit_us;
+}
+
+// Sets the CSL period (0 = off). Caller must not hold the OpenThread lock.
+static bool set_csl_period_us(uint32_t period_us)
+{
+    otInstance *ot = esp_openthread_get_instance();
+
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    const otError err = otLinkSetCslPeriod(ot, period_us);
+    // The OT mainloop sized its select() timeout (up to 10 s) before blocking, and a call from
+    // this task only arms OT's CSL alarm without waking it, so the first receive windows would
+    // open late. A data poll posts a tasklet, which wakes the loop, and hands the parent our CSL
+    // phase right away. Switching off needs no kick: the alarm is simply stopped.
+    otError poll_err = OT_ERROR_NONE;
+    if (err == OT_ERROR_NONE && period_us != 0)
+        poll_err = otLinkSendDataRequest(ot);
+    esp_openthread_lock_release();
+
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "otLinkSetCslPeriod(%lu us) failed: %d",
+                 static_cast<unsigned long>(period_us), static_cast<int>(err));
+        return false;
+    }
+    if (poll_err != OT_ERROR_NONE)
+        ESP_LOGW(TAG, "CSL: wake-up data poll failed: %d (loop wakes within 10 s anyway)",
+                 static_cast<int>(poll_err));
+    return true;
+}
+
+// One line of cumulative MAC counters plus CSL state, to tell apart the ways CSL can break
+// downlink: rx data/dup/err_sec show whether the parent's frames reach us (dup climbing = the
+// parent retransmits because it doesn't accept our enhanced ACKs); tx abort counts transmits
+// cut short when a CSL receive window opens mid-TX (an ESP radio-port quirk). Cumulative so it
+// can't disturb read_link_stats()'s per-cycle deltas -- compare two lines, not one.
+static void log_csl_diag(const char *reason)
+{
+    otInstance *ot = esp_openthread_get_instance();
+    otMacCounters mac = {};
+
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    if (const otMacCounters *counters = otLinkGetCounters(ot))
+        mac = *counters;
+    const bool enabled = otLinkIsCslEnabled(ot);
+    const uint32_t period_us = otLinkGetCslPeriod(ot);
+    esp_openthread_lock_release();
+
+    ESP_LOGW(TAG, "CSL %s: enabled=%d period=%lu us | tx=%lu poll=%lu retry=%lu abort=%lu "
+                  "cca_fail=%lu no_ack=%lu | rx=%lu data=%lu dup=%lu err_sec=%lu err_fcs=%lu "
+                  "no_frame=%lu",
+             reason, enabled, static_cast<unsigned long>(period_us),
+             static_cast<unsigned long>(mac.mTxTotal),
+             static_cast<unsigned long>(mac.mTxDataPoll),
+             static_cast<unsigned long>(mac.mTxRetry),
+             static_cast<unsigned long>(mac.mTxErrAbort),
+             static_cast<unsigned long>(mac.mTxErrCca),
+             static_cast<unsigned long>(mac.mTxDirectMaxRetryExpiry),
+             static_cast<unsigned long>(mac.mRxTotal),
+             static_cast<unsigned long>(mac.mRxData),
+             static_cast<unsigned long>(mac.mRxDuplicated),
+             static_cast<unsigned long>(mac.mRxErrSec),
+             static_cast<unsigned long>(mac.mRxErrFcs),
+             static_cast<unsigned long>(mac.mRxErrNoFrame));
+}
+
+// Called once per sensor cycle with its real outcome (see NetworkLink::noteCycleResult).
+static void note_cycle_result(bool ok)
+{
+    if (s_csl_period_us == 0)
+        return;
+
+    switch (s_csl_state.load(std::memory_order_relaxed)) {
+        case CslState::Off:
+            if (!ok)
+                return;
+            s_csl_ok_streak = 0;
+            s_csl_fail_streak = 0;
+            if (set_csl_period_us(s_csl_period_us)) {
+                s_csl_state.store(CslState::Probation, std::memory_order_relaxed);
+                log_csl_diag("engaged after first confirmed publish, on probation");
+            } else {
+                s_csl_state.store(CslState::Reverted, std::memory_order_relaxed);
+            }
+            return;
+
+        case CslState::Probation:
+            if (ok) {
+                s_csl_fail_streak = 0;
+                if (++s_csl_ok_streak >= CSL_TRUST_AFTER_OK_CYCLES) {
+                    s_csl_state.store(CslState::Trusted, std::memory_order_relaxed);
+                    ESP_LOGI(TAG, "CSL: trusted after %lu confirmed cycles",
+                             static_cast<unsigned long>(s_csl_ok_streak));
+                }
+                return;
+            }
+            s_csl_ok_streak = 0;
+            log_csl_diag("cycle failed during probation");
+            if (++s_csl_fail_streak >= CSL_REVERT_AFTER_FAILED_CYCLES) {
+                set_csl_period_us(0);
+                s_csl_state.store(CslState::Reverted, std::memory_order_relaxed);
+                log_csl_diag("reverted, off for the rest of this boot");
+            }
+            return;
+
+        case CslState::Trusted:
+            if (!ok)
+                log_csl_diag("cycle failed (trusted, not reverting)");
+            return;
+
+        case CslState::Reverted:
+            return;
+    }
+}
+
+// "enabled"/"reverted" (see CslState above), else whether the current parent could do CSL at
+// all (Mle::IsCslSupported(): attached AND parent is Thread 1.2+).
 static std::string_view cslStatus()
 {
     otInstance *ot = esp_openthread_get_instance();
@@ -93,10 +237,15 @@ static std::string_view cslStatus()
     esp_openthread_lock_acquire(portMAX_DELAY);
     const otDeviceRole role = otThreadGetDeviceRole(ot);
     const bool supported = otLinkIsCslSupported(ot);
+    const bool enabled = otLinkIsCslEnabled(ot);
     esp_openthread_lock_release();
 
+    if (s_csl_state.load(std::memory_order_relaxed) == CslState::Reverted)
+        return "reverted";
     if (role == OT_DEVICE_ROLE_DISABLED || role == OT_DEVICE_ROLE_DETACHED)
         return "detached";
+    if (enabled)
+        return "enabled";
     return supported ? "supported" : "unsupported";
 }
 
@@ -540,6 +689,12 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
 {
     s_ot_tlv_hex = cfg.ot_tlv_hex;
 
+    s_csl_period_us = csl_period_ms_to_us(cfg.csl_period_ms);
+    if (cfg.csl_period_ms != 0)
+        ESP_LOGI(TAG, "CSL: csl_period_ms=%lu -> %lu us, engaged after the first confirmed publish",
+                 static_cast<unsigned long>(cfg.csl_period_ms),
+                 static_cast<unsigned long>(s_csl_period_us));
+
     NetworkLink link;
     link.start = start;
     link.waitForReady = wait_for_ot_attached;
@@ -557,5 +712,6 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.readLinkStats = read_link_stats;
     link.setTxPowerDbm = set_tx_power_dbm;
     link.cslStatus = cslStatus;
+    link.noteCycleResult = note_cycle_result;
     return link;
 }
