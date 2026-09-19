@@ -45,11 +45,17 @@ CONFIG_OPENTHREAD_RADIO_STATS_ENABLE=y
 CONFIG_OPENTHREAD_LINK_METRICS=y
 # CSL (Coordinated Sampled Listening, Thread 1.2+): builds the CSL receiver in. It only runs
 # when device_config.yaml's csl_period_ms is non-zero -- see openthread_link.cpp. It adds
-# scheduled receive windows on top of data polling, not instead of it. CSL_ACCURACY/
-# CSL_UNCERTAIN stay at their defaults (50 ppm / 500 us) until hardware shows the internal RC
-# slow clock needs wider windows. Already selects IEEE802154_TIMING_OPTIMIZATION/
-# OPENTHREAD_TIMING_OPTIMIZATION, but CONFIG_OPENTHREAD_LINK_METRICS above already selects both.
+# scheduled receive windows on top of data polling, not instead of it. Already selects
+# IEEE802154_TIMING_OPTIMIZATION/OPENTHREAD_TIMING_OPTIMIZATION, but
+# CONFIG_OPENTHREAD_LINK_METRICS above already selects both.
 CONFIG_OPENTHREAD_CSL_ENABLE=y
+# EXPERIMENT (2026-09-19): our clock accuracy as seen by CSL, in +-ppm; default 50. Each receive
+# window is widened by (this + the parent's ppm) x time since the last sync. At 50, idle CSL
+# deliveries ~60 s after a sync failed 16/16 while those <0.4 s after one got 8/8 -- 255 (the
+# uint8 maximum) tests whether the internal RC slow clock drifts that much across light sleep.
+# Costs power: at 60 s since sync each window is ~+-17 ms instead of ~+-5 ms. Tune down, or back
+# to 50, once measured.
+CONFIG_OPENTHREAD_CSL_ACCURACY=255
 # end of OpenThread
 
 #
