@@ -21,3 +21,10 @@ esp_err_t hp_awake_stats_init();
 // the last call), in microseconds, then resets the accumulator -- same "per-cycle delta" shape
 // as LinkStats's counter-derived fields. Call once per publish cycle.
 uint32_t hp_awake_stats_get_and_reset_us();
+
+// How the same light sleep was shaped, for the CSL power investigation: how many separate sleeps
+// the HP core managed (cumulative since boot -- difference two readings) and the longest single
+// one in microseconds, which IS reset by this call. One long sleep spanning the idle stretch
+// means nothing woke the core; hundreds of ~CSL-period sleeps mean every receive window did.
+// Independent of hp_awake_stats_get_and_reset_us(), so either may be called without the other.
+void hp_awake_stats_read_sleep_profile(uint32_t *count, uint32_t *longest_us);

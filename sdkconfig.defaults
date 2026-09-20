@@ -49,13 +49,13 @@ CONFIG_OPENTHREAD_LINK_METRICS=y
 # IEEE802154_TIMING_OPTIMIZATION/OPENTHREAD_TIMING_OPTIMIZATION, but
 # CONFIG_OPENTHREAD_LINK_METRICS above already selects both.
 CONFIG_OPENTHREAD_CSL_ENABLE=y
-# EXPERIMENT (2026-09-19): our clock accuracy as seen by CSL, in +-ppm; default 50. Each receive
-# window is widened by (this + the parent's ppm) x time since the last sync. At 50, idle CSL
-# deliveries ~60 s after a sync failed 16/16 while those <0.4 s after one got 8/8 -- 255 (the
-# uint8 maximum) tests whether the internal RC slow clock drifts that much across light sleep.
-# Costs power: at 60 s since sync each window is ~+-17 ms instead of ~+-5 ms. Tune down, or back
-# to 50, once measured.
-CONFIG_OPENTHREAD_CSL_ACCURACY=255
+# Our clock accuracy as seen by CSL, in +-ppm; default 50. Each receive window is widened by
+# (this + the parent's ppm) x time since the last sync, so raising it costs power on every
+# window. Held at the default while the UART capture measures what the windows actually cost:
+# the rxat win_us/lead_us counters make the widening observable, and 255 (the uint8 maximum)
+# was going to change both the thing being measured and the measurement. Raise it only if that
+# capture leaves clock drift as a live explanation for the idle delivery misses.
+CONFIG_OPENTHREAD_CSL_ACCURACY=50
 # end of OpenThread
 
 #

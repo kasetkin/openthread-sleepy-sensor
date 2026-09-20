@@ -65,6 +65,13 @@ static std::atomic<bool> s_rx_at_scheduled{false};
 static std::atomic<uint32_t> s_rx_at_fix_count{0};
 static std::atomic<uint32_t> s_rx_at_skip_count{0};
 
+// Diagnostics only -- see the header. The sums are 64-bit because at a 500 ms period they take
+// on the order of 10 ms per window, which would wrap a uint32 of microseconds within the hour.
+static std::atomic<uint64_t> s_rx_at_total_count{0};
+static std::atomic<uint64_t> s_rx_at_window_us{0};
+static std::atomic<uint64_t> s_rx_at_lead_us{0};
+static std::atomic<uint32_t> s_rx_at_late_count{0};
+
 // ── PART A (backport of esp-idf d60495d8 -- delete on ESP-IDF >= v6.0.4 / >= v6.1.1) ─────────
 #if (ESP_IDF_VERSION_MAJOR == 6 && ESP_IDF_VERSION_MINOR == 0 && ESP_IDF_VERSION_PATCH >= 4) || \
     (ESP_IDF_VERSION_MAJOR == 6 && ESP_IDF_VERSION_MINOR == 1 && ESP_IDF_VERSION_PATCH >= 1) || \
@@ -98,11 +105,24 @@ static bool rx_at_window_expired(uint32_t time, uint32_t duration)
 
 esp_err_t __wrap_esp_ieee802154_receive_at(uint32_t time, uint32_t duration)
 {
+    // Diagnostics: every window asked for, including the ones PART A drops below.
+    s_rx_at_total_count.fetch_add(1, std::memory_order_relaxed);
+
     // PART A -- delete this if-block together with the block above.
     if (rx_at_window_expired(time, duration)) {
         s_rx_at_skip_count.fetch_add(1, std::memory_order_relaxed);
         return ESP_OK;
     }
+
+    // Diagnostics: of the windows actually armed, how wide and how far ahead. Wrap-safe, same
+    // 32-bit microsecond timebase the driver itself compares against.
+    const int32_t lead_us = static_cast<int32_t>(time - static_cast<uint32_t>(esp_timer_get_time()));
+    s_rx_at_window_us.fetch_add(duration, std::memory_order_relaxed);
+    if (lead_us > 0)
+        s_rx_at_lead_us.fetch_add(static_cast<uint32_t>(lead_us), std::memory_order_relaxed);
+    else
+        s_rx_at_late_count.fetch_add(1, std::memory_order_relaxed);
+
     // PART B
     s_rx_at_scheduled.store(true, std::memory_order_relaxed);
     return __real_esp_ieee802154_receive_at(time, duration);
@@ -126,4 +146,24 @@ uint32_t ieee802154_rx_at_fix_count()
 uint32_t ieee802154_rx_at_skip_count()
 {
     return s_rx_at_skip_count.load(std::memory_order_relaxed);
+}
+
+uint64_t ieee802154_rx_at_total_count()
+{
+    return s_rx_at_total_count.load(std::memory_order_relaxed);
+}
+
+uint64_t ieee802154_rx_at_window_us()
+{
+    return s_rx_at_window_us.load(std::memory_order_relaxed);
+}
+
+uint64_t ieee802154_rx_at_lead_us()
+{
+    return s_rx_at_lead_us.load(std::memory_order_relaxed);
+}
+
+uint32_t ieee802154_rx_at_late_count()
+{
+    return s_rx_at_late_count.load(std::memory_order_relaxed);
 }

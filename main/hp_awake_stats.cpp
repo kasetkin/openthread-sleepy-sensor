@@ -14,6 +14,13 @@
 static std::atomic<uint64_t> s_accumulated_sleep_us{0};
 static int64_t s_period_start_us = 0;
 
+// Same single-producer/single-consumer shape as the accumulator above, for the CSL power
+// investigation. The longest-sleep read-modify-write is not atomic as a whole, so a sleep
+// landing exactly across a reader's reset can be attributed to the previous period -- harmless
+// for a diagnostic, and not worth a critical section in a no-blocking callback.
+static std::atomic<uint32_t> s_sleep_count{0};
+static std::atomic<uint32_t> s_longest_sleep_us{0};
+
 // No blocking calls allowed here -- runs from IDLE task context after every automatic
 // light-sleep attempt (CONFIG_PM_LIGHT_SLEEP_CALLBACKS), same constraint documented on
 // lp_sensor_core.c's sibling registration. sleep_time_us is the actual duration just slept.
@@ -22,6 +29,11 @@ static esp_err_t on_light_sleep_exit(int64_t sleep_time_us, void *arg)
     (void)arg;
     if (sleep_time_us > 0) {
         s_accumulated_sleep_us.fetch_add(static_cast<uint64_t>(sleep_time_us), std::memory_order_relaxed);
+        s_sleep_count.fetch_add(1, std::memory_order_relaxed);
+
+        const uint32_t slept_us = static_cast<uint32_t>(std::min<int64_t>(sleep_time_us, UINT32_MAX));
+        if (slept_us > s_longest_sleep_us.load(std::memory_order_relaxed))
+            s_longest_sleep_us.store(slept_us, std::memory_order_relaxed);
     }
     return ESP_OK;
 }
@@ -54,4 +66,12 @@ uint32_t hp_awake_stats_get_and_reset_us()
     // slightly exceed `elapsed` right at the read boundary, and this must never wrap negative
     // into a huge uint32_t.
     return static_cast<uint32_t>(std::max<int64_t>(0, elapsed - static_cast<int64_t>(slept)));
+}
+
+void hp_awake_stats_read_sleep_profile(uint32_t *count, uint32_t *longest_us)
+{
+    if (count != nullptr)
+        *count = s_sleep_count.load(std::memory_order_relaxed);
+    if (longest_us != nullptr)
+        *longest_us = s_longest_sleep_us.exchange(0, std::memory_order_relaxed);
 }

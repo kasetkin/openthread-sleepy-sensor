@@ -15,6 +15,7 @@
 #include "esp_openthread_netif_glue.h"
 
 #include "common_utils.h"
+#include "hp_awake_stats.h"
 #include "ieee802154_rx_at_fix.h"
 #include "secrets.h"
 
@@ -163,7 +164,15 @@ static void log_csl_diag(const char *reason)
     const uint32_t period_us = otLinkGetCslPeriod(ot);
     const uint32_t rx_at_fixes = ieee802154_rx_at_fix_count();
     const uint32_t rx_at_skips = ieee802154_rx_at_skip_count();
+    const uint64_t rx_at_total = ieee802154_rx_at_total_count();
+    const uint64_t rx_at_window_us = ieee802154_rx_at_window_us();
+    const uint64_t rx_at_lead_us = ieee802154_rx_at_lead_us();
+    const uint32_t rx_at_late = ieee802154_rx_at_late_count();
     esp_openthread_lock_release();
+
+    uint32_t sleeps = 0;
+    uint32_t longest_sleep_us = 0;
+    hp_awake_stats_read_sleep_profile(&sleeps, &longest_sleep_us);
 
     ESP_LOGW(TAG, "CSL %s: enabled=%d period=%lu us | tx=%lu poll=%lu retry=%lu abort=%lu "
                   "cca_fail=%lu no_ack=%lu | rx=%lu data=%lu dup=%lu err_sec=%lu err_fcs=%lu "
@@ -183,6 +192,20 @@ static void log_csl_diag(const char *reason)
              static_cast<unsigned long>(mac.mRxErrNoFrame),
              static_cast<unsigned long>(rx_at_fixes),
              static_cast<unsigned long>(rx_at_skips));
+
+    // Second line, for the CSL power question: how many receive windows OpenThread asked for,
+    // how wide, how far ahead it armed them, and what that did to light sleep. Everything but
+    // longest_ms is cumulative, so subtract two lines to get a cycle. Diagnostics -- drop this
+    // line once the period ladder is settled.
+    ESP_LOGW(TAG, "CSL %s rxat: total=%llu win_us=%llu lead_us=%llu late=%lu | "
+                  "sleeps=%lu longest_ms=%lu",
+             reason,
+             static_cast<unsigned long long>(rx_at_total),
+             static_cast<unsigned long long>(rx_at_window_us),
+             static_cast<unsigned long long>(rx_at_lead_us),
+             static_cast<unsigned long>(rx_at_late),
+             static_cast<unsigned long>(sleeps),
+             static_cast<unsigned long>(longest_sleep_us / 1000));
 }
 
 // Called once per sensor cycle with its real outcome (see NetworkLink::noteCycleResult).
@@ -216,6 +239,7 @@ static void note_cycle_result(bool ok)
                              static_cast<unsigned long>(ieee802154_rx_at_fix_count()),
                              static_cast<unsigned long>(ieee802154_rx_at_skip_count()));
                 }
+                log_csl_diag("cycle ok (probation)");
                 return;
             }
             s_csl_ok_streak = 0;
@@ -228,8 +252,11 @@ static void note_cycle_result(bool ok)
             return;
 
         case CslState::Trusted:
-            if (!ok)
-                log_csl_diag("cycle failed (trusted, not reverting)");
+            // Every cycle, not just the failures: the rxat/sleep counters above are only
+            // readable as a difference between two lines, so a steady cadence of them is the
+            // measurement. One pair of lines per publish cycle, which is cheap next to the
+            // ~13 s the core is awake for.
+            log_csl_diag(ok ? "cycle ok (trusted)" : "cycle failed (trusted, not reverting)");
             return;
 
         case CslState::Reverted:
