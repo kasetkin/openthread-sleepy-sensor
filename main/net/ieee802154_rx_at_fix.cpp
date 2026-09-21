@@ -46,23 +46,36 @@
 //    mid-frame, sleep() would drop that frame. The poll path can't hit this -- the poll's own TX
 //    already cancelled any earlier window.
 //
-// ── PART C: radio left listening after the MAC goes idle ── backport of OpenThread main's
-//    SubMac::Sleep() (checked 2026-09-21), which is NOT in the OpenThread snapshot of IDF v6.0.2.
-//    DELETE PART C once the IDF's OpenThread has that SubMac::Sleep(): ProcessTimedRx(), then
-//    Radio::Sleep() unless a timed receive is in progress.
-//    Here, with CSL on, SubMac::Sleep() calls RadioSample() instead, which never calls
-//    Radio::Sleep() and leaves it to the next CSL window to switch the radio off. The driver
-//    sleeps on its own after a finished TX or a received and ACKed frame, but a continuous
-//    receive that ends without a frame (the MAC's wait for data after a poll, its sleep delay
-//    between fragments) keeps listening -- holding the PM lock -- for up to a whole CSL period.
-//    Hardware-measured 2026-09-21 with CONFIG_PM_PROFILING: the radio held the core awake for 89 %
-//    of every CSL publish window (39 % without CSL), in ~35 long stretches instead of hundreds
-//    of short ones. Fix: after the real SubMac::Sleep(), put a radio still in RX to sleep, unless
-//    a receive window was armed since the last immediate receive -- that RX state is the window's,
-//    and like upstream, going idle must not cancel a scheduled window. Otherwise RX can only be a
-//    continuous receive the MAC is done with, since arming a window stops any continuous one.
+// ── PART C: radio left listening after the MAC goes idle ── backport of OpenThread #13472
+//    (22b2ec2a8, "[CSL] Putting the radio back to sleep", Aug 2026), which fixes a regression
+//    from OpenThread's CSL rework in #11301/#11318. The regression is in the OpenThread snapshot
+//    of IDF v6.0.2 (a98813b30) and, as of 2026-09-21, in every IDF branch's snapshot, master's
+//    (43cc05a9) included.
+//    DELETE PART C once ESP-IDF's OpenThread includes #13472: check that SubMac::RadioSample() in
+//    components/openthread/openthread/src/core/mac/sub_mac.cpp calls Radio::Sleep() for a radio
+//    with receive timing but without RX-on-when-idle (#13491 later moved that call into
+//    SubMac::Sleep() itself). From then on the real function has already put the radio to sleep
+//    whenever this wrapper looks, so the wrapper never fires.
+//    Before the rework, SubMac put the radio to sleep from its CSL sampling whenever it wasn't
+//    sampling; since then it only does so for radios without receive timing. So here, with CSL
+//    on, SubMac::Sleep() calls RadioSample(), which never calls Radio::Sleep() and leaves it to the
+//    next CSL window to switch the radio off. The driver sleeps on its own after a finished TX or
+//    a received and ACKed frame, but a continuous receive that ends without a frame (the MAC's
+//    wait for data after a poll, its sleep delay between fragments) keeps listening -- holding the
+//    PM lock -- for up to a whole CSL period. Hardware-measured 2026-09-21 with
+//    CONFIG_PM_PROFILING: the radio held the core awake for 89 % of every CSL publish window (39 %
+//    without CSL), in ~35 long stretches instead of hundreds of short ones.
+//    Fix: after the real SubMac::Sleep(), put a radio still in RX to sleep, unless a receive
+//    window was armed since the last immediate receive -- that RX state is the window's. Otherwise
+//    RX can only be a continuous receive the MAC is done with, since arming a window stops any
+//    continuous one. #13472 itself calls Radio::Sleep() unconditionally, relying on the radio
+//    contract that sleep does not cancel a scheduled receive window; this driver's
+//    esp_ieee802154_sleep() does cancel it, so a verbatim port would drop the window re-armed
+//    after every data poll.
 //    This is the driver call SubMac::Sleep() makes at the same point without CSL, so it drops a
-//    frame arriving (or an ACK being sent) at that instant exactly as the non-CSL path would.
+//    frame arriving (or an ACK being sent) at that instant exactly as the non-CSL path would:
+//    esp_ieee802154_sleep() aborts both, although OpenThread #13504 says the radio must let them
+//    finish first.
 //
 // Re-check all parts on any IDF upgrade (OpenThread #13491 reworks timed RX), and delete this
 // file plus the three --wrap flags once the driver and OpenThread are fixed upstream. PART C wraps

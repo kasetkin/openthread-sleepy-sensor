@@ -12,9 +12,9 @@ uint32_t ieee802154_rx_at_fix_count();
 // they had already ended. When PART A goes, drop this and its rxat_skip log field too.
 uint32_t ieee802154_rx_at_skip_count();
 
-// PART C (backport of OpenThread main's SubMac::Sleep()): continuous receives the MAC went idle
-// on while CSL was on, which the radio would otherwise have kept listening through until the
-// next CSL window. Stays 0 without CSL.
+// PART C (backport of OpenThread #13472, delete once ESP-IDF's OpenThread includes it):
+// continuous receives the MAC went idle on while CSL was on, which the radio would otherwise have
+// kept listening through until the next CSL window. Stays 0 without CSL.
 uint32_t ieee802154_idle_rx_stop_count();
 
 // ── Diagnostics (not a workaround; delete once the CSL power question is settled) ─────────────
