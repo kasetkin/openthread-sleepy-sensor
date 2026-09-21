@@ -11,11 +11,12 @@
 // moment CSL was switched off.
 //
 // Hooked in via -Wl,--wrap=esp_ieee802154_receive_at / esp_ieee802154_receive (PARTs A, B) and
-// -Wl,--wrap=_ZN2ot3Mac6SubMac5SleepEv (PART C) in main/CMakeLists.txt. All callers
-// (otPlatRadioReceiveAt()/otPlatRadioReceive() in esp_openthread_radio.c, Mac::UpdateIdleMode()
-// in OpenThread's mac.cpp) run in the OpenThread task under its lock; the atomics only let other
-// tasks read the diagnostic counters. Inert without CSL: nothing calls receive_at then, and
-// SubMac::Sleep() already leaves the radio asleep.
+// -Wl,--wrap=_ZN2ot3Mac6SubMac5SleepEv / _ZN2ot5Radio10Statistics17RecordStateChangeENS1_6StatusE
+// (PART C) in main/CMakeLists.txt. All callers (otPlatRadioReceiveAt()/otPlatRadioReceive() in
+// esp_openthread_radio.c, Mac::UpdateIdleMode() in OpenThread's mac.cpp, the Radio methods inlined
+// into sub_mac.cpp) run in the OpenThread task under its lock; the atomics only let other tasks
+// read the diagnostic counters. Inert without CSL: nothing calls receive_at then, and
+// SubMac::Sleep() already leaves the radio asleep and its statistics saying so.
 //
 // ── PART A: expired receive window ── backport of esp-idf d60495d8 (merged to master as 7eed66d5,
 //    "fix(ieee802154): skip receive_at when rx window already expired", July 2026).
@@ -76,12 +77,23 @@
 //    frame arriving (or an ACK being sent) at that instant exactly as the non-CSL path would:
 //    esp_ieee802154_sleep() aborts both, although OpenThread #13504 says the radio must let them
 //    finish first.
+//    Radio::Sleep() also records the sleep in OpenThread's radio time statistics
+//    (otRadioTimeStatsGet(), our published radio RX time), and nothing else here does while CSL is
+//    on: Radio::Receive() switches them to "receive", and only the next transmission's CSMA
+//    backoff switches them back. They then count every stretch from a receive to the next
+//    transmission as RX -- up to a whole 70 s idle poll interval after a poll that fetched the
+//    parent's supervision message, ~90-113 s of "RX" per 300 s cycle while the radio was really
+//    on for ~10 s. So PART C also records the sleep through the real
+//    Radio::Statistics::RecordStateChange(), whose `this` it captures from OpenThread's own first
+//    call of it -- unconditionally, as #13472's Radio::Sleep() does. Without CSL the real
+//    SubMac::Sleep() has just recorded it, and recording it again adds nothing.
 //
 // Re-check all parts on any IDF upgrade (OpenThread #13491 reworks timed RX), and delete this
-// file plus the three --wrap flags once the driver and OpenThread are fixed upstream. PART C wraps
-// a C++ symbol: if it is renamed, the link fails on __real__ZN2ot3Mac6SubMac5SleepEv; if a call
-// moves into sub_mac.cpp itself, the wrap silently stops applying -- check that
-// Mac::UpdateIdleMode() still calls __wrap__ZN2ot3Mac6SubMac5SleepEv in the ELF.
+// file plus the four --wrap flags once the driver and OpenThread are fixed upstream. PART C wraps
+// two C++ symbols: if one is renamed, the link fails on its __real_ name; if a call moves into the
+// object that defines the function, the wrap silently stops applying -- check in the ELF that
+// Mac::UpdateIdleMode() still calls __wrap__ZN2ot3Mac6SubMac5SleepEv, and that some SubMac
+// function still calls __wrap__ZN2ot5Radio10Statistics17RecordStateChangeENS1_6StatusE.
 
 #include "ieee802154_rx_at_fix.h"
 
@@ -102,6 +114,19 @@ extern "C" esp_err_t __wrap_esp_ieee802154_receive_at(uint32_t time, uint32_t du
 // this ABI it is a plain function taking `this` as its only argument.
 extern "C" otError __real__ZN2ot3Mac6SubMac5SleepEv(void *sub_mac);
 extern "C" otError __wrap__ZN2ot3Mac6SubMac5SleepEv(void *sub_mac);
+
+// ot::Radio::Statistics::RecordStateChange(Status): `this` plus radio.hpp's
+// `enum Status : uint8_t { kDisabled, kSleep, kReceive }`.
+extern "C" void __real__ZN2ot5Radio10Statistics17RecordStateChangeENS1_6StatusE(void *stats,
+                                                                                 uint8_t status);
+extern "C" void __wrap__ZN2ot5Radio10Statistics17RecordStateChangeENS1_6StatusE(void *stats,
+                                                                                 uint8_t status);
+static constexpr uint8_t RADIO_STATS_STATUS_SLEEP = 1;
+
+// OpenThread's radio time statistics object, captured from its first RecordStateChange() call
+// (Radio::Enable() at stack start). Part of the static otInstance, so it never moves. OpenThread
+// task only, like everything that reads it.
+static void *s_radio_stats = nullptr;
 
 // Set when a receive window is armed, cleared by the next immediate receive: "the radio's RX state
 // may be a window's, not a continuous receive's". PART B cancels that window before receiving;
@@ -194,7 +219,17 @@ otError __wrap__ZN2ot3Mac6SubMac5SleepEv(void *sub_mac)
         esp_ieee802154_sleep();
         s_idle_rx_stop_count.fetch_add(1, std::memory_order_relaxed);
     }
+    if (s_radio_stats != nullptr)
+        __real__ZN2ot5Radio10Statistics17RecordStateChangeENS1_6StatusE(s_radio_stats,
+                                                                        RADIO_STATS_STATUS_SLEEP);
     return error;
+}
+
+// PART C
+void __wrap__ZN2ot5Radio10Statistics17RecordStateChangeENS1_6StatusE(void *stats, uint8_t status)
+{
+    s_radio_stats = stats;
+    __real__ZN2ot5Radio10Statistics17RecordStateChangeENS1_6StatusE(stats, status);
 }
 
 uint32_t ieee802154_rx_at_fix_count()
