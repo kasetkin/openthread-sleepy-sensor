@@ -22,8 +22,11 @@ idf_component_register(SRCS ${srcs}
 set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD 26)
 set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD_REQUIRED ON)
 
-# Workaround for an ESP-IDF 802.15.4 driver bug that makes a CSL receiver deaf after its own
-# data polls -- see net/ieee802154_rx_at_fix.cpp. Remove together with that file.
+# Workarounds for ESP-IDF 802.15.4 driver bugs that make a CSL receiver deaf after its own data
+# polls, plus a backport of OpenThread's SubMac::Sleep() (ot::Mac::SubMac::Sleep(), mangled) that
+# stops the radio listening after the MAC goes idle -- see net/ieee802154_rx_at_fix.cpp. Remove
+# together with that file.
 target_link_libraries(${COMPONENT_LIB} INTERFACE
                       "-Wl,--wrap=esp_ieee802154_receive"
-                      "-Wl,--wrap=esp_ieee802154_receive_at")
+                      "-Wl,--wrap=esp_ieee802154_receive_at"
+                      "-Wl,--wrap=_ZN2ot3Mac6SubMac5SleepEv")
