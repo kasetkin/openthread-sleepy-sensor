@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <vector>
 
 #include "esp_attr.h"
@@ -15,6 +16,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "soc/rtc.h"
+
+#include "die_temp.h"
+#include "rtc_clock_fix.h"
 
 static const char *TAG = "rtc-cal";
 
@@ -29,12 +33,13 @@ static constexpr int64_t TIMELINE_US = 1000 * 1000;
 // The timeline's tail that "settled" means: its mean is what every ppm figure is relative to.
 static constexpr uint32_t TIMELINE_SETTLED_SAMPLES = 16;
 static constexpr uint32_t RAW_PER_LINE = 32;
+static constexpr uint32_t DIE_TEMP_SAMPLES = 16;
 
 static constexpr uint32_t BIAS_REPS = 48;
 static constexpr uint32_t BIAS_CYCLES[] = {SLEEP_PATH_CAL_CYCLES, 32, 100};
 static constexpr size_t BIAS_N = sizeof(BIAS_CYCLES) / sizeof(BIAS_CYCLES[0]);
 
-// Power of two, so the ring index in the IRAM wrap is a mask. ~3 min of CSL-idle sleeps.
+// Power of two, so the ring index in the IRAM observer is a mask. ~3 min of CSL-idle sleeps.
 static constexpr uint32_t SLEEP_RING_SIZE = 512;
 
 static constexpr uint32_t FIRST_RUN_DELAY_MS = 5 * 60 * 1000;
@@ -42,18 +47,16 @@ static constexpr uint32_t RUN_PERIOD_MS = 5 * 60 * 1000;
 
 extern "C" uint32_t __real_rtc_clk_cal(soc_clk_freq_calculation_src_t cal_clk_sel,
                                        uint32_t slow_clk_cycles);
-extern "C" uint32_t __wrap_rtc_clk_cal(soc_clk_freq_calculation_src_t cal_clk_sel,
-                                       uint32_t slow_clk_cycles);
 
-// One light sleep as the sleep path timed it: the wrap fills the calibration and how long the
-// core had been awake before it, the exit callback then adds the sleep it was used for.
+// One light sleep as the sleep path timed it: the observer fills the period it used and how long
+// the core had been awake before it, the exit callback then adds the sleep it was used for.
 struct SleepCal {
     uint32_t period;
     uint32_t awake_us;
     uint32_t slept_us;
 };
 
-// Written by the wrap and the exit callback, both of which run with interrupts already off;
+// Written by the observer and the exit callback, both of which run with interrupts already off;
 // read by the diagnostic task. The critical section keeps an entry consistent for the reader.
 static portMUX_TYPE s_sleep_cal_mux = portMUX_INITIALIZER_UNLOCKED;
 static SleepCal s_sleep_ring[SLEEP_RING_SIZE];
@@ -63,6 +66,8 @@ static uint32_t s_sleep_ring_head = 0;
 static bool s_sleep_pending = false;
 static int64_t s_last_wake_us = 0;
 static uint32_t s_sleep_cal_count = 0;
+// Of those, how many ESP-IDF's own calibration timed (the rest got a cold value, see rtc_clock_fix.h).
+static uint32_t s_sleep_measured_count = 0;
 
 struct TimelineSample {
     uint32_t period;
@@ -78,26 +83,23 @@ static IRAM_ATTR uint32_t clamp_us(int64_t us)
     return us < 0 ? 0 : us > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(us);
 }
 
-// rtc_clk_cal() lives in IRAM (rtc_time: noflash_text) and is called from the sleep path, so the
-// wrap has to be in IRAM too, as does everything it calls (esp_timer_get_time() is, with
-// CONFIG_ESP_TIMER_IN_IRAM). Pass-through: it only records the sleep path's own 10-cycle results.
-// The diagnostic's measurements call __real_rtc_clk_cal() directly and aren't recorded.
-IRAM_ATTR uint32_t __wrap_rtc_clk_cal(soc_clk_freq_calculation_src_t cal_clk_sel, uint32_t slow_clk_cycles)
+// Called by rtc_clock_fix.cpp's wrap of rtc_clk_cal() in the sleep path, with interrupts off, so
+// IRAM like everything it calls (esp_timer_get_time() is, with CONFIG_ESP_TIMER_IN_IRAM). Only
+// records. The diagnostic's own measurements call __real_rtc_clk_cal() and never get here.
+static IRAM_ATTR void on_sleep_cal(uint32_t used, uint32_t measured)
 {
-    const uint32_t period = __real_rtc_clk_cal(cal_clk_sel, slow_clk_cycles);
-    if (cal_clk_sel == CLK_CAL_RTC_SLOW && slow_clk_cycles == SLEEP_PATH_CAL_CYCLES && period != 0) {
-        const int64_t now = esp_timer_get_time();
-        portENTER_CRITICAL_SAFE(&s_sleep_cal_mux);
-        SleepCal &entry = s_sleep_ring[s_sleep_ring_head % SLEEP_RING_SIZE];
-        entry.period = period;
-        entry.awake_us = s_last_wake_us > 0 ? clamp_us(now - s_last_wake_us) : UINT32_MAX;
-        entry.slept_us = 0;
-        s_sleep_ring_head++;
-        s_sleep_pending = true;
-        s_sleep_cal_count++;
-        portEXIT_CRITICAL_SAFE(&s_sleep_cal_mux);
-    }
-    return period;
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL_SAFE(&s_sleep_cal_mux);
+    SleepCal &entry = s_sleep_ring[s_sleep_ring_head % SLEEP_RING_SIZE];
+    entry.period = used;
+    entry.awake_us = s_last_wake_us > 0 ? clamp_us(now - s_last_wake_us) : UINT32_MAX;
+    entry.slept_us = 0;
+    s_sleep_ring_head++;
+    s_sleep_pending = true;
+    s_sleep_cal_count++;
+    if (measured != 0)
+        s_sleep_measured_count++;
+    portEXIT_CRITICAL_SAFE(&s_sleep_cal_mux);
 }
 
 // Runs from the IDLE task after every automatic light-sleep attempt, inside the PM critical
@@ -207,10 +209,12 @@ static double median_ppm(std::vector<double> &values)
     return *mid;
 }
 
-// The sleep path's own calibrations since the ring last wrapped: overall, and split by how long
-// the core had been awake before calibrating, since the timeline shows RTC_SLOW moving while
-// awake. "sleep-weighted" weighs each by the sleep it timed, so it is what esp_timer actually used.
-static void log_sleep_path(const std::vector<SleepCal> &sleeps, uint32_t cal_count, double settled, uint32_t in_use)
+// The periods the sleep path used since the ring last wrapped -- ESP-IDF's own calibration at
+// sleep entry or a cold one from rtc_clock_fix.cpp, depending on its mode: overall, and split by
+// how long the core had been awake before sleeping. "sleep-weighted" weighs each by the sleep it
+// timed, so it is what esp_timer actually used.
+static void log_sleep_path(const std::vector<SleepCal> &sleeps, uint32_t cal_count, uint32_t measured_count,
+                           double settled, uint32_t in_use)
 {
     struct AwakeBin {
         const char *name;
@@ -239,15 +243,15 @@ static void log_sleep_path(const std::vector<SleepCal> &sleeps, uint32_t cal_cou
         bin_slept[bin] += sleep.slept_us;
     }
 
-    ESP_LOGW(TAG, "sleep path N=%lu: %lu calibrations since last run, last %u: median %+.0f, sleep-weighted %+.0f "
-                  "ppm vs settled (%.1f s slept) | in use now %+.0f",
-             static_cast<unsigned long>(SLEEP_PATH_CAL_CYCLES), static_cast<unsigned long>(cal_count), static_cast<unsigned>(sleeps.size()),
-             median_ppm(all), slept_sum > 0 ? weighted_sum / slept_sum : 0.0, slept_sum / 1e6,
-             ppm_vs(in_use, settled));
+    ESP_LOGW(TAG, "sleep path: %lu sleeps since last run (%lu timed by ESP-IDF's own calibration), last %u: "
+                  "median %+.0f, sleep-weighted %+.0f ppm vs settled (%.1f s slept) | in use now %+.0f",
+             static_cast<unsigned long>(cal_count), static_cast<unsigned long>(measured_count),
+             static_cast<unsigned>(sleeps.size()), median_ppm(all), slept_sum > 0 ? weighted_sum / slept_sum : 0.0,
+             slept_sum / 1e6, ppm_vs(in_use, settled));
 
     char line[320];
     size_t len = 0;
-    append(line, sizeof(line), &len, "sleep path by awake time before the calibration (n, median ppm, share of sleep):");
+    append(line, sizeof(line), &len, "sleep path by awake time before sleeping (n, median ppm, share of sleep):");
     for (size_t i = 0; i < BIN_N; i++) {
         if (binned[i].empty())
             continue;
@@ -257,9 +261,22 @@ static void log_sleep_path(const std::vector<SleepCal> &sleeps, uint32_t cal_cou
     ESP_LOGW(TAG, "%s", line);
 }
 
+// A die-temperature reading relative to the one at wake, as raw steps and degrees.
+static void append_die_delta(char *buf, size_t size, size_t *len, const char *label,
+                             const std::optional<DieTemp> &at_wake, const std::optional<DieTemp> &now)
+{
+    if (at_wake && now)
+        append(buf, size, len, ", %s %+.1f steps (%+.2f C)", label, now->raw - at_wake->raw,
+               (now->raw - at_wake->raw) * DIE_TEMP_RAW_STEP_C);
+    else
+        append(buf, size, len, ", %s n/a", label);
+}
+
 static void run_once()
 {
     esp_pm_lock_acquire(s_no_sleep_lock);
+    // First, while the die is still at its sleeping temperature: a couple of ms.
+    const std::optional<DieTemp> die_at_wake = die_temp_read(DIE_TEMP_SAMPLES);
     const int64_t start_us = esp_timer_get_time();
     const uint64_t rtc_ticks = rtc_time_get();
     portENTER_CRITICAL(&s_sleep_cal_mux);
@@ -281,6 +298,7 @@ static void run_once()
         s_timeline[timeline_count].t_us = static_cast<uint32_t>(now - start_us);
         timeline_count++;
     }
+    const std::optional<DieTemp> die_after_timeline = die_temp_read(DIE_TEMP_SAMPLES);
 
     // Each short calibration against the mean of the reference just before and just after it,
     // ~15 ms apart, so RTC_SLOW moving during the run cancels out.
@@ -298,6 +316,7 @@ static void run_once()
         }
     }
     const uint32_t in_use = esp_clk_slowclk_cal_get();
+    const std::optional<DieTemp> die_at_end = die_temp_read(DIE_TEMP_SAMPLES);
     const int64_t end_us = esp_timer_get_time();
     esp_pm_lock_release(s_no_sleep_lock);
 
@@ -307,7 +326,9 @@ static void run_once()
     portENTER_CRITICAL(&s_sleep_cal_mux);
     const uint32_t head = s_sleep_ring_head;
     const uint32_t cal_count = s_sleep_cal_count;
+    const uint32_t measured_count = s_sleep_measured_count;
     s_sleep_cal_count = 0;
+    s_sleep_measured_count = 0;
     for (uint32_t i = head - std::min(head, SLEEP_RING_SIZE); i < head; i++)
         sleeps.push_back(s_sleep_ring[i % SLEEP_RING_SIZE]);
     portEXIT_CRITICAL(&s_sleep_cal_mux);
@@ -331,9 +352,18 @@ static void run_once()
              start_us, rtc_ticks, awake_before_ms, (end_us - start_us) / 1000,
              1e6 * (1 << RTC_CLK_CAL_FRACT) / settled / 1000.0, static_cast<unsigned long>(REFERENCE_CAL_CYCLES),
              static_cast<unsigned long>(timeline_failed));
+    char line[192];
+    size_t len = 0;
+    if (die_at_wake)
+        append(line, sizeof(line), &len, "die: %.1f C (raw %.1f) at wake", die_at_wake->celsius, die_at_wake->raw);
+    else
+        append(line, sizeof(line), &len, "die: n/a at wake");
+    append_die_delta(line, sizeof(line), &len, "after the 1 s timeline", die_at_wake, die_after_timeline);
+    append_die_delta(line, sizeof(line), &len, "at the end", die_at_wake, die_at_end);
+    ESP_LOGW(TAG, "%s", line);
     log_timeline(timeline_count, settled, awake_before_ms);
     log_bias(bias);
-    log_sleep_path(sleeps, cal_count, settled, in_use);
+    log_sleep_path(sleeps, cal_count, measured_count, settled, in_use);
 }
 
 static void rtc_cal_diag_task(void *)
@@ -361,6 +391,7 @@ esp_err_t rtc_cal_diag_start()
     err = esp_pm_light_sleep_register_cbs(&cbs_conf);
     if (err != ESP_OK)
         return err;
+    rtc_clock_fix_set_sleep_cal_observer(on_sleep_cal);
     // Lowest priority above idle: the measurement busy-waits (~2 s per run) and must never hold
     // up OpenThread or the sensor/MQTT tasks; being preempted only stretches it.
     if (xTaskCreate(rtc_cal_diag_task, "rtc_cal_diag", 6144, nullptr, tskIDLE_PRIORITY + 1, nullptr) != pdPASS)

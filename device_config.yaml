@@ -12,4 +12,6 @@ sensor_samples: "4"
 read_battery_via_adc: "true"
 battery_divider_r_vbat_ohm: "200200"
 battery_divider_r_gnd_ohm: "201700"
-
+rtc_cal_mode: "2"
+rtc_trim_mode: "2"
+ntp_server: "162.159.200.1"

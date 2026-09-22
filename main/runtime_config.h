@@ -36,7 +36,9 @@ inline constexpr std::string_view CFG_SUFFIX_HEATER_HIGH_RH_MIN = "cfg/heater_hi
 inline constexpr std::string_view CFG_SUFFIX_EXT_ANTENNA        = "cfg/ext_antenna";
 inline constexpr std::string_view CFG_SUFFIX_TX_POWER_DBM       = "cfg/tx_power_dbm";
 inline constexpr std::string_view CFG_SUFFIX_SENSOR_SAMPLES     = "cfg/sensor_samples";
-// One SUBSCRIBE for all 10 topics, not one per topic -- minimizes SUBSCRIBE-packet overhead in
+inline constexpr std::string_view CFG_SUFFIX_RTC_CAL_MODE       = "cfg/rtc_cal_mode";
+inline constexpr std::string_view CFG_SUFFIX_RTC_TRIM_MODE      = "cfg/rtc_trim_mode";
+// One SUBSCRIBE for all 12 topics, not one per topic -- minimizes SUBSCRIBE-packet overhead in
 // the brief per-cycle awake window (see run_publish_cycle()'s existing manifest/install subscribes).
 inline constexpr std::string_view CFG_SUFFIX_WILDCARD           = "cfg/#";
 
@@ -90,6 +92,15 @@ inline constexpr int8_t TX_POWER_TABLE_MAX_DBM = 20;
 inline constexpr uint32_t SENSOR_SAMPLES_MIN = 1;
 inline constexpr uint32_t SENSOR_SAMPLES_MAX = 16;
 inline constexpr uint32_t SENSOR_SAMPLES_STEP = 1;
+// The light-sleep clock fix's modes (rtc_clock_fix.h), live from the next sleep. Calibration:
+// 0 = ESP-IDF's own at sleep entry, 1 = the latest cold one, 2 = the mean of the last 32 cold
+// ones. Trim: 0 = off, 1 = the latest NTP interval's, 2 = the mean of the last 8 intervals'.
+inline constexpr uint32_t RTC_CAL_MODE_MIN = 0;
+inline constexpr uint32_t RTC_CAL_MODE_MAX = 2;
+inline constexpr uint32_t RTC_CAL_MODE_STEP = 1;
+inline constexpr uint32_t RTC_TRIM_MODE_MIN = 0;
+inline constexpr uint32_t RTC_TRIM_MODE_MAX = 2;
+inline constexpr uint32_t RTC_TRIM_MODE_STEP = 1;
 
 // Call once from main.cpp, right after lp_sensor_core_start() succeeds. `boot_config` seeds
 // this module's shadow of the 8 numeric fields (lp_sensor_core_apply_config() always writes
@@ -112,7 +123,7 @@ void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
                           bool ext_antenna_on, int32_t tx_power_known_good_dbm,
                           const NetworkLink *link);
 
-// The 10 HA-tunable parameters' current resolved value, in HA-facing units (heater fields in
+// The 12 HA-tunable parameters' current resolved value, in HA-facing units (heater fields in
 // minutes, max_publish_gap in seconds -- neither in LP cycles) -- whichever is freshest of the
 // boot default/NVS override or the latest MQTT change accepted since. Used by mqtt_sender.cpp to
 // publish each cfg/* topic's retained state alongside its discovery config (see
@@ -132,6 +143,8 @@ struct RuntimeConfigValues
     bool ext_antenna_on;
     int32_t tx_power_dbm;
     uint32_t sensor_samples;
+    uint32_t rtc_cal_mode;
+    uint32_t rtc_trim_mode;
 };
 RuntimeConfigValues runtime_config_current_values();
 
@@ -147,6 +160,8 @@ const char *runtime_config_topic_heater_high_rh_trigger_minutes();
 const char *runtime_config_topic_ext_antenna();
 const char *runtime_config_topic_tx_power_dbm();
 const char *runtime_config_topic_sensor_samples();
+const char *runtime_config_topic_rtc_cal_mode();
+const char *runtime_config_topic_rtc_trim_mode();
 
 // ── TX power (Phase B) ──────────────────────────────────────────────────────────────────────
 // A tx_power_dbm value low enough to break the uplink would strand the device (its only

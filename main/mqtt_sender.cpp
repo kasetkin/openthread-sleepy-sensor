@@ -24,6 +24,7 @@
 #include "history_log.h"
 #include "runtime_config.h"
 #include "hp_awake_stats.h"
+#include "rtc_clock_fix.h"
 
 static const char *TAG = "mqtt-sender";
 
@@ -39,6 +40,11 @@ static constexpr EventBits_t BIT_IDLE = BIT0;
 // learned, only for an IPv4 broker; Wi-Fi: always immediate). After attach a NAT64
 // route can land slightly late; a few seconds covers the gap.
 static constexpr uint32_t BROKER_REACHABLE_WAIT_MS = 5000;
+
+// How far into a publish cycle the light-sleep clock fix's NTP sample (rtc_clock_fix.h) may
+// still finish: sensorstask.cpp waits PUBLISH_TIMEOUT_MS (15 s) for the cycle and counts a
+// longer one as failed, which would cost CSL probation and a TX-power trial. The rest is margin.
+static constexpr int64_t NTP_SAMPLE_DEADLINE_US = 12 * 1000 * 1000;
 
 // Which sensors' HA-discovery configs have been confirmed sent this boot. Per-sensor bits, not
 // one bool: each cycle publishes configs only for the values actually present, so a first cycle
@@ -415,17 +421,19 @@ static constexpr size_t MAX_UPDATE_DISCOVERY_TOPIC_LEN =
 static constexpr size_t MAX_STATE_TOPIC_LEN = STATE_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 static constexpr size_t MAX_BACKFILL_TOPIC_LEN = BACKFILL_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 
-// Longest HA entity `name` among the 8 `number` + 1 `switch` config entities (see the
+// Longest HA entity `name` among the 11 `number` + 1 `switch` config entities (see the
 // publish_number_discoveries()/publish_switch_discovery() call sites below).
 static constexpr size_t MAX_CFG_NAME_LEN = std::max({sizeof("Temperature offset"), sizeof("Temperature min change"),
     sizeof("Humidity offset"), sizeof("Humidity min change"), sizeof("Max publish gap"),
     sizeof("Heater period"), sizeof("Heater high-RH trigger"), sizeof("External antenna"),
-    sizeof("TX power")}) - 1;
-// Longest of the 9 cfg/* topic suffixes (runtime_config.h).
+    sizeof("TX power"), sizeof("Sensor samples"), sizeof("Sleep clock cal mode"),
+    sizeof("Sleep clock trim mode")}) - 1;
+// Longest of the 12 cfg/* topic suffixes (runtime_config.h).
 static constexpr size_t MAX_CFG_SUFFIX_LEN = std::max({CFG_SUFFIX_TEMP_OFFSET.size(), CFG_SUFFIX_TEMP_MIN_CHANGE.size(),
     CFG_SUFFIX_RH_OFFSET.size(), CFG_SUFFIX_RH_MIN_CHANGE.size(), CFG_SUFFIX_MAX_PUBLISH_GAP_SEC.size(),
     CFG_SUFFIX_HEATER_PERIOD_MIN.size(), CFG_SUFFIX_HEATER_HIGH_RH_MIN.size(), CFG_SUFFIX_EXT_ANTENNA.size(),
-    CFG_SUFFIX_TX_POWER_DBM.size()});
+    CFG_SUFFIX_TX_POWER_DBM.size(), CFG_SUFFIX_SENSOR_SAMPLES.size(), CFG_SUFFIX_RTC_CAL_MODE.size(),
+    CFG_SUFFIX_RTC_TRIM_MODE.size()});
 // Full "<device_id>/cfg/<suffix>" topic, interpolated 2x into CMD_PART_TAIL (state + command).
 static constexpr size_t MAX_CFG_TOPIC_LEN = MAX_DEVICE_ID_LEN + 1 /* '/' */ + MAX_CFG_SUFFIX_LEN;
 // unique_id's slug half -- the bare key name (suffix minus the "cfg/" segment).
@@ -914,7 +922,7 @@ static void retire_old_battery_adc_time_discovery(esp_mqtt_client_handle_t clien
     esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 1, 1);
 }
 
-// Issues all 9 publish_number_discovery() calls -- the ONE place these entities' HA-visible
+// Issues all 11 publish_number_discovery() calls -- the ONE place these entities' HA-visible
 // names/units/ranges are decided; ranges come straight from runtime_config.h so the clamp
 // applied on the device side can never drift from what HA's UI advertises. Current values come
 // from runtime_config_current_values(), fetched once here. NUMBER_ENTITY_COUNT below must track
@@ -951,6 +959,12 @@ static void publish_number_discoveries(esp_mqtt_client_handle_t client, std::str
     publish_number_discovery(client, device_id, device_name, "Sensor samples", "sensor_samples",
         runtime_config_topic_sensor_samples(), SENSOR_SAMPLES_MIN, SENSOR_SAMPLES_MAX,
         SENSOR_SAMPLES_STEP, nullptr, cur.sensor_samples);
+    publish_number_discovery(client, device_id, device_name, "Sleep clock cal mode", "rtc_cal_mode",
+        runtime_config_topic_rtc_cal_mode(), RTC_CAL_MODE_MIN, RTC_CAL_MODE_MAX, RTC_CAL_MODE_STEP,
+        nullptr, cur.rtc_cal_mode);
+    publish_number_discovery(client, device_id, device_name, "Sleep clock trim mode", "rtc_trim_mode",
+        runtime_config_topic_rtc_trim_mode(), RTC_TRIM_MODE_MIN, RTC_TRIM_MODE_MAX, RTC_TRIM_MODE_STEP,
+        nullptr, cur.rtc_trim_mode);
 
     retire_old_max_skip_cycles_discovery(client, device_id);
 }
@@ -960,7 +974,7 @@ static void publish_number_discoveries(esp_mqtt_client_handle_t client, std::str
 // DISC_NUMBERS ACK-counting site below (run_publish_cycle()'s discovery_msgs computation) so
 // the next entity added to that function only needs to update this one number, not hunt down a
 // magic-number ACK count that silently desyncs BIT_ALL_ACKED if missed.
-static constexpr int NUMBER_ENTITY_COUNT = 9;
+static constexpr int NUMBER_ENTITY_COUNT = 11;
 static constexpr int NUMBER_ENTITY_MSGS = NUMBER_ENTITY_COUNT * 2;  // discovery config + current-value state, each
 
 // The ext_antenna HA `switch` entity's discovery config -- same state_topic==command_topic
@@ -1197,6 +1211,7 @@ struct PublishParams
 // the event group and MQTT client handle every single publish cycle.
 static bool run_publish_cycle(const PublishParams &params)
 {
+    const int64_t cycleStartUs = esp_timer_get_time();
     const bool hasTemp = params.temperature.has_value();
     const bool hasHumid = params.humidity.has_value();
     // Both-or-neither: a lone battery value (shouldn't happen -- sensorstask always sets the
@@ -1658,6 +1673,15 @@ static bool run_publish_cycle(const PublishParams &params)
         s_lastStatePublishAwakeUs = statePublishAwakeUs;
         s_lastStatePublishRawUs = statePublishRawUs;
         s_lastClientStopAwakeUs = clientStopAwakeUs;
+    }
+
+    // The light-sleep clock fix's NTP sample, when one is due (about every 30 min): still inside
+    // the window, so its replies arrive at the fast poll, and only in whatever is left before
+    // NTP_SAMPLE_DEADLINE_US -- it skips this window rather than stretch the cycle. Ahead of the
+    // OTA check, which reboots on success.
+    if (ok || !hasAny) {
+        const int64_t leftUs = NTP_SAMPLE_DEADLINE_US - (esp_timer_get_time() - cycleStartUs);
+        rtc_clock_fix_ntp_sample_if_due(*s_link, leftUs > 0 ? static_cast<uint32_t>(leftUs / 1000) : 0);
     }
 
     // A staged update only starts from a healthy cycle: for a data-carrying cycle that means

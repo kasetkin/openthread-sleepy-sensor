@@ -20,10 +20,14 @@
 //    settled tail, binned and raw;
 //  - 10-, 32- and 100-cycle calibrations each sandwiched between two 1024-cycle ones, so a
 //    counting offset shows up as a bias shrinking as 1/N and drift during the run cancels;
-//  - the sleep path's own 10-cycle values over its last 512 sleeps (a pass-through wrap of
-//    rtc_clk_cal() that changes nothing), overall and by how long the core had been awake before
-//    calibrating, plus the mean weighted by the sleep each one timed.
+//  - the die temperature (die_temp.h) at wake, after the timeline and at the end, so the
+//    timeline's drift can be set against the die warming up;
+//  - the periods the sleep path used over its last 512 sleeps -- ESP-IDF's own calibration or a
+//    cold one, see rtc_clock_fix.h, whose wrap of rtc_clk_cal() reports them here -- overall and
+//    by how long the core had been awake before sleeping, plus the mean weighted by the sleep
+//    each one timed.
 //
-// Delete this module, its call in main.cpp and its --wrap flag in CMakeLists.txt once the question
-// is settled.
+// 2026-09-22 results: the 10-cycle calibration is exact; RTC_SLOW slows right after activity,
+// which is what rtc_clock_fix.h fixes. Delete this module and its call in main.cpp once that fix
+// is settled (rtc_clock_fix.cpp owns the --wrap).
 esp_err_t rtc_cal_diag_start();

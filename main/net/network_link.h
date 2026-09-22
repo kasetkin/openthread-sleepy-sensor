@@ -75,6 +75,11 @@ struct NetworkLink
     // guarantee it).
     std::function<bool(std::string_view broker_address, uint32_t timeoutMs)> waitForBrokerReachable;
 
+    // The literal a socket should connect to for `address` (a literal IPv4 or IPv6 address, no
+    // DNS names): OT maps an IPv4 address into the learned NAT64 prefix, Wi-Fi returns it
+    // unchanged. Empty if it can't be mapped. brokerUri() is this plus the MQTT scheme and port.
+    std::function<std::string(std::string_view address)> connectAddress;
+
     // Publish-window hooks (OT: fast/slow poll period; Wi-Fi: no-op).
     std::function<void()> onPublishWindowBegin;
     std::function<void()> onPublishWindowEnd;
