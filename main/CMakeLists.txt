@@ -39,6 +39,6 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE
                       "-Wl,--wrap=_ZN2ot5Radio10Statistics17RecordStateChangeENS1_6StatusE")
 
 # Fix for the device clock running fast in light sleep: hands ESP-IDF's light-sleep path an RTC_SLOW
-# calibration taken right after the previous wake instead of at sleep entry, times an NTP-learned
-# trim -- see rtc_clock_fix.h. rtc_cal_diag.cpp observes it. Remove together with that module.
+# calibration taken right after the previous wake instead of at sleep entry -- see rtc_clock_fix.h.
+# rtc_cal_diag.cpp observes it. Remove together with that module.
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=rtc_clk_cal")

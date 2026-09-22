@@ -499,7 +499,7 @@ static void setNat64Prefix(const uint8_t *p12)
         xEventGroupSetBits(s_prefix_eg, BIT_PREFIX_KNOWN);
 }
 
-static std::string make_nat64_host(std::string_view ipv4)
+static std::string make_nat64_uri(std::string_view ipv4, uint16_t port, bool use_tls)
 {
     const auto octets = parseIpv4(ipv4);
     if (!octets) {
@@ -515,14 +515,6 @@ static std::string make_nat64_host(std::string_view ipv4)
 
     char host[OT_IP6_ADDRESS_STRING_SIZE];
     otIp6AddressToString(&addr, host, sizeof(host));
-    return host;
-}
-
-static std::string make_nat64_uri(std::string_view ipv4, uint16_t port, bool use_tls)
-{
-    const std::string host = make_nat64_host(ipv4);
-    if (host.empty())
-        return {};
     return std::format("{}://[{}]:{}", mqttScheme(use_tls), host, port);
 }
 
@@ -729,13 +721,6 @@ static bool waitForBrokerReachable(std::string_view broker_address, uint32_t tim
     return true;
 }
 
-static std::string connectAddress(std::string_view address)
-{
-    if (looksLikeIpv6(address))
-        return std::string(address);
-    return make_nat64_host(address);
-}
-
 static std::string brokerUri(std::string_view broker_address, uint16_t port, bool use_tls)
 {
     if (looksLikeIpv6(broker_address))
@@ -817,7 +802,6 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.waitForReady = wait_for_ot_attached;
     link.brokerUri = brokerUri;
     link.waitForBrokerReachable = waitForBrokerReachable;
-    link.connectAddress = connectAddress;
     link.onPublishWindowBegin = []() { pm_profile_publish_window_begin();
                                        set_poll_period(POLL_FAST_MS); };
     link.onPublishWindowEnd = []() { set_poll_period(POLL_SLOW_MS);

@@ -190,7 +190,6 @@ NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
     link.waitForReady = waitForWifiReady;
     link.brokerUri = brokerUri;
     link.waitForBrokerReachable = waitForBrokerReachable;
-    link.connectAddress = [](std::string_view address) { return std::string(address); };
     link.onPublishWindowBegin = noop;
     link.onPublishWindowEnd = noop;
     link.onOtaWindowBegin = noop;   // Wi-Fi STA is already always-RX during the awake window

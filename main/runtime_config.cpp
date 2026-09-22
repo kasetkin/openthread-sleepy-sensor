@@ -29,7 +29,6 @@ static std::string s_topic_heater_high_rh_trigger_minutes;
 static std::string s_topic_ext_antenna;
 static std::string s_topic_sensor_samples;
 static std::string s_topic_rtc_cal_mode;
-static std::string s_topic_rtc_trim_mode;
 
 static uint32_t s_poll_interval_sec = 20;
 // Always-current shadow of the 7 calibration/threshold/heater-schedule fields, seeded from
@@ -87,7 +86,6 @@ struct PendingCfg
     bool tx_power_dbm_set = false;
     bool sensor_samples_set = false;
     bool rtc_cal_mode_set = false;
-    bool rtc_trim_mode_set = false;
 
     float temp_offset_c = 0.0f;
     float temp_min_change_c = 0.0f;
@@ -100,7 +98,6 @@ struct PendingCfg
     int32_t tx_power_dbm = 0;
     uint32_t sensor_samples = 0;
     uint32_t rtc_cal_mode = 0;
-    uint32_t rtc_trim_mode = 0;
 };
 static PendingCfg s_pending;
 static SemaphoreHandle_t s_mutex = nullptr;
@@ -194,7 +191,6 @@ void runtime_config_init(std::string_view device_id, uint32_t poll_interval_sec,
     s_topic_tx_power_dbm                   = full(CFG_SUFFIX_TX_POWER_DBM);
     s_topic_sensor_samples                 = full(CFG_SUFFIX_SENSOR_SAMPLES);
     s_topic_rtc_cal_mode                   = full(CFG_SUFFIX_RTC_CAL_MODE);
-    s_topic_rtc_trim_mode                  = full(CFG_SUFFIX_RTC_TRIM_MODE);
 
     // A trial left outstanding by a previous boot -- runtime_config_tx_power_note_first_attach()
     // decides what to do with it (never resumed, always treated as failed).
@@ -227,7 +223,6 @@ const char *runtime_config_topic_ext_antenna()                    { return s_top
 const char *runtime_config_topic_tx_power_dbm()                   { return s_topic_tx_power_dbm.c_str(); }
 const char *runtime_config_topic_sensor_samples()                 { return s_topic_sensor_samples.c_str(); }
 const char *runtime_config_topic_rtc_cal_mode()                   { return s_topic_rtc_cal_mode.c_str(); }
-const char *runtime_config_topic_rtc_trim_mode()                  { return s_topic_rtc_trim_mode.c_str(); }
 
 void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
                                   const char *data, size_t data_len)
@@ -341,15 +336,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         s_pending.rtc_cal_mode = v;
         s_pending.rtc_cal_mode_set = true;
         xSemaphoreGive(s_mutex);
-    } else if (topic_is(topic, topic_len, s_topic_rtc_trim_mode)) {
-        uint32_t v;
-        if (!parse_uint32(data, data_len, v))
-            return;
-        v = std::clamp(v, RTC_TRIM_MODE_MIN, RTC_TRIM_MODE_MAX);
-        xSemaphoreTake(s_mutex, portMAX_DELAY);
-        s_pending.rtc_trim_mode = v;
-        s_pending.rtc_trim_mode_set = true;
-        xSemaphoreGive(s_mutex);
     }
 }
 
@@ -408,14 +394,10 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
         ++applied;
     }
 
-    // Both only change what the sleep path uses from its next sleep on -- no link or protocol
-    // state to renegotiate, so no trial/revert machinery either.
+    // Only changes which calibration the sleep path uses from its next sleep on -- no link or
+    // protocol state to renegotiate, so no trial/revert machinery either.
     if (snap.rtc_cal_mode_set) {
         rtc_clock_fix_set_cal_mode(snap.rtc_cal_mode);
-        ++applied;
-    }
-    if (snap.rtc_trim_mode_set) {
-        rtc_clock_fix_set_trim_mode(snap.rtc_trim_mode);
         ++applied;
     }
 
@@ -453,8 +435,6 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
             nvs_set_u32(nvs, "sensor_samples", snap.sensor_samples);
         if (snap.rtc_cal_mode_set)
             nvs_set_u32(nvs, "rtc_cal_mode", snap.rtc_cal_mode);
-        if (snap.rtc_trim_mode_set)
-            nvs_set_u32(nvs, "rtc_trim_mode", snap.rtc_trim_mode);
         if (nvs_commit(nvs) != ESP_OK)
             ESP_LOGE(TAG, "nvs_commit failed — change applied live but may not survive a reboot");
         nvs_close(nvs);
@@ -482,7 +462,6 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
         if (snap.tx_power_dbm_set)    { appendNum(val, snap.tx_power_dbm); echo(s_topic_tx_power_dbm.c_str()); }
         if (snap.sensor_samples_set)  { appendNum(val, snap.sensor_samples); echo(s_topic_sensor_samples.c_str()); }
         if (snap.rtc_cal_mode_set)    { appendNum(val, snap.rtc_cal_mode); echo(s_topic_rtc_cal_mode.c_str()); }
-        if (snap.rtc_trim_mode_set)   { appendNum(val, snap.rtc_trim_mode); echo(s_topic_rtc_trim_mode.c_str()); }
     }
 
     ESP_LOGI(TAG, "applied %d runtime config change(s)", applied);
@@ -564,7 +543,6 @@ RuntimeConfigValues runtime_config_current_values()
         .tx_power_dbm = s_tx_power_has_pending ? int32_t(s_tx_power_pending) : int32_t(s_tx_power_known_good),
         .sensor_samples = s_shadow.sensor_samples,
         .rtc_cal_mode = rtc_clock_fix_cal_mode(),
-        .rtc_trim_mode = rtc_clock_fix_trim_mode(),
     };
 }
 
