@@ -8,6 +8,7 @@ set(srcs
   ota_updater.cpp
   runtime_config.cpp
   hp_awake_stats.cpp
+  rtc_cal_diag.cpp
   net/network_link.cpp
   net/openthread_link.cpp
   net/wifi_link.cpp
@@ -34,3 +35,8 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE
                       "-Wl,--wrap=esp_ieee802154_receive_at"
                       "-Wl,--wrap=_ZN2ot3Mac6SubMac5SleepEv"
                       "-Wl,--wrap=_ZN2ot5Radio10Statistics17RecordStateChangeENS1_6StatusE")
+
+# Diagnostic for the device clock running fast in light sleep: a pass-through wrap that records
+# the RTC_SLOW calibrations the light-sleep path makes -- see rtc_cal_diag.h. Remove together with
+# that module.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=rtc_clk_cal")

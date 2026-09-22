@@ -17,6 +17,7 @@
 #include "mqtt_sender.h"
 #include "runtime_config.h"
 #include "hp_awake_stats.h"
+#include "rtc_cal_diag.h"
 
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -219,6 +220,10 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(enableAutomaticLightSleep());
     // Sleep time before this point is untracked -- same ordering constraint as the call above.
     ESP_ERROR_CHECK(hp_awake_stats_init());
+    // Diagnostic for the device clock running fast in light sleep -- see rtc_cal_diag.h. Only
+    // logs, so a failure to start it must not stop the device.
+    if (const esp_err_t err = rtc_cal_diag_start(); err != ESP_OK)
+        ESP_LOGW("main", "rtc_cal_diag_start failed: %s", esp_err_to_name(err));
 
     // ── parse secrets ─────────────────────────────────────────────────────────
     const std::string_view yaml = secrets_yaml();
