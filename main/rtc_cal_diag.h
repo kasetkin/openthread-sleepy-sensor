@@ -11,9 +11,9 @@
 // rate asleep than awake. The first version's single run on 2026-09-22 saw RTC_SLOW slow down by
 // ~870 ppm within half a second of staying awake, which also spoiled its sequential comparison.
 //
-// Five minutes after start, then every 15 minutes, a low-priority task holds a no-light-sleep lock
-// for ~2 s and logs (tag rtc-cal, every ppm figure positive = a longer tick, i.e. esp_timer would
-// run fast across a sleep):
+// Every 5 minutes, the first time 5 minutes after start, a low-priority task holds a
+// no-light-sleep lock for ~2 s and logs (tag rtc-cal, every ppm figure positive = a longer tick,
+// i.e. esp_timer would run fast across a sleep):
 //  - esp_timer and the RTC tick counter read together, so two runs and the border router's log
 //    give the tick length RTC_SLOW really had between them, mostly asleep;
 //  - a one-second timeline of 1024-cycle calibrations from the moment it woke, relative to its

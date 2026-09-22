@@ -38,7 +38,7 @@ static constexpr size_t BIAS_N = sizeof(BIAS_CYCLES) / sizeof(BIAS_CYCLES[0]);
 static constexpr uint32_t SLEEP_RING_SIZE = 512;
 
 static constexpr uint32_t FIRST_RUN_DELAY_MS = 5 * 60 * 1000;
-static constexpr uint32_t RUN_PERIOD_MS = 15 * 60 * 1000;
+static constexpr uint32_t RUN_PERIOD_MS = 5 * 60 * 1000;
 
 extern "C" uint32_t __real_rtc_clk_cal(soc_clk_freq_calculation_src_t cal_clk_sel,
                                        uint32_t slow_clk_cycles);
