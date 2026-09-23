@@ -25,7 +25,18 @@
 //  - the periods the sleep path used over its last 512 sleeps -- ESP-IDF's own calibration or a
 //    cold one, see rtc_clock_fix.h, whose wrap of rtc_clk_cal() reports them here -- overall and
 //    by how long the core had been awake before sleeping, plus the mean weighted by the sleep
-//    each one timed.
+//    each one timed;
+//  - how much slower RTC_SLOW reads at sleep entry, where ESP-IDF calibrates it, than the cold
+//    value that timed the sleep: the heat the die still carries from the activity just before;
+//  - the cooling curve: the cold calibrations averaged per length of the sleep they ended. While
+//    this diagnostic is registered the exit callback also calibrates after sleeps too short for
+//    the ring, and those are the ones that wake with the die still warm.
+//
+// The last two are for the open question of the -54 ppm the clock is still out by (2026-09-22
+// capture): that is the die being ~0.035 C warmer over the sleep on average than at the wake where
+// the calibration is taken. If the cooling curve resolves against the ~920 ppm a single
+// calibration scatters by, the device can fit its own time constant and correct for it with no
+// external reference -- the hot-vs-cold figure is the amplitude that correction would scale.
 //
 // 2026-09-22 results: the 10-cycle calibration is exact; RTC_SLOW slows right after activity,
 // which is what rtc_clock_fix.h fixes. Delete this module and its call in main.cpp once that fix

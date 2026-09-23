@@ -16,8 +16,14 @@
 // OpenThread turns the radio on (a CSL window opens >= 2.3 ms later), while the die is still at
 // its sleeping temperature, and hand that to ESP-IDF's sleep path through a
 // -Wl,--wrap=rtc_clk_cal. Same 10-cycle calibration, same cost, different moment. Both the latest
-// such "cold" value and the mean of the last 32 are kept; RtcCalMode picks which one the sleep
-// path uses. HA-tunable (cfg/rtc_cal_mode), taking effect at the next sleep.
+// such "cold" value and the mean of the last COLD_RING_SIZE are kept; RtcCalMode picks which one
+// the sleep path uses. HA-tunable (cfg/rtc_cal_mode), taking effect at the next sleep.
+//
+// A single calibration scatters by ~920 ppm (2026-09-22 capture, 164 status lines), so the mean is
+// the steadier of the two, but only over spans shorter than the ring: a moving average preserves
+// the sum of its inputs, so over 10 s or more the accumulated clock error barely depends on the
+// ring size at all. What does grow with it is the lag behind a drifting die -- 67 ppm at 32 samples
+// at the fastest drift in that capture, against the -54 ppm the clock is still out by. Hence 8.
 //
 // Every 5 minutes a status line logs the die temperature (die_temp.h), the cold calibrations and
 // which calibration timed the sleeps since the previous line.
@@ -38,7 +44,17 @@ void rtc_clock_fix_set_cal_mode(uint32_t mode);
 uint32_t rtc_clock_fix_cal_mode();
 
 // For rtc_cal_diag: called from the wrap in the sleep path, with interrupts off, so it must be
-// IRAM_ATTR and must not block. `used` is the period the sleep path got, `measured` the
-// calibration ESP-IDF's own call made or 0 when a cold value was used instead.
-using RtcSleepCalObserver = void (*)(uint32_t used, uint32_t measured);
+// IRAM_ATTR and must not block. `used` is the period the sleep path got and `cold` says whether
+// that came from the ring. `measured` is ESP-IDF's own calibration at sleep entry, which is taken
+// even when a cold value times the sleep -- only while an observer is registered, because its one
+// remaining use is to show the diagnostic how much warmer the die reads there.
+using RtcSleepCalObserver = void (*)(uint32_t used, uint32_t measured, bool cold);
 void rtc_clock_fix_set_sleep_cal_observer(RtcSleepCalObserver observer);
+
+// For rtc_cal_diag's cooling curve: called from the light-sleep exit callback once per sleep, with
+// interrupts off, so it must not block. `cold` is the calibration just taken at the wake,
+// `slept_us` the sleep it ended and `taken` whether it went into the ring. Registering an observer
+// also makes the callback calibrate after sleeps too short to be worth ringing, since those are
+// the ones that wake with the die still warm and so are what traces the curve.
+using RtcColdCalObserver = void (*)(int64_t slept_us, uint32_t cold, bool taken);
+void rtc_clock_fix_set_cold_cal_observer(RtcColdCalObserver observer);

@@ -24,9 +24,10 @@ static constexpr uint32_t SLEEP_PATH_CAL_CYCLES = 10;
 static constexpr uint32_t COLD_CAL_CYCLES = 10;
 // Only a sleep this long counts as having let the die cool from whatever came before it.
 static constexpr int64_t COLD_MIN_SLEEP_US = 50 * 1000;
-static constexpr uint32_t COLD_RING_SIZE = 32;
-// Until this many cold values exist the sleep path keeps ESP-IDF's own calibration.
-static constexpr uint32_t COLD_MIN_SAMPLES = 8;
+// Averaging beyond this buys nothing the clock can feel and only adds lag behind a drifting die
+// (see rtc_clock_fix.h). Until the ring is full the sleep path keeps ESP-IDF's own calibration,
+// which on the 2026-09-22 capture was 13 sleeps out of 144150, all in the first seconds of a boot.
+static constexpr uint32_t COLD_RING_SIZE = 8;
 // A cold value this far from the mean is dropped as a glitch: ~10 C of RC drift between wakes.
 static constexpr uint64_t COLD_MAX_JUMP_PPM = 20000;
 
@@ -42,6 +43,7 @@ extern "C" uint32_t __wrap_rtc_clk_cal(soc_clk_freq_calculation_src_t cal_clk_se
 static std::atomic<uint32_t> s_cal_mode{static_cast<uint32_t>(RtcCalMode::ColdMean)};
 
 static RtcSleepCalObserver s_observer = nullptr;
+static RtcColdCalObserver s_cold_observer = nullptr;
 
 // Written by the exit callback and read by the wrap -- same core, both with interrupts off, so
 // never at the same time -- and read by the status task under s_mux.
@@ -81,25 +83,30 @@ IRAM_ATTR uint32_t __wrap_rtc_clk_cal(soc_clk_freq_calculation_src_t cal_clk_sel
         return __real_rtc_clk_cal(cal_clk_sel, slow_clk_cycles);
 
     const auto mode = static_cast<RtcCalMode>(s_cal_mode.load(std::memory_order_relaxed));
+    const RtcSleepCalObserver observer = s_observer;
     uint32_t measured = 0;
     uint32_t period = 0;
-    if (mode != RtcCalMode::EspIdf && s_cold_count >= COLD_MIN_SAMPLES) {
+    const bool cold = mode != RtcCalMode::EspIdf && s_cold_count >= COLD_RING_SIZE;
+    if (cold) {
         period = mode == RtcCalMode::ColdLast ? s_cold_last : s_cold_mean;
+        // Nothing needs it, so it is only worth its ~80 us while the diagnostic is watching.
+        if (observer != nullptr)
+            measured = __real_rtc_clk_cal(cal_clk_sel, slow_clk_cycles);
         s_sleeps_cold++;
     } else {
         measured = __real_rtc_clk_cal(cal_clk_sel, slow_clk_cycles);
         period = measured;
         s_sleeps_measured++;
     }
-    if (s_observer != nullptr && period != 0)
-        s_observer(period, measured);
+    if (observer != nullptr && period != 0)
+        observer(period, measured, cold);
     return period;
 }
 
 // Under s_mux.
 static void accept_cold(uint32_t period)
 {
-    if (s_cold_count >= COLD_MIN_SAMPLES) {
+    if (s_cold_count >= COLD_RING_SIZE) {
         const uint32_t diff = period > s_cold_mean ? period - s_cold_mean : s_cold_mean - period;
         if (uint64_t{diff} * 1000000 > uint64_t{s_cold_mean} * COLD_MAX_JUMP_PPM) {
             s_cold_rejected++;
@@ -122,14 +129,22 @@ static void accept_cold(uint32_t period)
 // calibration is the first thing after the wake.
 static esp_err_t on_light_sleep_exit(int64_t sleep_time_us, void *)
 {
-    if (sleep_time_us < COLD_MIN_SLEEP_US)
+    if (sleep_time_us <= 0)
+        return ESP_OK;
+    const RtcColdCalObserver observer = s_cold_observer;
+    const bool take = sleep_time_us >= COLD_MIN_SLEEP_US;
+    if (!take && observer == nullptr)
         return ESP_OK;
     const uint32_t cold = __real_rtc_clk_cal(CLK_CAL_RTC_SLOW, COLD_CAL_CYCLES);
     if (cold == 0)
         return ESP_OK;
-    portENTER_CRITICAL_SAFE(&s_mux);
-    accept_cold(cold);
-    portEXIT_CRITICAL_SAFE(&s_mux);
+    if (take) {
+        portENTER_CRITICAL_SAFE(&s_mux);
+        accept_cold(cold);
+        portEXIT_CRITICAL_SAFE(&s_mux);
+    }
+    if (observer != nullptr)
+        observer(sleep_time_us, cold, take);
     return ESP_OK;
 }
 
@@ -148,6 +163,11 @@ uint32_t rtc_clock_fix_cal_mode()
 void rtc_clock_fix_set_sleep_cal_observer(RtcSleepCalObserver observer)
 {
     s_observer = observer;
+}
+
+void rtc_clock_fix_set_cold_cal_observer(RtcColdCalObserver observer)
+{
+    s_cold_observer = observer;
 }
 
 // Every STATUS_PERIOD_MS: the die temperature, what the cold calibrations say and what timed the

@@ -48,12 +48,37 @@ static constexpr uint32_t RUN_PERIOD_MS = 5 * 60 * 1000;
 extern "C" uint32_t __real_rtc_clk_cal(soc_clk_freq_calculation_src_t cal_clk_sel,
                                        uint32_t slow_clk_cycles);
 
-// One light sleep as the sleep path timed it: the observer fills the period it used and how long
-// the core had been awake before it, the exit callback then adds the sleep it was used for.
+// One light sleep as the sleep path timed it: the observer fills the period it used, ESP-IDF's own
+// calibration at sleep entry and how long the core had been awake before it, the exit callback
+// then adds the sleep it was used for.
 struct SleepCal {
     uint32_t period;
+    uint32_t hot;
     uint32_t awake_us;
     uint32_t slept_us;
+};
+
+// The cooling curve: cold calibrations from the light-sleep exit callback, summed per length of
+// the sleep they ended. A short sleep wakes with the die still warm from the activity before it,
+// a long one wakes at the asymptote, so the bins trace how fast the die cools -- which is what a
+// trim would need to know to correct the wake-moment calibration to the sleep's mean.
+struct CoolBin {
+    const char *name;
+    uint32_t below_us;
+};
+
+static constexpr CoolBin COOL_BINS[] = {
+    {"<2ms", 2000}, {"2-5ms", 5000}, {"5-10ms", 10000}, {"10-20ms", 20000}, {"20-50ms", 50000},
+    {"50-100ms", 100000}, {"0.1-0.2s", 200000}, {"0.2-0.5s", 500000}, {"0.5-1s", 1000000},
+    {">1s", UINT32_MAX},
+};
+static constexpr size_t COOL_BIN_N = sizeof(COOL_BINS) / sizeof(COOL_BINS[0]);
+
+// Sums, not a ring: the observer runs with interrupts off on a core without an FPU, so it may only
+// add integers. The task turns them into means.
+struct CoolSum {
+    uint32_t count;
+    uint64_t period_sum;
 };
 
 // Written by the observer and the exit callback, both of which run with interrupts already off;
@@ -68,6 +93,10 @@ static int64_t s_last_wake_us = 0;
 static uint32_t s_sleep_cal_count = 0;
 // Of those, how many ESP-IDF's own calibration timed (the rest got a cold value, see rtc_clock_fix.h).
 static uint32_t s_sleep_measured_count = 0;
+static CoolSum s_cool[COOL_BIN_N];
+// Cold calibrations reported since the last run, and how many of them the ring took.
+static uint32_t s_cold_cal_count = 0;
+static uint32_t s_cold_taken_count = 0;
 
 struct TimelineSample {
     uint32_t period;
@@ -86,19 +115,37 @@ static IRAM_ATTR uint32_t clamp_us(int64_t us)
 // Called by rtc_clock_fix.cpp's wrap of rtc_clk_cal() in the sleep path, with interrupts off, so
 // IRAM like everything it calls (esp_timer_get_time() is, with CONFIG_ESP_TIMER_IN_IRAM). Only
 // records. The diagnostic's own measurements call __real_rtc_clk_cal() and never get here.
-static IRAM_ATTR void on_sleep_cal(uint32_t used, uint32_t measured)
+static IRAM_ATTR void on_sleep_cal(uint32_t used, uint32_t measured, bool cold)
 {
     const int64_t now = esp_timer_get_time();
     portENTER_CRITICAL_SAFE(&s_sleep_cal_mux);
     SleepCal &entry = s_sleep_ring[s_sleep_ring_head % SLEEP_RING_SIZE];
     entry.period = used;
+    entry.hot = measured;
     entry.awake_us = s_last_wake_us > 0 ? clamp_us(now - s_last_wake_us) : UINT32_MAX;
     entry.slept_us = 0;
     s_sleep_ring_head++;
     s_sleep_pending = true;
     s_sleep_cal_count++;
-    if (measured != 0)
+    if (!cold)
         s_sleep_measured_count++;
+    portEXIT_CRITICAL_SAFE(&s_sleep_cal_mux);
+}
+
+// Called by rtc_clock_fix.cpp's light-sleep exit callback, once per sleep, with interrupts off.
+// Only sums, so no floating point and nothing that could block.
+static void on_cold_cal(int64_t slept_us, uint32_t cold, bool taken)
+{
+    const uint32_t slept = clamp_us(slept_us);
+    size_t bin = 0;
+    while (bin + 1 < COOL_BIN_N && slept >= COOL_BINS[bin].below_us)
+        bin++;
+    portENTER_CRITICAL_SAFE(&s_sleep_cal_mux);
+    s_cool[bin].count++;
+    s_cool[bin].period_sum += cold;
+    s_cold_cal_count++;
+    if (taken)
+        s_cold_taken_count++;
     portEXIT_CRITICAL_SAFE(&s_sleep_cal_mux);
 }
 
@@ -227,6 +274,8 @@ static void log_sleep_path(const std::vector<SleepCal> &sleeps, uint32_t cal_cou
 
     std::vector<double> all;
     std::vector<double> binned[BIN_N];
+    std::vector<double> hot_all;
+    std::vector<double> hot_binned[BIN_N];
     double weighted_sum = 0;
     double slept_sum = 0;
     double bin_slept[BIN_N] = {};
@@ -241,6 +290,11 @@ static void log_sleep_path(const std::vector<SleepCal> &sleeps, uint32_t cal_cou
             bin++;
         binned[bin].push_back(ppm);
         bin_slept[bin] += sleep.slept_us;
+        if (sleep.hot != 0 && sleep.period != 0) {
+            const double excess = ppm_vs(sleep.hot, sleep.period);
+            hot_all.push_back(excess);
+            hot_binned[bin].push_back(excess);
+        }
     }
 
     ESP_LOGW(TAG, "sleep path: %lu sleeps since last run (%lu timed by ESP-IDF's own calibration), last %u: "
@@ -257,6 +311,43 @@ static void log_sleep_path(const std::vector<SleepCal> &sleeps, uint32_t cal_cou
             continue;
         append(line, sizeof(line), &len, " %s %u %+.0f %.0f%%", BINS[i].name, static_cast<unsigned>(binned[i].size()), median_ppm(binned[i]),
                slept_sum > 0 ? 100.0 * bin_slept[i] / slept_sum : 0.0);
+    }
+    ESP_LOGW(TAG, "%s", line);
+
+    if (hot_all.empty())
+        return;
+    // How much slower RTC_SLOW reads where ESP-IDF calibrates it, at sleep entry, than the cold
+    // value that timed the sleep: the temperature the die still carries from the activity just
+    // before, and so the size of what a cooling-curve trim would have to correct for.
+    len = 0;
+    append(line, sizeof(line), &len, "hot vs cold at sleep entry: median %+.0f ppm (n %u) | by awake time:",
+           median_ppm(hot_all), static_cast<unsigned>(hot_all.size()));
+    for (size_t i = 0; i < BIN_N; i++) {
+        if (hot_binned[i].empty())
+            continue;
+        append(line, sizeof(line), &len, " %s %u %+.0f", BINS[i].name, static_cast<unsigned>(hot_binned[i].size()),
+               median_ppm(hot_binned[i]));
+    }
+    ESP_LOGW(TAG, "%s", line);
+}
+
+// The cold calibrations since the last run, averaged per length of the sleep they ended. If the
+// die's cooling is resolvable at all against the ~920 ppm a single calibration scatters by, it
+// shows up here as the short bins reading slower (more negative) than the long ones.
+static void log_cooling_curve(const CoolSum (&cool)[COOL_BIN_N], uint32_t cold_count,
+                              uint32_t taken_count, double settled)
+{
+    char line[320];
+    size_t len = 0;
+    append(line, sizeof(line), &len, "cooling curve: %lu cold calibrations since last run (%lu into the ring) "
+                                     "| by sleep length (n, mean ppm vs settled):",
+           static_cast<unsigned long>(cold_count), static_cast<unsigned long>(taken_count));
+    for (size_t i = 0; i < COOL_BIN_N; i++) {
+        if (cool[i].count == 0)
+            continue;
+        const double mean = static_cast<double>(cool[i].period_sum) / cool[i].count;
+        append(line, sizeof(line), &len, " %s %lu %+.0f", COOL_BINS[i].name,
+               static_cast<unsigned long>(cool[i].count), ppm_vs(mean, settled));
     }
     ESP_LOGW(TAG, "%s", line);
 }
@@ -323,12 +414,21 @@ static void run_once()
     // No light sleep happened during the run, so the ring holds the sleeps just before it.
     std::vector<SleepCal> sleeps;
     sleeps.reserve(SLEEP_RING_SIZE);
+    CoolSum cool[COOL_BIN_N];
     portENTER_CRITICAL(&s_sleep_cal_mux);
     const uint32_t head = s_sleep_ring_head;
     const uint32_t cal_count = s_sleep_cal_count;
     const uint32_t measured_count = s_sleep_measured_count;
+    const uint32_t cold_count = s_cold_cal_count;
+    const uint32_t cold_taken = s_cold_taken_count;
     s_sleep_cal_count = 0;
     s_sleep_measured_count = 0;
+    s_cold_cal_count = 0;
+    s_cold_taken_count = 0;
+    for (size_t i = 0; i < COOL_BIN_N; i++) {
+        cool[i] = s_cool[i];
+        s_cool[i] = CoolSum{};
+    }
     for (uint32_t i = head - std::min(head, SLEEP_RING_SIZE); i < head; i++)
         sleeps.push_back(s_sleep_ring[i % SLEEP_RING_SIZE]);
     portEXIT_CRITICAL(&s_sleep_cal_mux);
@@ -364,6 +464,7 @@ static void run_once()
     log_timeline(timeline_count, settled, awake_before_ms);
     log_bias(bias);
     log_sleep_path(sleeps, cal_count, measured_count, settled, in_use);
+    log_cooling_curve(cool, cold_count, cold_taken, settled);
 }
 
 static void rtc_cal_diag_task(void *)
@@ -392,6 +493,7 @@ esp_err_t rtc_cal_diag_start()
     if (err != ESP_OK)
         return err;
     rtc_clock_fix_set_sleep_cal_observer(on_sleep_cal);
+    rtc_clock_fix_set_cold_cal_observer(on_cold_cal);
     // Lowest priority above idle: the measurement busy-waits (~2 s per run) and must never hold
     // up OpenThread or the sensor/MQTT tasks; being preempted only stretches it.
     if (xTaskCreate(rtc_cal_diag_task, "rtc_cal_diag", 6144, nullptr, tskIDLE_PRIORITY + 1, nullptr) != pdPASS)
