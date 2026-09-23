@@ -56,5 +56,10 @@ void rtc_clock_fix_set_sleep_cal_observer(RtcSleepCalObserver observer);
 // `slept_us` the sleep it ended and `taken` whether it went into the ring. Registering an observer
 // also makes the callback calibrate after sleeps too short to be worth ringing, since those are
 // the ones that wake with the die still warm and so are what traces the curve.
+//
+// This callback is registered before any other light-sleep exit callback (see
+// rtc_clock_fix_start), so the observer runs before them: rtc_cal_diag relies on that to pair each
+// cold value with the sleep-entry calibration of the same sleep, which its own exit callback has
+// not yet retired.
 using RtcColdCalObserver = void (*)(int64_t slept_us, uint32_t cold, bool taken);
 void rtc_clock_fix_set_cold_cal_observer(RtcColdCalObserver observer);

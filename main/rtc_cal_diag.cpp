@@ -58,10 +58,12 @@ struct SleepCal {
     uint32_t slept_us;
 };
 
-// The cooling curve: cold calibrations from the light-sleep exit callback, summed per length of
-// the sleep they ended. A short sleep wakes with the die still warm from the activity before it,
-// a long one wakes at the asymptote, so the bins trace how fast the die cools -- which is what a
-// trim would need to know to correct the wake-moment calibration to the sleep's mean.
+// The cooling curve: every sleep sampled at both ends -- the sleep-entry calibration the wrap
+// takes and the cold one the exit callback takes -- summed per length of the sleep between them.
+// A short sleep wakes with the die still warm from the activity before it, a long one wakes
+// nearer the asymptote, so the bins trace how fast the die cools. Pairing the two ends is what
+// makes that readable: entry is the amplitude each sleep started from, so a bin gives a decay
+// ratio without having to assume every sleep was preceded by the same activity.
 struct CoolBin {
     const char *name;
     uint32_t below_us;
@@ -75,10 +77,14 @@ static constexpr CoolBin COOL_BINS[] = {
 static constexpr size_t COOL_BIN_N = sizeof(COOL_BINS) / sizeof(COOL_BINS[0]);
 
 // Sums, not a ring: the observer runs with interrupts off on a core without an FPU, so it may only
-// add integers. The task turns them into means.
+// add integers. The task turns them into means. The sleep length is summed too -- a bin spans up
+// to 2.5x and the widest one holds every CSL-idle sleep at ~490 ms, so its midpoint is nowhere
+// near where the samples in it actually sit.
 struct CoolSum {
     uint32_t count;
     uint64_t period_sum;
+    uint64_t hot_sum;
+    uint64_t us_sum;
 };
 
 // Written by the observer and the exit callback, both of which run with interrupts already off;
@@ -133,7 +139,11 @@ static IRAM_ATTR void on_sleep_cal(uint32_t used, uint32_t measured, bool cold)
 }
 
 // Called by rtc_clock_fix.cpp's light-sleep exit callback, once per sleep, with interrupts off.
-// Only sums, so no floating point and nothing that could block.
+// That callback is registered before this file's own one below, and esp_pm runs equal priorities
+// in registration order (pm_impl.c: a new entry is inserted after the ones already at its
+// priority), so the ring's newest entry is still the sleep that just ended and its sleep-entry
+// calibration is the other end of this sleep's cooling. Only sums, so no floating point and
+// nothing that could block.
 static void on_cold_cal(int64_t slept_us, uint32_t cold, bool taken)
 {
     const uint32_t slept = clamp_us(slept_us);
@@ -141,11 +151,19 @@ static void on_cold_cal(int64_t slept_us, uint32_t cold, bool taken)
     while (bin + 1 < COOL_BIN_N && slept >= COOL_BINS[bin].below_us)
         bin++;
     portENTER_CRITICAL_SAFE(&s_sleep_cal_mux);
-    s_cool[bin].count++;
-    s_cool[bin].period_sum += cold;
     s_cold_cal_count++;
     if (taken)
         s_cold_taken_count++;
+    // Unpaired only before the very first sleep of a boot, or if the entry calibration failed:
+    // dropping those keeps a bin's three means over one and the same set of sleeps, and the count
+    // above still accounts for them.
+    const uint32_t hot = s_sleep_pending ? s_sleep_ring[(s_sleep_ring_head - 1) % SLEEP_RING_SIZE].hot : 0;
+    if (hot != 0) {
+        s_cool[bin].count++;
+        s_cool[bin].period_sum += cold;
+        s_cool[bin].hot_sum += hot;
+        s_cool[bin].us_sum += slept;
+    }
     portEXIT_CRITICAL_SAFE(&s_sleep_cal_mux);
 }
 
@@ -331,23 +349,31 @@ static void log_sleep_path(const std::vector<SleepCal> &sleeps, uint32_t cal_cou
     ESP_LOGW(TAG, "%s", line);
 }
 
-// The cold calibrations since the last run, averaged per length of the sleep they ended. If the
-// die's cooling is resolvable at all against the ~920 ppm a single calibration scatters by, it
-// shows up here as the short bins reading slower (more negative) than the long ones.
+// The sleeps since the last run, each sampled at both ends and averaged per its length. If the
+// die's cooling is resolvable at all against the ~880 ppm a single calibration scatters by, it
+// shows up here as the cold figure climbing towards the hot one as the bins get shorter.
+//
+// What the sleep path should have used is the mean period over the sleep, not the value at either
+// end of it. For a single exponential that mean is the asymptote plus the logarithmic mean of the
+// two excesses, (1 - r) / -ln r with r = (cold - asymptote) / (hot - asymptote): the time constant
+// cancels, so only the asymptote is left to fit. Sleeps here never reach it -- CSL caps them at
+// ~490 ms -- but every sleep that would need correcting is inside the range these bins cover.
 static void log_cooling_curve(const CoolSum (&cool)[COOL_BIN_N], uint32_t cold_count,
                               uint32_t taken_count, double settled)
 {
-    char line[320];
+    char line[512];
     size_t len = 0;
     append(line, sizeof(line), &len, "cooling curve: %lu cold calibrations since last run (%lu into the ring) "
-                                     "| by sleep length (n, mean ppm vs settled):",
+                                     "| by sleep length (n, mean sleep ms, cold, hot ppm vs settled):",
            static_cast<unsigned long>(cold_count), static_cast<unsigned long>(taken_count));
     for (size_t i = 0; i < COOL_BIN_N; i++) {
         if (cool[i].count == 0)
             continue;
-        const double mean = static_cast<double>(cool[i].period_sum) / cool[i].count;
-        append(line, sizeof(line), &len, " %s %lu %+.0f", COOL_BINS[i].name,
-               static_cast<unsigned long>(cool[i].count), ppm_vs(mean, settled));
+        const double n = cool[i].count;
+        append(line, sizeof(line), &len, " %s %lu %.1f %+.0f %+.0f", COOL_BINS[i].name,
+               static_cast<unsigned long>(cool[i].count), static_cast<double>(cool[i].us_sum) / n / 1000.0,
+               ppm_vs(static_cast<double>(cool[i].period_sum) / n, settled),
+               ppm_vs(static_cast<double>(cool[i].hot_sum) / n, settled));
     }
     ESP_LOGW(TAG, "%s", line);
 }

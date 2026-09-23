@@ -28,15 +28,20 @@
 //    each one timed;
 //  - how much slower RTC_SLOW reads at sleep entry, where ESP-IDF calibrates it, than the cold
 //    value that timed the sleep: the heat the die still carries from the activity just before;
-//  - the cooling curve: the cold calibrations averaged per length of the sleep they ended. While
-//    this diagnostic is registered the exit callback also calibrates after sleeps too short for
-//    the ring, and those are the ones that wake with the die still warm.
+//  - the cooling curve: every sleep sampled at both ends -- the calibration at its entry and the
+//    cold one at its wake -- averaged per length of the sleep between them, along with that mean
+//    length. While this diagnostic is registered the exit callback also calibrates after sleeps
+//    too short for the ring, and those are the ones that wake with the die still warm.
 //
 // The last two are for the open question of the -54 ppm the clock is still out by (2026-09-22
 // capture): that is the die being ~0.035 C warmer over the sleep on average than at the wake where
-// the calibration is taken. If the cooling curve resolves against the ~920 ppm a single
-// calibration scatters by, the device can fit its own time constant and correct for it with no
-// external reference -- the hot-vs-cold figure is the amplitude that correction would scale.
+// the calibration is taken. Pairing the two ends of each sleep is what makes the curve readable --
+// the entry value is the amplitude that sleep started cooling from, so the bins give a decay
+// ratio instead of mixing amplitude with decay. And the correction the device would apply needs
+// no time constant at all: for a single exponential the sleep's mean period is the asymptote plus
+// the logarithmic mean of the two excesses, and the time constant cancels (see log_cooling_curve
+// in the .cpp). So the curve is here to show whether one exponential describes it, and what the
+// asymptote is, with no external time reference.
 //
 // 2026-09-22 results: the 10-cycle calibration is exact; RTC_SLOW slows right after activity,
 // which is what rtc_clock_fix.h fixes. Delete this module and its call in main.cpp once that fix
