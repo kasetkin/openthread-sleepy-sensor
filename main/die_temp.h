@@ -4,7 +4,7 @@
 #include <optional>
 
 // The ESP32-C6's own on-die temperature sensor, for the light-sleep clock work: RTC_SLOW (the
-// internal RC every light sleep is timed with) moves ~1900 ppm per degree, so the die's
+// internal RC every light sleep is timed with) moves ~1540 ppm per degree, so the die's
 // temperature is what the clock's error should follow -- the SHT4x reads the air instead.
 struct DieTemp {
     // The driver's calibrated reading, averaged over the samples. The driver truncates each

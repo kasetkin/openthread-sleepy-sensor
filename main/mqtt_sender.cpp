@@ -415,17 +415,19 @@ static constexpr size_t MAX_UPDATE_DISCOVERY_TOPIC_LEN =
 static constexpr size_t MAX_STATE_TOPIC_LEN = STATE_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 static constexpr size_t MAX_BACKFILL_TOPIC_LEN = BACKFILL_TOPIC_FMT.size() + MAX_DEVICE_ID_LEN;
 
-// Longest HA entity `name` among the 10 `number` + 1 `switch` config entities (see the
+// Longest HA entity `name` among the 11 `number` + 1 `switch` config entities (see the
 // publish_number_discoveries()/publish_switch_discovery() call sites below).
 static constexpr size_t MAX_CFG_NAME_LEN = std::max({sizeof("Temperature offset"), sizeof("Temperature min change"),
     sizeof("Humidity offset"), sizeof("Humidity min change"), sizeof("Max publish gap"),
     sizeof("Heater period"), sizeof("Heater high-RH trigger"), sizeof("External antenna"),
-    sizeof("TX power"), sizeof("Sensor samples"), sizeof("Sleep clock cal mode")}) - 1;
-// Longest of the 11 cfg/* topic suffixes (runtime_config.h).
+    sizeof("TX power"), sizeof("Sensor samples"), sizeof("Sleep clock cal samples"),
+    sizeof("Sleep clock cal period")}) - 1;
+// Longest of the 12 cfg/* topic suffixes (runtime_config.h).
 static constexpr size_t MAX_CFG_SUFFIX_LEN = std::max({CFG_SUFFIX_TEMP_OFFSET.size(), CFG_SUFFIX_TEMP_MIN_CHANGE.size(),
     CFG_SUFFIX_RH_OFFSET.size(), CFG_SUFFIX_RH_MIN_CHANGE.size(), CFG_SUFFIX_MAX_PUBLISH_GAP_SEC.size(),
     CFG_SUFFIX_HEATER_PERIOD_MIN.size(), CFG_SUFFIX_HEATER_HIGH_RH_MIN.size(), CFG_SUFFIX_EXT_ANTENNA.size(),
-    CFG_SUFFIX_TX_POWER_DBM.size(), CFG_SUFFIX_SENSOR_SAMPLES.size(), CFG_SUFFIX_RTC_CAL_MODE.size()});
+    CFG_SUFFIX_TX_POWER_DBM.size(), CFG_SUFFIX_SENSOR_SAMPLES.size(), CFG_SUFFIX_RTC_CAL_SAMPLES.size(),
+    CFG_SUFFIX_RTC_CAL_PERIOD_SEC.size()});
 // Full "<device_id>/cfg/<suffix>" topic, interpolated 2x into CMD_PART_TAIL (state + command).
 static constexpr size_t MAX_CFG_TOPIC_LEN = MAX_DEVICE_ID_LEN + 1 /* '/' */ + MAX_CFG_SUFFIX_LEN;
 // unique_id's slug half -- the bare key name (suffix minus the "cfg/" segment).
@@ -914,7 +916,22 @@ static void retire_old_battery_adc_time_discovery(esp_mqtt_client_handle_t clien
     esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 1, 1);
 }
 
-// Issues all 10 publish_number_discovery() calls -- the ONE place these entities' HA-visible
+// Retires the "Sleep clock cal mode" HA entity (cfg/rtc_cal_mode: 0 = ESP-IDF, 1 = latest cold
+// calibration, 2 = mean of the cold ones), replaced by "Sleep clock cal samples" (0 = ESP-IDF,
+// N = mean of the last N) -- and its retained value with it, which the cfg/# subscription would
+// otherwise keep handing back every wake. Same empty-retained-payload removal as above, but at
+// QoS 0: nothing waits for these, and a PUBACK here would count towards the discovery ACKs the
+// cycle does wait for (the two helpers above publish at QoS 1 without being counted).
+static void retire_old_rtc_cal_mode(esp_mqtt_client_handle_t client, std::string_view device_id)
+{
+    std::array<char, TOPIC_BUF> topicBuf;
+    if (format_into(topicBuf, NUMBER_DISCOVERY_TOPIC_FMT, device_id, "rtc_cal_mode") != 0)
+        esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 0, 1);
+    if (format_into(topicBuf, "{}/cfg/rtc_cal_mode", device_id) != 0)
+        esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 0, 1);
+}
+
+// Issues all 11 publish_number_discovery() calls -- the ONE place these entities' HA-visible
 // names/units/ranges are decided; ranges come straight from runtime_config.h so the clamp
 // applied on the device side can never drift from what HA's UI advertises. Current values come
 // from runtime_config_current_values(), fetched once here. NUMBER_ENTITY_COUNT below must track
@@ -951,11 +968,15 @@ static void publish_number_discoveries(esp_mqtt_client_handle_t client, std::str
     publish_number_discovery(client, device_id, device_name, "Sensor samples", "sensor_samples",
         runtime_config_topic_sensor_samples(), SENSOR_SAMPLES_MIN, SENSOR_SAMPLES_MAX,
         SENSOR_SAMPLES_STEP, nullptr, cur.sensor_samples);
-    publish_number_discovery(client, device_id, device_name, "Sleep clock cal mode", "rtc_cal_mode",
-        runtime_config_topic_rtc_cal_mode(), RTC_CAL_MODE_MIN, RTC_CAL_MODE_MAX, RTC_CAL_MODE_STEP,
-        nullptr, cur.rtc_cal_mode);
+    publish_number_discovery(client, device_id, device_name, "Sleep clock cal samples", "rtc_cal_samples",
+        runtime_config_topic_rtc_cal_samples(), RTC_CAL_SAMPLES_MIN, RTC_CAL_SAMPLES_MAX,
+        RTC_CAL_SAMPLES_STEP, nullptr, cur.rtc_cal_samples);
+    publish_number_discovery(client, device_id, device_name, "Sleep clock cal period", "rtc_cal_period_sec",
+        runtime_config_topic_rtc_cal_period_sec(), RTC_CAL_PERIOD_SEC_MIN, RTC_CAL_PERIOD_SEC_MAX,
+        RTC_CAL_PERIOD_SEC_STEP, "s", cur.rtc_cal_period_sec);
 
     retire_old_max_skip_cycles_discovery(client, device_id);
+    retire_old_rtc_cal_mode(client, device_id);
 }
 
 // How many HA `number` entities publish_number_discoveries() above issues -- must track that
@@ -963,7 +984,7 @@ static void publish_number_discoveries(esp_mqtt_client_handle_t client, std::str
 // DISC_NUMBERS ACK-counting site below (run_publish_cycle()'s discovery_msgs computation) so
 // the next entity added to that function only needs to update this one number, not hunt down a
 // magic-number ACK count that silently desyncs BIT_ALL_ACKED if missed.
-static constexpr int NUMBER_ENTITY_COUNT = 10;
+static constexpr int NUMBER_ENTITY_COUNT = 11;
 static constexpr int NUMBER_ENTITY_MSGS = NUMBER_ENTITY_COUNT * 2;  // discovery config + current-value state, each
 
 // The ext_antenna HA `switch` entity's discovery config -- same state_topic==command_topic

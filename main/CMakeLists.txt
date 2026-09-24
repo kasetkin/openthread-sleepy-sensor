@@ -8,7 +8,6 @@ set(srcs
   ota_updater.cpp
   runtime_config.cpp
   hp_awake_stats.cpp
-  rtc_cal_diag.cpp
   rtc_clock_fix.cpp
   die_temp.cpp
   net/network_link.cpp
@@ -40,5 +39,4 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE
 
 # Fix for the device clock running fast in light sleep: hands ESP-IDF's light-sleep path an RTC_SLOW
 # calibration taken right after the previous wake instead of at sleep entry -- see rtc_clock_fix.h.
-# rtc_cal_diag.cpp observes it. Remove together with that module.
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=rtc_clk_cal")

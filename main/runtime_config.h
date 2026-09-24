@@ -7,6 +7,7 @@
 #include "mqtt_client.h"
 #include "lp_sensor_core.h"
 #include "network_link.h"
+#include "rtc_clock_fix.h"
 
 // HA-tunable device parameters over MQTT, applied without a reflash. Split of responsibilities
 // with mqtt_sender.cpp (which owns the per-cycle client), mirroring ota_updater.h/.cpp's shape:
@@ -36,8 +37,9 @@ inline constexpr std::string_view CFG_SUFFIX_HEATER_HIGH_RH_MIN = "cfg/heater_hi
 inline constexpr std::string_view CFG_SUFFIX_EXT_ANTENNA        = "cfg/ext_antenna";
 inline constexpr std::string_view CFG_SUFFIX_TX_POWER_DBM       = "cfg/tx_power_dbm";
 inline constexpr std::string_view CFG_SUFFIX_SENSOR_SAMPLES     = "cfg/sensor_samples";
-inline constexpr std::string_view CFG_SUFFIX_RTC_CAL_MODE       = "cfg/rtc_cal_mode";
-// One SUBSCRIBE for all 11 topics, not one per topic -- minimizes SUBSCRIBE-packet overhead in
+inline constexpr std::string_view CFG_SUFFIX_RTC_CAL_SAMPLES    = "cfg/rtc_cal_samples";
+inline constexpr std::string_view CFG_SUFFIX_RTC_CAL_PERIOD_SEC = "cfg/rtc_cal_period_sec";
+// One SUBSCRIBE for all 12 topics, not one per topic -- minimizes SUBSCRIBE-packet overhead in
 // the brief per-cycle awake window (see run_publish_cycle()'s existing manifest/install subscribes).
 inline constexpr std::string_view CFG_SUFFIX_WILDCARD           = "cfg/#";
 
@@ -91,11 +93,13 @@ inline constexpr int8_t TX_POWER_TABLE_MAX_DBM = 20;
 inline constexpr uint32_t SENSOR_SAMPLES_MIN = 1;
 inline constexpr uint32_t SENSOR_SAMPLES_MAX = 16;
 inline constexpr uint32_t SENSOR_SAMPLES_STEP = 1;
-// Which RTC_SLOW calibration times each light sleep (rtc_clock_fix.h), live from the next sleep:
-// 0 = ESP-IDF's own at sleep entry, 1 = the latest cold one, 2 = the mean of the last 32 cold ones.
-inline constexpr uint32_t RTC_CAL_MODE_MIN = 0;
-inline constexpr uint32_t RTC_CAL_MODE_MAX = 2;
-inline constexpr uint32_t RTC_CAL_MODE_STEP = 1;
+// The light-sleep clock (rtc_clock_fix.h), both live: how many cold calibrations the sleep path
+// averages (0 = ESP-IDF's own) from its next sleep, and how often the status task wakes the core,
+// in seconds (0 = never, 1..29 are raised to 30). Maximums and clamping live in rtc_clock_fix.h.
+inline constexpr uint32_t RTC_CAL_SAMPLES_MIN = 0;
+inline constexpr uint32_t RTC_CAL_SAMPLES_STEP = 1;
+inline constexpr uint32_t RTC_CAL_PERIOD_SEC_MIN = 0;
+inline constexpr uint32_t RTC_CAL_PERIOD_SEC_STEP = 30;
 
 // Call once from main.cpp, right after lp_sensor_core_start() succeeds. `boot_config` seeds
 // this module's shadow of the 8 numeric fields (lp_sensor_core_apply_config() always writes
@@ -138,7 +142,8 @@ struct RuntimeConfigValues
     bool ext_antenna_on;
     int32_t tx_power_dbm;
     uint32_t sensor_samples;
-    uint32_t rtc_cal_mode;
+    uint32_t rtc_cal_samples;
+    uint32_t rtc_cal_period_sec;
 };
 RuntimeConfigValues runtime_config_current_values();
 
@@ -154,7 +159,8 @@ const char *runtime_config_topic_heater_high_rh_trigger_minutes();
 const char *runtime_config_topic_ext_antenna();
 const char *runtime_config_topic_tx_power_dbm();
 const char *runtime_config_topic_sensor_samples();
-const char *runtime_config_topic_rtc_cal_mode();
+const char *runtime_config_topic_rtc_cal_samples();
+const char *runtime_config_topic_rtc_cal_period_sec();
 
 // ── TX power (Phase B) ──────────────────────────────────────────────────────────────────────
 // A tx_power_dbm value low enough to break the uplink would strand the device (its only

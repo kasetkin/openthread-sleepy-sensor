@@ -78,6 +78,18 @@ tx_power_dbm: "20"
 # Not MQTT tunable.
 csl_period_ms: "0"
 
+# Light-sleep clock: RTC_SLOW, the internal RC oscillator every light sleep is timed with, runs
+# ~1540 ppm slower per degree the die warms, and ESP-IDF measures it at sleep entry, right after
+# whatever woke the core -- which left the clock ~700 ppm fast. rtc_cal_samples averages that many
+# calibrations taken instead right after each wake, while the die is still cold; "0" keeps
+# ESP-IDF's own. 0 to 32. rtc_cal_period_sec is how often, in seconds, a status line with the die
+# temperature and the calibrations is logged -- and each of those is a wake, so a calibration, at
+# least that often. "0" = off; 30 to 3600. See main/rtc_clock_fix.h.
+# MQTT tunable: <device_id>/cfg/rtc_cal_samples
+rtc_cal_samples: "8"
+# MQTT tunable: <device_id>/cfg/rtc_cal_period_sec
+rtc_cal_period_sec: "300"
+
 # Battery measurement. When "true", the HP core reads the battery voltage on GPIO2 (through the
 # resistor divider below) right before each publish and adds it to the MQTT state message;
 # readings never trigger a publish by themselves. Only the literal strings "true"/"false" are

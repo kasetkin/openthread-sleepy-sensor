@@ -137,6 +137,8 @@ survives a power cycle.
 | Heater high-RH trigger | `heater_high_rh_trigger_minutes` | 0 .. 1440 min |
 | Sensor samples | `sensor_samples` | 1 .. 16 |
 | External antenna | *(no YAML key — HA/NVS only)* | on/off |
+| Sleep clock cal samples | `rtc_cal_samples` | 0 .. 32 (0 = ESP-IDF's own) |
+| Sleep clock cal period | `rtc_cal_period_sec` | 0 (off), 30 .. 3600 s |
 
 Each entity is backed by one retained MQTT topic, `<device_id>/cfg/<name>` (see
 [runtime_config.h](main/runtime_config.h) for the exact contract), which the device subscribes
@@ -151,6 +153,9 @@ The first 8 rows go straight into the LP core's shared-memory config block (the 
 core's very next wake. The external antenna switch is a GPIO-level analog RF-switch selection
 ([common_utils.h](main/common_utils.h)'s `enableExtAntenna()`) — also applied immediately, no
 reboot, since the switch is transparent to everything above the radio's physical layer.
+The two sleep-clock rows change how the HP core times its light sleeps
+([rtc_clock_fix.h](main/rtc_clock_fix.h)): the sample count from the very next sleep, the status
+period from the next status wake.
 
 Precedence at boot is **NVS override (if HA has ever set one) → `device_config.yaml` → compiled
 default** — editing `device_config.yaml` still works exactly as before for a device that has

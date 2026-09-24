@@ -17,7 +17,6 @@
 #include "mqtt_sender.h"
 #include "runtime_config.h"
 #include "hp_awake_stats.h"
-#include "rtc_cal_diag.h"
 #include "rtc_clock_fix.h"
 
 #include "esp_event.h"
@@ -221,17 +220,15 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(enableAutomaticLightSleep());
     // The light-sleep clock fix (see rtc_clock_fix.h). Started ahead of every other light-sleep
     // exit callback so its wake-time calibration is the first thing after each wake. A failure
-    // leaves ESP-IDF's own calibration in charge, i.e. today's fast clock, so it's logged, not fatal.
-    if (const esp_err_t err = rtc_clock_fix_start(runtime_config_nvs_override(
-            parse_as_uint32_or(device_config_yaml(), "rtc_cal_mode", static_cast<uint32_t>(RtcCalMode::ColdMean)),
-            "rtc_cal_mode")); err != ESP_OK)
+    // leaves ESP-IDF's own calibration in charge, i.e. the fast clock, so it's logged, not fatal.
+    const uint32_t rtc_cal_samples = runtime_config_nvs_override(
+        parse_as_uint32_or(device_config_yaml(), "rtc_cal_samples", RTC_CAL_SAMPLES_DEFAULT), "rtc_cal_samples");
+    const uint32_t rtc_cal_period_sec = runtime_config_nvs_override(
+        parse_as_uint32_or(device_config_yaml(), "rtc_cal_period_sec", RTC_CAL_PERIOD_SEC_DEFAULT), "rtc_cal_per_s");
+    if (const esp_err_t err = rtc_clock_fix_start(rtc_cal_samples, rtc_cal_period_sec); err != ESP_OK)
         ESP_LOGW("main", "rtc_clock_fix_start failed: %s", esp_err_to_name(err));
     // Sleep time before this point is untracked -- same ordering constraint as the call above.
     ESP_ERROR_CHECK(hp_awake_stats_init());
-    // Diagnostic for the device clock running fast in light sleep -- see rtc_cal_diag.h. Only
-    // logs, so a failure to start it must not stop the device.
-    if (const esp_err_t err = rtc_cal_diag_start(); err != ESP_OK)
-        ESP_LOGW("main", "rtc_cal_diag_start failed: %s", esp_err_to_name(err));
 
     // ── parse secrets ─────────────────────────────────────────────────────────
     const std::string_view yaml = secrets_yaml();
