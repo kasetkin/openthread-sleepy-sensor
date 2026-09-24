@@ -203,10 +203,14 @@ static void log_status()
                  period_khz(stored));
         return;
     }
+    // The ppm is of the two frequencies it follows, not of their periods, so a faster last reads
+    // positive.
+    const double last_khz = period_khz(last);
+    const double mean_khz = period_khz(mean);
     ESP_LOGW(TAG, "status: die %.1f C (raw %.1f) | cold last %.3f kHz, mean of %lu %.3f kHz (%+.0f ppm), "
                   "%lu taken, %lu rejected, %lu restarts | %lu sleeps cold, %lu measured | stored %.3f kHz",
-             die ? die->celsius : NAN, die ? die->raw : NAN, period_khz(last), static_cast<unsigned long>(samples),
-             period_khz(mean), mean != 0 ? (static_cast<double>(last) / mean - 1.0) * 1e6 : 0.0,
+             die ? die->celsius : NAN, die ? die->raw : NAN, last_khz, static_cast<unsigned long>(samples),
+             mean_khz, last != 0 && mean != 0 ? (last_khz / mean_khz - 1.0) * 1e6 : 0.0,
              static_cast<unsigned long>(taken), static_cast<unsigned long>(rejected),
              static_cast<unsigned long>(restarts), static_cast<unsigned long>(sleeps_cold),
              static_cast<unsigned long>(sleeps_measured), period_khz(stored));
