@@ -46,9 +46,7 @@ NOT_A_NUMBER = ("unavailable", "unknown")
 
 # How long a held value stays credible. A chosen threshold, not a derived one: the safeguard
 # publish gap on this device is 304-326 s, so ~20x that is certainly a real gap rather than a
-# de-duplicated repeat. It matches the dropout cap power_model.arrhenius_multiplier() already
-# uses for the sibling problem, and keeping one number in the codebase is worth more than
-# deriving two. Do NOT read it as expire_after: that is 680 s and unrelated.
+# de-duplicated repeat. Do NOT read it as expire_after: that is 680 s and unrelated.
 MAX_HOLD_S = 7200.0
 
 # Cluster width for grouping the entities of one MQTT publish into one cycle. Measured, the whole
@@ -83,6 +81,7 @@ Series = namedtuple("Series", "name entity_id samples blackouts boundary_stamps 
 Export = namedtuple("Export", "path device_prefix series start end")
 Column = namedtuple("Column", "name values sampled held missing")
 CycleTable = namedtuple("CycleTable", "anchors columns epsilon_s max_hold_s")
+LinearFit = namedtuple("LinearFit", "slope intercept")
 Bootstrap = namedtuple("Bootstrap", "slope sigma half_width low high confidence block_hours "
                                     "replications blocks seed")
 
@@ -328,8 +327,7 @@ def dwell_weighted_mean(samples, max_dwell_s=MAX_HOLD_S):
     """Mean of a de-duplicated series weighted by how long each value STOOD, not by row count.
 
     An unweighted mean over-represents whatever changes fastest -- hot afternoons generate far
-    more rows than quiet nights. This is power_model.arrhenius_multiplier()'s weighting with the
-    Arrhenius part removed.
+    more rows than quiet nights.
     """
     weighted = 0.0
     total_s = 0.0
@@ -436,10 +434,44 @@ def ordinary_least_squares_slope(hours, values):
     return statistics.linear_regression(hours, values)
 
 
-def slope_block_bootstrap(hours, values, block_hours=BOOTSTRAP_BLOCK_HOURS,
+def weighted_least_squares_slope(hours, values, weights):
+    """Slope and intercept of a linear fit weighting each sample by `weights`.
+
+    Same normal equations as the unweighted fit with w_i folded into every sum, so passing equal
+    weights reproduces ordinary_least_squares_slope() exactly.
+
+    The reason this exists: Home Assistant de-duplicates unchanged values, so a row is emitted
+    when the value MOVES, and on this device the battery voltage moves with the diurnal
+    temperature swing. Rows are therefore ~4x denser at midday than before dawn, and an
+    unweighted fit silently weights the estimate toward whatever time of day is noisiest.
+    Weighting each sample by how long it STOOD is the continuous-time fit -- the same
+    reconstruction argument as forward-filling onto a cycle anchor, applied to a regression.
+
+    NB this de-biases the sampling, which is a small effect here (0.5 % on a nine-day window,
+    3 % on a two-day one). It does NOT remove the diurnal signal itself, which is a function of
+    time and survives any reweighting.
+    """
+    total_w = sum(weights)
+    if total_w <= 0.0:
+        raise ValueError("weights sum to zero -- every sample was dropped")
+    mean_x = sum(w * x for w, x in zip(weights, hours)) / total_w
+    mean_y = sum(w * y for w, y in zip(weights, values)) / total_w
+    covariance = sum(w * (x - mean_x) * (y - mean_y) for w, x, y in zip(weights, hours, values))
+    variance = sum(w * (x - mean_x) ** 2 for w, x in zip(weights, hours))
+    if variance <= 0.0:
+        raise ValueError("weighted x-variance is zero -- the window has no time span")
+    slope = covariance / variance
+    return LinearFit(slope=slope, intercept=mean_y - slope * mean_x)
+
+
+def slope_block_bootstrap(hours, values, weights=None, block_hours=BOOTSTRAP_BLOCK_HOURS,
                           replications=BOOTSTRAP_REPLICATIONS, confidence=BOOTSTRAP_CONFIDENCE,
                           seed=BOOTSTRAP_SEED):
-    """Confidence interval on an OLS slope by resampling residuals in whole blocks.
+    """Confidence interval on a least-squares slope by resampling residuals in whole blocks.
+
+    `weights` makes the fit -- point estimate AND every replication -- a weighted one. It must be
+    the SAME weighting the caller's headline slope uses: an interval computed on a different
+    estimator than the number it is quoted beside is not an interval on that number.
 
     Whole blocks because the residuals are strongly autocorrelated -- this pack's terminal voltage
     swings 20-24 mV every day with the enclosure temperature, against a 28 mV signal across nine
@@ -454,7 +486,12 @@ def slope_block_bootstrap(hours, values, block_hours=BOOTSTRAP_BLOCK_HOURS,
     Returns a Bootstrap. `half_width` is the half-width of the `confidence` interval, not a sigma;
     print it as an interval and name the confidence level.
     """
-    fit = ordinary_least_squares_slope(hours, values)
+    def refit(sample_values):
+        if weights is None:
+            return ordinary_least_squares_slope(hours, sample_values)
+        return weighted_least_squares_slope(hours, sample_values, weights)
+
+    fit = refit(values)
     residuals = [values[i] - (fit.intercept + fit.slope * hours[i]) for i in range(len(hours))]
 
     blocks = []
@@ -474,7 +511,7 @@ def slope_block_bootstrap(hours, values, block_hours=BOOTSTRAP_BLOCK_HOURS,
             resampled.extend(residuals[low:high])
         resampled = resampled[:len(hours)]
         shuffled = [fit.intercept + fit.slope * hours[i] + resampled[i] for i in range(len(hours))]
-        slopes.append(ordinary_least_squares_slope(hours, shuffled).slope)
+        slopes.append(refit(shuffled).slope)
     slopes.sort()
 
     tail = (1.0 - confidence) / 2.0

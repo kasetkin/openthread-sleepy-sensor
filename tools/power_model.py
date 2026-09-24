@@ -38,7 +38,6 @@ runtime by 7.6%), and the model now converts across the buck so its totals are b
 directly comparable with a decay measurement.
 """
 import argparse
-import math
 from collections import namedtuple
 
 # Per-cycle awake-phase durations (seconds) and currents (mA), current conditions (6 dBm TX).
@@ -331,21 +330,6 @@ def rail_to_battery_ua(rail_ua, efficiency=BUCK_EFFICIENCY, pack_voltage=None):
 # rest test (charge, disconnect the load, log open-circuit voltage for a week).
 SELF_DISCHARGE_PCT_PER_MONTH_AT_25C = None
 
-# Self-discharge follows Arrhenius kinetics -- leakage current doubles roughly every 15 K
-# (Sensirion-style "doubles per 10 K" rules of thumb are for other mechanisms; the
-# measured figure for Li-ion leakage is ~15 K). The device sits by a window, so its
-# temperature swings far more than a cupboard-mounted sensor would.
-SELF_DISCHARGE_DOUBLING_K = 15.0
-SELF_DISCHARGE_REFERENCE_C = 25.0
-
-# The SHT4x measures AIR, on the PCB; the cell is a ~45 g lump that damps and lags those
-# swings. Applying the Arrhenius weighting to raw air temperature therefore overstates the
-# excursions. One hour is a plausible first-order time constant for an 18650 in still air --
-# it is an assumption, not a measurement, and the weighting is only mildly sensitive to it
-# (the 2026-08-29->09-07 window's multiplier moves 0.928 -> 0.920 -> 0.910 for tau =
-# 0 / 1 / 2 h), so it does not need to be exact.
-BATTERY_THERMAL_TAU_H = 1.0
-
 
 def lp_active_time_s(sensor_samples):
     """Wall-clock time the LP core stays awake per poll for `sensor_samples` readings."""
@@ -416,52 +400,12 @@ def sensor_samples_extra_ua(sensor_samples, lp_poll_period_sec):
     return (LP_ACTIVE_CURRENT_UA - SLEEP_CURRENT_UA) * (duty(sensor_samples) - duty(1))
 
 
-def arrhenius_multiplier(samples, tau_h=BATTERY_THERMAL_TAU_H):
-    """Time-weighted self-discharge multiplier vs. a flat 25 C, from real temperature history.
-
-    `samples` is a chronological [(datetime, temp_c)] list -- e.g. the `_temperature` rows of
-    a Home Assistant export. Home Assistant de-duplicates unchanged values, so each sample is
-    weighted by its DWELL time (how long it stood before the next one), not counted once:
-    an unweighted mean over-represents hot afternoons, which generate far more samples than
-    quiet nights. On the 2026-08-29->09-07 window that distinction alone moves the mean from
-    24.5 C to 21.9 C.
-
-    Returns 1.0 for a pack held at exactly 25 C, >1 hotter, <1 cooler.
-
-    Because the weighting is convex, brief hot excursions cost more than their share of
-    wall-clock time -- the gap between this figure and a naive 2**((mean_T-25)/D) is about
-    +6% on that same window. Measured multipliers across five windows: 1.216, 1.209, 1.278,
-    1.033, 0.920 -- i.e. self-discharge really does vary ~40% window to window, but at a
-    2 %/month nominal that is only an ~31 uA swing against a ~650 uA spread in the measured
-    totals, so it is a refinement, not the explanation for that spread.
-    """
-    if len(samples) < 2:
-        return 1.0
-    weighted = 0.0
-    total_s = 0.0
-    smoothed = samples[0][1]
-    for (stamp, temp_c), (next_stamp, _) in zip(samples, samples[1:]):
-        dwell_s = (next_stamp - stamp).total_seconds()
-        # A gap this long means the export dropped out; carrying the old value across it
-        # would invent temperature history that was never recorded.
-        if not 0.0 < dwell_s < 7200.0:
-            continue
-        if tau_h > 0.0:
-            smoothed += (1.0 - math.exp(-(dwell_s / 3600.0) / tau_h)) * (temp_c - smoothed)
-        else:
-            smoothed = temp_c
-        weighted += 2.0 ** ((smoothed - SELF_DISCHARGE_REFERENCE_C) / SELF_DISCHARGE_DOUBLING_K) * dwell_s
-        total_s += dwell_s
-    return weighted / total_s if total_s else 1.0
-
-
-def self_discharge_ua(temperature_multiplier=1.0):
+def self_discharge_ua():
     """Pack self-discharge in uA, or 0.0 while SELF_DISCHARGE_PCT_PER_MONTH_AT_25C is None."""
     if SELF_DISCHARGE_PCT_PER_MONTH_AT_25C is None:
         return 0.0
     hours_per_month = 730.5
-    at_25c_ua = PACK_CAPACITY_MAH * SELF_DISCHARGE_PCT_PER_MONTH_AT_25C / 100.0 / hours_per_month * 1000.0
-    return at_25c_ua * temperature_multiplier
+    return PACK_CAPACITY_MAH * SELF_DISCHARGE_PCT_PER_MONTH_AT_25C / 100.0 / hours_per_month * 1000.0
 
 
 def model_avg_current_ua(window_s, tx_s, rx_s, cpu_s, cpu_current_ma=None, sensor_samples=1,
@@ -713,14 +657,14 @@ def print_regression_table():
 Budget = namedtuple("Budget", "cadence_s sensor_samples lp_poll_period_sec lp_poll_interval_sec "
                               "tx_power_dbm phase_times_s capacity_mah mid_ua low_ua high_ua "
                               "extra_ua tx_current_ma tx_spread_ma tx_spread_ua battery_ua "
-                              "board_ua device_ua self_discharge_ua temperature_multiplier "
+                              "board_ua device_ua self_discharge_ua "
                               "runtime_days measured_ua scaled_measured_ua residual_ua "
                               "residual_pct_per_month capacity_floors")
 
 CAPACITY_FLOOR_STEPS_PCT = (0.0, 0.35, 1.0, 2.0)
 
 
-def power_budget(cadence_s, sensor_samples=1, lp_poll_period_sec=None, temperature_multiplier=1.0,
+def power_budget(cadence_s, sensor_samples=1, lp_poll_period_sec=None,
                  capacity_mah=None, measured_ua=None, tx_power_dbm=None, phase_times_s=None):
     """Compute the whole budget and return it, printing nothing.
 
@@ -768,8 +712,7 @@ def power_budget(cadence_s, sensor_samples=1, lp_poll_period_sec=None, temperatu
         battery_ua=battery_ua,
         board_ua=BOARD_FIXED_UA,
         device_ua=device_ua,
-        self_discharge_ua=self_discharge_ua(temperature_multiplier),
-        temperature_multiplier=temperature_multiplier,
+        self_discharge_ua=self_discharge_ua(),
         runtime_days=runtime_days(mid, capacity_mah),
         measured_ua=measured_ua,
         scaled_measured_ua=scaled,
@@ -806,8 +749,7 @@ def print_budget(budget):
               "will read HIGHER than the figure above.")
     else:
         print(f"Pack self-discharge: {budget.self_discharge_ua:.1f} uA "
-              f"({SELF_DISCHARGE_PCT_PER_MONTH_AT_25C:.1f} %/month at 25 C "
-              f"x {budget.temperature_multiplier:.3f} temperature multiplier)")
+              f"({SELF_DISCHARGE_PCT_PER_MONTH_AT_25C:.1f} %/month at 25 C)")
         print(f"Device + self-discharge: {budget.mid_ua + budget.self_discharge_ua:.1f} uA "
               "(this is what a voltage-decay measurement should see)")
 
@@ -847,10 +789,10 @@ def print_budget(budget):
                   f"({(1 - floor_mah / PACK_CAPACITY_MAH) * 100:.1f} % degradation)")
 
 
-def summarize(cadence_s, sensor_samples=1, lp_poll_period_sec=None, temperature_multiplier=1.0,
+def summarize(cadence_s, sensor_samples=1, lp_poll_period_sec=None,
               capacity_mah=None, measured_ua=None, tx_power_dbm=None, phase_times_s=None):
     """Compute and print the budget. Thin wrapper; callers wanting the numbers use power_budget."""
-    budget = power_budget(cadence_s, sensor_samples, lp_poll_period_sec, temperature_multiplier,
+    budget = power_budget(cadence_s, sensor_samples, lp_poll_period_sec,
                           capacity_mah, measured_ua, tx_power_dbm, phase_times_s)
     print_budget(budget)
     return budget
@@ -912,9 +854,6 @@ def _build_parser():
     parser.add_argument("--measured", type=float, default=None, metavar="UA",
                         help="measured average current from a voltage-decay run, quoted at the "
                              "nominal capacity; enables the reconciliation block")
-    parser.add_argument("--temperature-multiplier", type=float, default=1.0, metavar="X",
-                        help="Arrhenius self-discharge multiplier vs 25 C, from "
-                             "arrhenius_multiplier() (default: %(default)s)")
     parser.add_argument("--list-tx-table", action="store_true",
                         help="print TX current for every integer dBm the runtime knob accepts, "
                              "with each row's provenance and interpolation-basis uncertainty, "
@@ -954,7 +893,6 @@ if __name__ == "__main__":
             cadence_s,
             sensor_samples=args.sensor_samples,
             lp_poll_period_sec=args.lp_poll_period,
-            temperature_multiplier=args.temperature_multiplier,
             capacity_mah=args.capacity,
             measured_ua=args.measured,
             tx_power_dbm=args.tx_power,

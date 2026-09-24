@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
+import battery_power_from_history as bp
 import ha_history as hh
 
 PREFIX = "sensor.test_device_"
@@ -303,6 +304,50 @@ class StatisticsTest(unittest.TestCase):
         samples.append((EPOCH + timedelta(seconds=10), 10.0))
         samples.append((EPOCH + timedelta(seconds=3610), 10.0))
         self.assertLess(hh.dwell_weighted_mean(samples), 11.0)
+
+    def test_equal_weights_reproduce_the_unweighted_fit(self):
+        """The identity that makes the weighted fit a generalisation rather than a new estimator."""
+        rng = random.Random(3)
+        hours = [i * 0.25 for i in range(400)]
+        values = [80.0 - 0.01 * h + rng.gauss(0.0, 0.4) for h in hours]
+        plain = hh.ordinary_least_squares_slope(hours, values)
+        weighted = hh.weighted_least_squares_slope(hours, values, [1.0] * len(hours))
+        self.assertAlmostEqual(plain.slope, weighted.slope, places=10)
+        self.assertAlmostEqual(plain.intercept, weighted.intercept, places=10)
+        # ... and any uniform scaling of the weights is the same fit again.
+        scaled = hh.weighted_least_squares_slope(hours, values, [7.5] * len(hours))
+        self.assertAlmostEqual(plain.slope, scaled.slope, places=10)
+
+    def test_weighting_recovers_a_slope_that_drifting_density_distorts(self):
+        """Dense sampling that MOVES through the diurnal phase is what actually biases a slope.
+
+        Note the "drifting" carefully: a density pattern identical every day biases the
+        INTERCEPT, not the slope, and both estimators recover the trend from it about equally.
+        The bias needs the dense hours to sit at the wobble's peak early in the window and at
+        its trough later, which is the real failure mode -- HA emits a row when the voltage
+        moves, and what makes it move drifts with the weather across a multi-day window.
+        """
+        import math as _math
+        truth = -0.02
+        hours = []
+        for day in range(10):
+            centre = 12.0 if day < 5 else 0.0        # peak early, trough late
+            hours.extend(day * 24.0 + centre + i * 0.05 for i in range(60))
+            hours.extend(day * 24.0 + h for h in (2.0, 6.0, 10.0, 14.0, 18.0, 22.0))
+        hours = sorted(h for h in hours if h >= 0.0)
+        values = [50.0 + truth * h + 2.0 * _math.sin(h / 24.0 * 2 * _math.pi) for h in hours]
+        plain = hh.ordinary_least_squares_slope(hours, values).slope
+        weighted = hh.weighted_least_squares_slope(hours, values, bp.dwell_weights(hours)).slope
+        self.assertLess(abs(weighted - truth), abs(plain - truth) / 3.0)
+
+    def test_bootstrap_weights_change_the_interval(self):
+        """A weighted point estimate must carry a weighted interval, not the unweighted one."""
+        rng = random.Random(5)
+        hours = [i * 0.1 for i in range(1200)]
+        values = [90.0 - 0.03 * h + rng.gauss(0.0, 0.6) for h in hours]
+        weights = [1.0 if i % 2 else 5.0 for i in range(len(hours))]
+        self.assertNotEqual(hh.slope_block_bootstrap(hours, values).slope,
+                            hh.slope_block_bootstrap(hours, values, weights).slope)
 
     def test_bootstrap_is_deterministic_and_brackets_the_slope(self):
         rng = random.Random(7)

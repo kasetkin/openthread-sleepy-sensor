@@ -30,7 +30,7 @@ from collections import namedtuple
 
 import ha_history as hh
 import power_model as pm
-from battery_power_from_history import PACK_ENERGY_MWH, decay_fit, voltage_to_percent
+from battery_power_from_history import decay_fit
 
 # The series that carry a fresh value most cycles. This tuple IS the cycle clock -- see the module
 # docstring. Guard-rail constants are read but never anchored on.
@@ -69,7 +69,7 @@ LpPeriod = namedtuple("LpPeriod", "raw_s corrected_s stall_s increments uncertai
                                   "interval_corrected_s")
 Measured = namedtuple("Measured", "ua half_width_ua confidence mean_v pct_delta hours bootstrap")
 Guard = namedtuple("Guard", "name ok fatal detail")
-Findings = namedtuple("Findings", "window phases safeguard lp measured multiplier sensor_samples "
+Findings = namedtuple("Findings", "window phases safeguard lp measured sensor_samples "
                                   "tx_power_dbm guards coverage")
 
 
@@ -237,8 +237,9 @@ def measured_current(export):
     """
     readings = hh.series_for(export, "voltage").samples
     decay = decay_fit(readings)
-    percents = [voltage_to_percent(value * 1000) for _, value in readings]
-    bootstrap = hh.slope_block_bootstrap(decay.hours, percents)
+    # The SAME dwell weights the point estimate used -- an interval computed on a different
+    # estimator than the number beside it is not an interval on that number.
+    bootstrap = hh.slope_block_bootstrap(decay.hours, decay.percents, decay.weights)
     per_pp = pm.PACK_CAPACITY_MAH * 1000.0 / 100.0
     return Measured(ua=decay.mean_ma * 1000.0, half_width_ua=bootstrap.half_width * per_pp,
                     confidence=bootstrap.confidence, mean_v=decay.mean_v,
@@ -360,14 +361,13 @@ def derive(export, epsilon_s=hh.CYCLE_EPSILON_S, max_hold_s=hh.MAX_HOLD_S,
         safeguard = safeguard._replace(k=exact_k)
 
     measured = measured_current(export)
-    multiplier = pm.arrhenius_multiplier(hh.series_for(export, "temperature").samples)
 
     extras = [("heater stall usable increments", stall_s is not None,
                f"{stall_n} increment(s) cleared mode + {HEATER_STALL_MARGIN_S:g} s"
                if stall_s is not None else "no increment's ending gap cleared the cut")]
     guards = check_guards(export, window, phases, lp, safeguard, extras)
     return Findings(window=window, phases=phases, safeguard=safeguard, lp=lp, measured=measured,
-                    multiplier=multiplier, sensor_samples=sensor_samples,
+                    sensor_samples=sensor_samples,
                     tx_power_dbm=tx_power_dbm, guards=guards, coverage=coverage_report(window))
 
 
@@ -395,7 +395,6 @@ def model_command_line(findings, basis="raw", capacity_mah=None):
         f"--tx-power {findings.tx_power_dbm:g}",
         f"--phase-times {tx_s:.5f},{rx_s:.5f},{cpu_s:.5f}",
         f"--measured {findings.measured.ua:.0f}",
-        f"--temperature-multiplier {findings.multiplier:.4f}",
     ]
     if capacity_mah:
         parts.append(f"--capacity {capacity_mah:.0f}")
@@ -508,8 +507,6 @@ def print_findings(findings, stream=sys.stdout):
     print(f"  from {measured.pct_delta:.2f} pp over {measured.hours:.2f} h at "
           f"{pm.PACK_CAPACITY_MAH:.0f} mAh; mean pack {measured.mean_v:.3f} V (reporting only)",
           file=stream)
-    print(f"  self-discharge temperature multiplier {findings.multiplier:.4f} "
-          f"(dwell-weighted, tau {pm.BATTERY_THERMAL_TAU_H:g} h)", file=stream)
     print(f"  operating point: sensor_samples {findings.sensor_samples}, "
           f"TX power {findings.tx_power_dbm:g} dBm", file=stream)
 
@@ -553,7 +550,6 @@ def report(findings, run_model=True, basis="raw", capacity_mah=None, forced=Fals
             findings.window.cadence_s,
             sensor_samples=findings.sensor_samples,
             lp_poll_period_sec=findings.lp.raw_s if basis == "raw" else findings.lp.corrected_s,
-            temperature_multiplier=findings.multiplier,
             capacity_mah=capacity_mah,
             measured_ua=findings.measured.ua,
             tx_power_dbm=findings.tx_power_dbm,

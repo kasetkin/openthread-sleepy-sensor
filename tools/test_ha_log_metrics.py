@@ -49,8 +49,9 @@ WINDOW_A = (
     Expect("stall_s", 96.0, 3.0, "abs", "kRhSettleMs 90 s + ~3 x kCooldownPollMs 2 s"),
     Expect("outlier_count", 15, 0, "exact", "hp_awake_time > 5 s"),
     Expect("outlier_s", 297.8, 1.0, "abs", "9.1 % of all HP-awake time"),
-    Expect("multiplier", 0.9195, 0.001, "abs", "arrhenius_multiplier docstring's 0.920"),
-    Expect("measured_ua", 600.0, 1.0, "abs", "charge-correct; battery%-direct fit gives 600.2"),
+    Expect("measured_ua", 594.6, 1.0, "abs",
+           "dwell-weighted 2026-09-10 (was 600.0 unweighted, -0.90 %); the independent "
+           "battery%-direct fit tracks it to 594.8"),
     Expect("sensor_samples", 4, 0, "exact", "number.*_sensor_samples, flat"),
     Expect("tx_power_dbm", 20.0, 0, "exact", "tx_power_active, flat"),
     Expect("model_mid_ua", 494.5, 0.05, "abs", "power_model REGRESSION_TABLE window A row"),
@@ -77,8 +78,9 @@ WINDOW_B = (
     Expect("stall_s", 97.0, 3.0, "abs", "agrees with window A to 1 s at a different LP period"),
     Expect("outlier_count", 3, 0, "exact", "one is the 79.5 s outage-recovery cycle"),
     Expect("outlier_s", 91.4, 1.0, "abs", "3.3 % of all HP-awake time"),
-    Expect("multiplier", 1.0327, 0.001, "abs", "arrhenius_multiplier docstring's 1.033"),
-    Expect("measured_ua", 1253.4, 1.0, "abs", "charge-correct; printed 1168.6 before the fix"),
+    Expect("measured_ua", 1259.1, 1.0, "abs",
+           "dwell-weighted 2026-09-10 (was 1253.4 unweighted, +0.45 %); the independent "
+           "battery%-direct fit tracks it to 1258.8"),
     Expect("sensor_samples", 16, 0, "exact", "number.*_sensor_samples, flat"),
     Expect("tx_power_dbm", 20.0, 0, "exact", "tx_power_active, flat"),
     Expect("model_mid_ua", 1011.6, 0.05, "abs", "power_model REGRESSION_TABLE window B row"),
@@ -91,7 +93,7 @@ def measure(path):
     findings = hlm.derive(hh.load_export(path))
     tx_s, rx_s, cpu_s = hlm.model_phase_times(findings)
     budget = pm.power_budget(findings.window.cadence_s, findings.sensor_samples,
-                             findings.lp.raw_s, findings.multiplier, None,
+                             findings.lp.raw_s, None,
                              findings.measured.ua, findings.tx_power_dbm,
                              (tx_s, rx_s, cpu_s))
     return findings, {
@@ -113,7 +115,6 @@ def measure(path):
         "stall_s": findings.lp.stall_s,
         "outlier_count": findings.phases.outlier_count,
         "outlier_s": findings.phases.outlier_s,
-        "multiplier": findings.multiplier,
         "measured_ua": findings.measured.ua,
         "sensor_samples": findings.sensor_samples,
         "tx_power_dbm": findings.tx_power_dbm,
