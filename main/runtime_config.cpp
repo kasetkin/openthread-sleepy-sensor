@@ -66,14 +66,22 @@ static uint32_t s_tx_power_unconfirmed_cycles = 0;
 // attach (see runtime_config_tx_power_note_first_attach()), independent of any persisted state.
 static int8_t s_tx_power_active_dbm = TX_POWER_TABLE_MAX_DBM;
 static bool s_tx_power_first_attach_done = false;
+// The TX power that last failed its trial, or was left unconfirmed by a previous boot, until a
+// different one is tried. The broker goes on serving it -- every wake's cfg/# subscribe hands it
+// back -- until an echo of the value in effect replaces it, and trying it again each time would
+// turn the revert into an endless trial/revert loop.
+static int8_t s_tx_power_rejected = 0;
+static bool s_tx_power_has_rejected = false;
 // Deliberately shorter than UNCONFIRMED_OTA_REBOOT_AFTER_CYCLES (5, sensorstask.h): a bad TX
 // power is higher-severity than an unconfirmed OTA image -- no reboot/rollback fixes it, only
 // physical access does -- so the grace window should be the tighter of the two.
 static constexpr uint32_t TX_POWER_REVERT_AFTER_CYCLES = 3;
 
-// Every value HA has sent since the last runtime_config_apply_pending() call, guarded by
-// s_mutex. Mirrors ota_updater.cpp's Manifest/s_mutex pattern: the event-handler-context
-// writer takes the mutex only for a fast, non-blocking struct copy.
+// Every value received since the last runtime_config_apply_pending() call, as received (clamping
+// happens there), guarded by s_mutex. Mostly NOT changes: every wake's cfg/# subscribe hands back
+// all the retained values, and the device receives its own echoes too -- apply_pending() sorts out
+// which ones differ from what's in effect. Mirrors ota_updater.cpp's Manifest/s_mutex pattern: the
+// event-handler-context writer takes the mutex only for a fast, non-blocking struct copy.
 struct PendingCfg
 {
     bool temp_offset_set = false;
@@ -101,6 +109,20 @@ struct PendingCfg
     uint32_t sensor_samples = 0;
     uint32_t rtc_cal_samples = 0;
     uint32_t rtc_cal_period_sec = 0;
+
+    // Only on apply_pending()'s own copy, after settle(): what to re-publish on the topic.
+    bool temp_offset_echo = false;
+    bool temp_min_change_echo = false;
+    bool rh_offset_echo = false;
+    bool rh_min_change_echo = false;
+    bool max_publish_gap_sec_echo = false;
+    bool heater_period_echo = false;
+    bool heater_high_rh_echo = false;
+    bool ext_antenna_echo = false;
+    bool tx_power_dbm_echo = false;
+    bool sensor_samples_echo = false;
+    bool rtc_cal_samples_echo = false;
+    bool rtc_cal_period_sec_echo = false;
 };
 static PendingCfg s_pending;
 static SemaphoreHandle_t s_mutex = nullptr;
@@ -127,6 +149,19 @@ static bool parse_int32(const char *data, size_t len, int32_t &out)
 {
     const auto [ptr, ec] = std::from_chars(data, data + len, out);
     return ec == std::errc{} && ptr == data + len;
+}
+
+// One received value against `current`, the one in effect. Received exactly that: nothing to do,
+// the broker already holds it. Received something else: echo the clamped value, so the broker and
+// HA's display end up holding what the device actually uses -- and if the clamped value differs
+// too, apply and persist it (`set` stays true). `value` becomes the clamped value. Returns `echo`.
+template <typename T>
+static bool settle(bool &set, bool &echo, T &value, T clamped, T current)
+{
+    echo = value != current;
+    set = clamped != current;
+    value = clamped;
+    return echo;
 }
 
 // device_config.yaml expresses the heater schedule in wall-clock minutes; the LP program
@@ -239,7 +274,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         float v;
         if (!parse_float(data, data_len, v))
             return;
-        v = std::clamp(v, TEMP_OFFSET_MIN, TEMP_OFFSET_MAX);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.temp_offset_c = v;
         s_pending.temp_offset_set = true;
@@ -248,7 +282,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         float v;
         if (!parse_float(data, data_len, v))
             return;
-        v = std::clamp(v, TEMP_MIN_CHANGE_MIN, TEMP_MIN_CHANGE_MAX);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.temp_min_change_c = v;
         s_pending.temp_min_change_set = true;
@@ -257,7 +290,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         float v;
         if (!parse_float(data, data_len, v))
             return;
-        v = std::clamp(v, RH_OFFSET_MIN, RH_OFFSET_MAX);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.rh_offset_pct = v;
         s_pending.rh_offset_set = true;
@@ -266,7 +298,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         float v;
         if (!parse_float(data, data_len, v))
             return;
-        v = std::clamp(v, RH_MIN_CHANGE_MIN, RH_MIN_CHANGE_MAX);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.rh_min_change_pct = v;
         s_pending.rh_min_change_set = true;
@@ -275,7 +306,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         uint32_t v;
         if (!parse_uint32(data, data_len, v))
             return;
-        v = std::clamp(v, MAX_PUBLISH_GAP_SEC_MIN, MAX_PUBLISH_GAP_SEC_MAX);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.max_publish_gap_sec = v;
         s_pending.max_publish_gap_sec_set = true;
@@ -284,7 +314,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         uint32_t v;
         if (!parse_uint32(data, data_len, v))
             return;
-        v = std::clamp(v, HEATER_PERIOD_MIN_MINUTES, HEATER_PERIOD_MAX_MINUTES);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.heater_period_minutes = v;
         s_pending.heater_period_set = true;
@@ -293,7 +322,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         uint32_t v;
         if (!parse_uint32(data, data_len, v))
             return;
-        v = std::clamp(v, HEATER_HIGH_RH_MIN_MINUTES, HEATER_HIGH_RH_MAX_MINUTES);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.heater_high_rh_trigger_minutes = v;
         s_pending.heater_high_rh_set = true;
@@ -318,7 +346,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         int32_t v;
         if (!parse_int32(data, data_len, v))
             return;
-        v = std::clamp(v, TX_POWER_DBM_MIN, TX_POWER_DBM_MAX);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.tx_power_dbm = v;
         s_pending.tx_power_dbm_set = true;
@@ -327,7 +354,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         uint32_t v;
         if (!parse_uint32(data, data_len, v))
             return;
-        v = std::clamp(v, SENSOR_SAMPLES_MIN, SENSOR_SAMPLES_MAX);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.sensor_samples = v;
         s_pending.sensor_samples_set = true;
@@ -336,7 +362,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         uint32_t v;
         if (!parse_uint32(data, data_len, v))
             return;
-        v = rtc_cal_clamp_samples(v);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.rtc_cal_samples = v;
         s_pending.rtc_cal_samples_set = true;
@@ -345,7 +370,6 @@ void runtime_config_on_mqtt_data(const char *topic, size_t topic_len,
         uint32_t v;
         if (!parse_uint32(data, data_len, v))
             return;
-        v = rtc_cal_clamp_period_sec(v);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_pending.rtc_cal_period_sec = v;
         s_pending.rtc_cal_period_sec_set = true;
@@ -360,6 +384,67 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
     snap = s_pending;
     s_pending = PendingCfg{};
     xSemaphoreGive(s_mutex);
+
+    // From here on a field's `_set` means "apply and persist" and its `_echo` "re-publish" -- see
+    // settle(). Most of what arrives is already in effect and ends up as neither.
+    int echoes = 0;
+    if (snap.temp_offset_set)
+        echoes += settle(snap.temp_offset_set, snap.temp_offset_echo, snap.temp_offset_c,
+                         std::clamp(snap.temp_offset_c, TEMP_OFFSET_MIN, TEMP_OFFSET_MAX),
+                         s_shadow.temp_offset_c);
+    if (snap.temp_min_change_set)
+        echoes += settle(snap.temp_min_change_set, snap.temp_min_change_echo, snap.temp_min_change_c,
+                         std::clamp(snap.temp_min_change_c, TEMP_MIN_CHANGE_MIN, TEMP_MIN_CHANGE_MAX),
+                         s_shadow.temp_min_change_c);
+    if (snap.rh_offset_set)
+        echoes += settle(snap.rh_offset_set, snap.rh_offset_echo, snap.rh_offset_pct,
+                         std::clamp(snap.rh_offset_pct, RH_OFFSET_MIN, RH_OFFSET_MAX),
+                         s_shadow.rh_offset_pct);
+    if (snap.rh_min_change_set)
+        echoes += settle(snap.rh_min_change_set, snap.rh_min_change_echo, snap.rh_min_change_pct,
+                         std::clamp(snap.rh_min_change_pct, RH_MIN_CHANGE_MIN, RH_MIN_CHANGE_MAX),
+                         s_shadow.rh_min_change_pct);
+    if (snap.max_publish_gap_sec_set)
+        echoes += settle(snap.max_publish_gap_sec_set, snap.max_publish_gap_sec_echo, snap.max_publish_gap_sec,
+                         std::clamp(snap.max_publish_gap_sec, MAX_PUBLISH_GAP_SEC_MIN, MAX_PUBLISH_GAP_SEC_MAX),
+                         s_max_publish_gap_sec);
+    if (snap.heater_period_set)
+        echoes += settle(snap.heater_period_set, snap.heater_period_echo, snap.heater_period_minutes,
+                         std::clamp(snap.heater_period_minutes, HEATER_PERIOD_MIN_MINUTES, HEATER_PERIOD_MAX_MINUTES),
+                         s_heater_period_minutes);
+    if (snap.heater_high_rh_set)
+        echoes += settle(snap.heater_high_rh_set, snap.heater_high_rh_echo, snap.heater_high_rh_trigger_minutes,
+                         std::clamp(snap.heater_high_rh_trigger_minutes, HEATER_HIGH_RH_MIN_MINUTES,
+                                    HEATER_HIGH_RH_MAX_MINUTES),
+                         s_heater_high_rh_trigger_minutes);
+    if (snap.ext_antenna_set)
+        echoes += settle(snap.ext_antenna_set, snap.ext_antenna_echo, snap.ext_antenna_on, snap.ext_antenna_on,
+                         s_ext_antenna_on);
+    if (snap.tx_power_dbm_set) {
+        // In effect here means most recently accepted, on trial or not -- what
+        // runtime_config_current_values() reports too.
+        const int32_t accepted = s_tx_power_has_pending ? s_tx_power_pending : s_tx_power_known_good;
+        if (s_tx_power_has_rejected && snap.tx_power_dbm == s_tx_power_rejected) {
+            // The broker's copy of a value that failed its trial: echo the one in effect over it.
+            snap.tx_power_dbm_set = false;
+            snap.tx_power_dbm_echo = accepted != s_tx_power_rejected;
+            snap.tx_power_dbm = accepted;
+            echoes += snap.tx_power_dbm_echo;
+        } else {
+            echoes += settle(snap.tx_power_dbm_set, snap.tx_power_dbm_echo, snap.tx_power_dbm,
+                             std::clamp(snap.tx_power_dbm, TX_POWER_DBM_MIN, TX_POWER_DBM_MAX), accepted);
+        }
+    }
+    if (snap.sensor_samples_set)
+        echoes += settle(snap.sensor_samples_set, snap.sensor_samples_echo, snap.sensor_samples,
+                         std::clamp(snap.sensor_samples, SENSOR_SAMPLES_MIN, SENSOR_SAMPLES_MAX),
+                         s_shadow.sensor_samples);
+    if (snap.rtc_cal_samples_set)
+        echoes += settle(snap.rtc_cal_samples_set, snap.rtc_cal_samples_echo, snap.rtc_cal_samples,
+                         rtc_cal_clamp_samples(snap.rtc_cal_samples), rtc_clock_fix_samples());
+    if (snap.rtc_cal_period_sec_set)
+        echoes += settle(snap.rtc_cal_period_sec_set, snap.rtc_cal_period_sec_echo, snap.rtc_cal_period_sec,
+                         rtc_cal_clamp_period_sec(snap.rtc_cal_period_sec), rtc_clock_fix_period_sec());
 
     int applied = 0;
     bool lpChanged = false;
@@ -403,6 +488,7 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
         s_tx_power_pending = dbm;
         s_tx_power_has_pending = true;
         s_tx_power_unconfirmed_cycles = 0;
+        s_tx_power_has_rejected = false;
         if (s_link && s_link->setTxPowerDbm && s_link->setTxPowerDbm(dbm) == ESP_OK)
             s_tx_power_active_dbm = dbm;
         ++applied;
@@ -419,7 +505,7 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
         ++applied;
     }
 
-    if (applied == 0)
+    if (applied == 0 && echoes == 0)
         return 0;
 
     // Persist whichever fields changed. Floats have no native NVS type -- raw 4-byte blob,
@@ -428,7 +514,7 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
     // lp_poll_interval_sec change (a reflash, since it's boot-only) re-derives the right cycle
     // count instead of replaying a now-stale one.
     nvs_handle_t nvs;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+    if (applied > 0 && nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         if (snap.temp_offset_set)
             nvs_set_blob(nvs, "temp_offset", &snap.temp_offset_c, sizeof(float));
         if (snap.temp_min_change_set)
@@ -458,34 +544,34 @@ int runtime_config_apply_pending(esp_mqtt_client_handle_t client)
         if (nvs_commit(nvs) != ESP_OK)
             ESP_LOGE(TAG, "nvs_commit failed — change applied live but may not survive a reboot");
         nvs_close(nvs);
-    } else {
+    } else if (applied > 0) {
         ESP_LOGE(TAG, "nvs_open (%s, RW) failed — change applied live but not persisted", NVS_NAMESPACE);
     }
 
-    // Echo each changed value back on its own retained topic -- fire-and-forget, no ACK wait:
-    // the value is already durably applied above, so delivery only affects how promptly HA's
-    // display catches up, not correctness.
-    if (client) {
+    // Echo each value the broker doesn't hold yet back on its own retained topic -- fire-and-forget,
+    // no ACK wait: the value is already durably applied above, so delivery only affects how
+    // promptly HA's display catches up, not correctness.
+    if (client && echoes > 0) {
         std::string val;
         const auto echo = [&](const char *topic) {
             esp_mqtt_client_publish(client, topic, val.c_str(), static_cast<int>(val.size()), 1, 1);
             val.clear();
         };
-        if (snap.temp_offset_set)     { appendNum(val, snap.temp_offset_c); echo(s_topic_temp_offset.c_str()); }
-        if (snap.temp_min_change_set) { appendNum(val, snap.temp_min_change_c); echo(s_topic_temp_min_change.c_str()); }
-        if (snap.rh_offset_set)       { appendNum(val, snap.rh_offset_pct); echo(s_topic_rh_offset.c_str()); }
-        if (snap.rh_min_change_set)   { appendNum(val, snap.rh_min_change_pct); echo(s_topic_rh_min_change.c_str()); }
-        if (snap.max_publish_gap_sec_set) { appendNum(val, snap.max_publish_gap_sec); echo(s_topic_max_publish_gap_sec.c_str()); }
-        if (snap.heater_period_set)   { appendNum(val, snap.heater_period_minutes); echo(s_topic_heater_period_minutes.c_str()); }
-        if (snap.heater_high_rh_set)  { appendNum(val, snap.heater_high_rh_trigger_minutes); echo(s_topic_heater_high_rh_trigger_minutes.c_str()); }
-        if (snap.ext_antenna_set)     { val = snap.ext_antenna_on ? "ON" : "OFF"; echo(s_topic_ext_antenna.c_str()); }
-        if (snap.tx_power_dbm_set)    { appendNum(val, snap.tx_power_dbm); echo(s_topic_tx_power_dbm.c_str()); }
-        if (snap.sensor_samples_set)  { appendNum(val, snap.sensor_samples); echo(s_topic_sensor_samples.c_str()); }
-        if (snap.rtc_cal_samples_set) { appendNum(val, snap.rtc_cal_samples); echo(s_topic_rtc_cal_samples.c_str()); }
-        if (snap.rtc_cal_period_sec_set) { appendNum(val, snap.rtc_cal_period_sec); echo(s_topic_rtc_cal_period_sec.c_str()); }
+        if (snap.temp_offset_echo)     { appendNum(val, snap.temp_offset_c); echo(s_topic_temp_offset.c_str()); }
+        if (snap.temp_min_change_echo) { appendNum(val, snap.temp_min_change_c); echo(s_topic_temp_min_change.c_str()); }
+        if (snap.rh_offset_echo)       { appendNum(val, snap.rh_offset_pct); echo(s_topic_rh_offset.c_str()); }
+        if (snap.rh_min_change_echo)   { appendNum(val, snap.rh_min_change_pct); echo(s_topic_rh_min_change.c_str()); }
+        if (snap.max_publish_gap_sec_echo) { appendNum(val, snap.max_publish_gap_sec); echo(s_topic_max_publish_gap_sec.c_str()); }
+        if (snap.heater_period_echo)   { appendNum(val, snap.heater_period_minutes); echo(s_topic_heater_period_minutes.c_str()); }
+        if (snap.heater_high_rh_echo)  { appendNum(val, snap.heater_high_rh_trigger_minutes); echo(s_topic_heater_high_rh_trigger_minutes.c_str()); }
+        if (snap.ext_antenna_echo)     { val = snap.ext_antenna_on ? "ON" : "OFF"; echo(s_topic_ext_antenna.c_str()); }
+        if (snap.tx_power_dbm_echo)    { appendNum(val, snap.tx_power_dbm); echo(s_topic_tx_power_dbm.c_str()); }
+        if (snap.sensor_samples_echo)  { appendNum(val, snap.sensor_samples); echo(s_topic_sensor_samples.c_str()); }
+        if (snap.rtc_cal_samples_echo) { appendNum(val, snap.rtc_cal_samples); echo(s_topic_rtc_cal_samples.c_str()); }
+        if (snap.rtc_cal_period_sec_echo) { appendNum(val, snap.rtc_cal_period_sec); echo(s_topic_rtc_cal_period_sec.c_str()); }
     }
 
-    ESP_LOGI(TAG, "applied %d runtime config change(s)", applied);
+    ESP_LOGI(TAG, "runtime config: %d change(s) applied, %d value(s) echoed", applied, echoes);
     return applied;
 }
 
@@ -586,6 +672,8 @@ void runtime_config_tx_power_note_first_attach()
         ESP_LOGW(TAG, "TX power: discarding unconfirmed trial (%d dBm) left over from a previous "
                       "boot, falling back to known-good (%d dBm)",
                  s_tx_power_pending, s_tx_power_known_good);
+        s_tx_power_rejected = s_tx_power_pending;
+        s_tx_power_has_rejected = true;
         s_tx_power_has_pending = false;
         s_tx_power_unconfirmed_cycles = 0;
         nvs_handle_t nvs;
@@ -629,6 +717,8 @@ void runtime_config_tx_power_note_cycle_result(bool ok)
                   "(%d dBm)",
              s_tx_power_pending, static_cast<unsigned long>(s_tx_power_unconfirmed_cycles),
              s_tx_power_known_good);
+    s_tx_power_rejected = s_tx_power_pending;
+    s_tx_power_has_rejected = true;
     s_tx_power_has_pending = false;
     s_tx_power_unconfirmed_cycles = 0;
     if (s_link && s_link->setTxPowerDbm && s_link->setTxPowerDbm(s_tx_power_known_good) == ESP_OK)

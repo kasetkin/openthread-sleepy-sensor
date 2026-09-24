@@ -146,7 +146,11 @@ to as a single `<device_id>/cfg/#` wildcard each wake — same "retained command
 can't miss" idiom the OTA `install` topic uses above. `state_topic` and `command_topic` are the
 same topic: HA publishes a new value there (retained), and after validating/clamping it the
 device applies it and republishes its own retained echo of the value actually in effect, so
-HA's display always matches reality, not just what was requested.
+HA's display always matches reality, not just what was requested. A value that's already in effect
+is left alone: every wake's subscribe hands back all the retained values, and the device receives
+its own echoes too, so a normal cycle applies, saves and publishes nothing. A TX power that fails
+its trial is the one exception that does get an echo: the known-good value, published over the
+failed one so the broker stops handing it back.
 
 The first 8 rows go straight into the LP core's shared-memory config block (the same one
 `lp_sensor_core_init()` populates at boot from `device_config.yaml`) and take effect on the LP
