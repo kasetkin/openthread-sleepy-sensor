@@ -159,6 +159,17 @@ class CycleReconstructionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             hh.cycle_anchors(self.export, self.synthetic.names, epsilon_s=1000.0)
 
+    def test_default_epsilon_keeps_a_retry_gap(self):
+        """A failed publish is retried one 20 s LP poll later, and on 2026-09-23 HA saw such a
+        pair 14.3 s apart -- inside the 1.5x refusal margin of the old 10 s default."""
+        synthetic = SyntheticExport(cycles=60, cadence_s=14.3)
+        path = os.path.join(self.dir.name, "retry.csv")
+        write_rows(path, synthetic.deduplicated()[0])
+        export = hh.load_export(path)
+        self.assertEqual(len(hh.cycle_anchors(export, synthetic.names)), 60)
+        with self.assertRaises(hh.AnchorError):
+            hh.cycle_anchors(export, synthetic.names, epsilon_s=10.0)
+
 
 class BlackoutTest(unittest.TestCase):
     """`unavailable` runs, and the difference between one and a real outage."""

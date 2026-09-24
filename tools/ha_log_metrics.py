@@ -300,8 +300,8 @@ def check_guards(export, window, phases, lp, safeguard, findings_extras):
 
     increments = heater_increments(export)
     add("heater increments", len(increments) >= MIN_HEATER_INCREMENTS, False,
-        f"{len(increments)} increment(s); below {MIN_HEATER_INCREMENTS} the LP period falls back "
-        f"to the safeguard estimator")
+        f"{len(increments)} increment(s); below {MIN_HEATER_INCREMENTS} the heater LP period "
+        f"rests on a single interval, and below 2 there is none")
     periods, spread = heater_interval_spread(increments)
     add("heater interval spread", spread <= HEATER_INTERVAL_TOLERANCE, True,
         f"max deviation {spread * 100:.2f} % from the median interval"
@@ -318,6 +318,13 @@ def check_guards(export, window, phases, lp, safeguard, findings_extras):
             add("LP estimators agree", abs(lp.disagreement) <= LP_ESTIMATOR_DISAGREEMENT, True,
                 f"heater {lp.raw_s:.4f} s vs safeguard {lp.cross_check_s:.4f} s "
                 f"({lp.disagreement * 100:+.3f} %)")
+    else:
+        # Fatal because the LP period is not a detail: through sensor_samples_extra_ua() it is a
+        # ~147 uA term at ss=4. The safeguard-pool fallback docs/plan_ha_log_metrics.md section 4
+        # describes is not implemented, so past --force the model runs on its NOMINAL period.
+        add("LP period measured", False, True,
+            "fewer than two heater_run_count increments (the heater runs once a day); "
+            "--force runs the model on power_model's nominal period instead")
 
     for name, ok, detail in findings_extras:
         add(name, ok, False, detail)
@@ -383,15 +390,30 @@ def model_phase_times(findings):
             findings.phases.cpu_s / cycles)
 
 
+def model_lp_period_s(findings, basis="raw"):
+    """The LP period handed to the model, or None when the window could not measure one.
+
+    None is only reachable past the fatal "LP period measured" guard rail (--force, --quiet), and
+    power_model then falls back to its nominal period for the window's sensor_samples.
+    """
+    if findings.lp is None:
+        return None
+    return findings.lp.raw_s if basis == "raw" else findings.lp.corrected_s
+
+
 def model_command_line(findings, basis="raw", capacity_mah=None):
     """The power_model.py invocation that reproduces this window. The reproducible artifact."""
-    period_s = findings.lp.raw_s if basis == "raw" else findings.lp.corrected_s
+    period_s = model_lp_period_s(findings, basis)
     tx_s, rx_s, cpu_s = model_phase_times(findings)
     parts = [
         "tools/power_model.py",
         f"--cadence {findings.window.cadence_s:.2f}",
         f"--sensor-samples {findings.sensor_samples}",
-        f"--lp-poll-period {period_s:.4f}",
+    ]
+    # Left out rather than guessed, so the command line says as much as the window did.
+    if period_s is not None:
+        parts.append(f"--lp-poll-period {period_s:.4f}")
+    parts += [
         f"--tx-power {findings.tx_power_dbm:g}",
         f"--phase-times {tx_s:.5f},{rx_s:.5f},{cpu_s:.5f}",
         f"--measured {findings.measured.ua:.0f}",
@@ -473,6 +495,9 @@ def print_findings(findings, stream=sys.stdout):
     if lp is None:
         print("LP poll period: NOT MEASURABLE (fewer than two heater_run_count increments)",
               file=stream)
+        print(f"  the model below runs on power_model's nominal "
+              f"{pm.lp_poll_period_s(findings.sensor_samples):.4f} s for sensor_samples "
+              f"{findings.sensor_samples}", file=stream)
     else:
         print("LP poll period", file=stream)
         print(f"  raw       {lp.raw_s:.4f} s  +/-{lp.uncertainty_frac * 100:.4f} % "
@@ -549,7 +574,7 @@ def report(findings, run_model=True, basis="raw", capacity_mah=None, forced=Fals
         budget = pm.power_budget(
             findings.window.cadence_s,
             sensor_samples=findings.sensor_samples,
-            lp_poll_period_sec=findings.lp.raw_s if basis == "raw" else findings.lp.corrected_s,
+            lp_poll_period_sec=model_lp_period_s(findings, basis),
             capacity_mah=capacity_mah,
             measured_ua=findings.measured.ua,
             tx_power_dbm=findings.tx_power_dbm,
@@ -567,8 +592,7 @@ def report(findings, run_model=True, basis="raw", capacity_mah=None, forced=Fals
         from_totals = pm.model_avg_current_ua(
             findings.window.seconds, findings.phases.tx_s, findings.phases.rx_s,
             findings.phases.cpu_s, None, findings.sensor_samples,
-            findings.lp.raw_s if basis == "raw" else findings.lp.corrected_s,
-            findings.tx_power_dbm)
+            model_lp_period_s(findings, basis), findings.tx_power_dbm)
         print(file=stream)
         print(f"Totals form (the model's primitive): {from_totals:.1f} uA "
               f"= {awake_s:.1f} s awake in {findings.window.seconds:.0f} s", file=stream)
@@ -649,8 +673,14 @@ def main(argv=None):
                   f"{series.boundary_stamps} boundary")
         return 0
 
-    findings = derive(export, args.cycle_epsilon, args.max_hold, args.outlier_threshold,
-                      args.sensor_samples, args.tx_power)
+    try:
+        findings = derive(export, args.cycle_epsilon, args.max_hold, args.outlier_threshold,
+                          args.sensor_samples, args.tx_power)
+    except hh.AnchorError as error:
+        # Same exit code as a failed guard rail: the data can't be quoted as asked, and nothing
+        # was computed that could be copied out of a traceback.
+        print(f"REFUSING to anchor cycles in this export: {error}")
+        return 2
     if args.quiet:
         print(model_command_line(findings, args.lp_period_basis, args.capacity))
         return 0

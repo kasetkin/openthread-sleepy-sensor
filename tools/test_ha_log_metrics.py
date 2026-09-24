@@ -13,7 +13,12 @@ regression from a re-blessing that never happened. Quantities section 6 marks EX
 assertEqual -- a tolerance there would hide exactly the off-by-one-cycle bug that the
 cluster-scoped fill exists to prevent.
 """
+import contextlib
+import csv
+import gzip
+import io
 import os
+import tempfile
 import unittest
 from collections import namedtuple
 
@@ -205,6 +210,59 @@ class WindowBTest(unittest.TestCase, FixtureMixin):
         gaps = hh.anchor_gaps(self.findings.window.anchors)
         self.assertGreater(max(gaps), 8000.0)
         self.assertLess(max(gaps), 8300.0)
+
+
+class ShortWindowTest(unittest.TestCase):
+    """Fewer than two heater runs leave the LP period unmeasured; that must refuse, not crash.
+
+    Window A cut just before its second heater_run_count increment: 1.33 days, about the length
+    of a one-day experiment. Before the fix every path past the guard rails (--force, --quiet, a
+    window with no other fatal rail) died on findings.lp being None.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cutoff = hlm.heater_increments(hh.load_export(FIXTURE_A))[1][0]
+        cls.dir = tempfile.TemporaryDirectory()
+        cls.path = os.path.join(cls.dir.name, "short.csv")
+        with gzip.open(FIXTURE_A, "rt", newline="") as source, \
+                open(cls.path, "w", newline="") as target:
+            reader = csv.reader(source)
+            writer = csv.writer(target, lineterminator="\n")
+            writer.writerow(next(reader))
+            for row in reader:
+                if hh.parse_timestamp(row[2]) < cutoff:
+                    writer.writerow(row)
+        cls.findings = hlm.derive(hh.load_export(cls.path))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def test_the_unmeasured_period_is_a_fatal_rail(self):
+        self.assertIsNone(self.findings.lp)
+        guard = next(guard for guard in self.findings.guards if guard.name == "LP period measured")
+        self.assertFalse(guard.ok)
+        self.assertTrue(guard.fatal)
+
+    def test_unforced_report_refuses(self):
+        stream = io.StringIO()
+        self.assertEqual(hlm.report(self.findings, stream=stream), 2)
+        self.assertIn("REFUSING", stream.getvalue())
+
+    def test_forced_report_runs_on_the_nominal_period(self):
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()):  # print_budget() writes to stdout
+            self.assertEqual(hlm.report(self.findings, forced=True, stream=stream), 3)
+        self.assertIn("# FORCED: LP period measured", stream.getvalue())
+        self.assertNotIn("--lp-poll-period", hlm.model_command_line(self.findings))
+
+    def test_an_epsilon_the_export_cannot_honour_is_refused_not_raised(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = hlm.main(["--csv", self.path, "--cycle-epsilon", "1000"])
+        self.assertEqual(code, 2)
+        self.assertIn("REFUSING to anchor cycles", out.getvalue())
 
 
 @unittest.skipUnless(os.path.exists(RAW_A), "raw export not present (untracked working file)")

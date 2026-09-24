@@ -277,6 +277,12 @@ period under ~10 s with `max_publish_gap_sec` at one poll the epsilon would merg
 Make it a parameter (it already is, §5.7) and have the extractor refuse when the epsilon exceeds
 half the smallest observed gap.
 
+**[changed 2026-09-24]** default 10 s -> **5 s**. The 2026-09-23 export has a 14.3 s minimum gap
+(a failed publish retried one 20 s poll later, one of the pair landing late), which the refusal
+rule -- implemented as `smallest gap < 1.5 x epsilon` -- turned into a Python traceback. 5 s is
+still ~300x the cluster spread. A refusal is now `ha_history.AnchorError`, and the extractor
+reports it as a refused window (exit 2) rather than raising.
+
 ### 2.2 LP poll period: two estimators that check each other
 
 **Primary -- `heater_run_count`.** It advances once per exactly 4320 LP cycles
@@ -492,6 +498,10 @@ Every one of these has already invalidated a window in this project. **Fatal by 
 - per-metric coverage below threshold -> report it; never silently average a sparse series
 - fewer than 3 `heater_run_count` increments -> LP period falls back to the safeguard estimator
   with a widened error bar (§2.2), not to the nominal
+  **[2026-09-24] the fallback was never implemented.** With 2 increments the heater estimator
+  runs on its one interval (its error bar widens by itself); with fewer, the new fatal rail
+  "LP period measured" refuses the window, and `--force` runs the model on the NOMINAL period.
+  Before that, such a window crashed on `findings.lp` being None.
 - **[added 2026-09-09]** any single `heater_run_count` interval more than 1 % off the median
   interval -> a humidity-triggered heater run reset `cycles_since_heater`, so the endpoint-span
   estimator of §2.2 is measuring fewer than `4320 x (n-1)` polls. Fatal: it corrupts the primary
@@ -525,7 +535,7 @@ blackout policy. Both `battery_power_from_history.py` and the new extractor need
 ```python
 NOT_A_NUMBER    = ("unavailable", "unknown")   # HA's two non-value states
 MAX_HOLD_S      = 7200.0                       # dwell cap; see 2.4 -- chosen, not derived
-CYCLE_EPSILON_S = 10.0                         # anchor cluster width; see 2.1
+CYCLE_EPSILON_S = 10.0                         # anchor cluster width; see 2.1 (5.0 since 2026-09-24)
 
 Blackout   = namedtuple("Blackout", "start end seconds marker")
 Series     = namedtuple("Series", "name entity_id samples blackouts")
@@ -736,7 +746,7 @@ ha_log_metrics.py --csv metrics_history_2026-08-29__to__2026-09-07.csv --run
 | `--sensor-samples N` | from `number.*_sensor_samples` | override when the entity is absent |
 | `--tx-power DBM` | from `tx_power_active` | ditto |
 | `--capacity MAH` | `power_model.PACK_CAPACITY_MAH` | passed through to the model |
-| `--cycle-epsilon SECONDS` | `10.0` | anchor cluster width (§2.1) |
+| `--cycle-epsilon SECONDS` | `10.0` (`5.0` since 2026-09-24) | anchor cluster width (§2.1) |
 | `--max-hold SECONDS` | `7200.0` | forward-fill dwell cap (§2.4) |
 | `--outlier-threshold MS` | `5000.0` | per-cycle HP-awake outlier cut |
 | `--start ISO` / `--end ISO` | none | trim the window without re-exporting |

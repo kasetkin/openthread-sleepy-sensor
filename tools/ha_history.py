@@ -50,10 +50,21 @@ NOT_A_NUMBER = ("unavailable", "unknown")
 MAX_HOLD_S = 7200.0
 
 # Cluster width for grouping the entities of one MQTT publish into one cycle. Measured, the whole
-# cluster spans at most 16 ms; the smallest real inter-publish gap seen is 16.1 s. So anything
-# from ~0.1 s to ~15 s works on this device today -- 10 s is comfortably inside that, but it is a
-# parameter and not a law, and cycle_anchors() refuses when it approaches the smallest real gap.
-CYCLE_EPSILON_S = 10.0
+# cluster spans at most 16 ms. The smallest real inter-publish gap was 16.1 s on the 2026-09
+# reference windows, but 14.3 s on 2026-09-23, where a failed publish is retried one 20 s LP poll
+# later and one of the two lands late -- and cycle_anchors() refuses anything under 1.5x epsilon,
+# so the old 10 s turned a routine retry into a refusal. 5 s still sits ~300x above the cluster
+# spread and is refused only below 7.5 s. A parameter and not a law.
+CYCLE_EPSILON_S = 5.0
+
+
+class AnchorError(ValueError):
+    """The export cannot be split into publish cycles as asked.
+
+    No samples at all, or an epsilon too close to the smallest gap. Both are properties of the
+    data rather than bugs, so a caller refuses the window instead of crashing on it.
+    """
+
 
 # Bootstrap recipe, pinned so the interval a run prints is the interval another run prints. The
 # figure this replaces (+/-0.077 mA, from the 2026-08-29 power-budget report) could not be
@@ -233,14 +244,14 @@ def cycle_anchors(export, names, epsilon_s=CYCLE_EPSILON_S):
     eight measurement entities give 3390 cycles at 234.341 s, while all 26 give 3395 at 233.996 s
     and no single entity is dense enough to anchor on alone.
 
-    Raises when epsilon is too large to separate the cycles it found, rather than silently
-    merging two publishes into one.
+    Raises AnchorError when epsilon is too large to separate the cycles it found, rather than
+    silently merging two publishes into one.
     """
     stamps = sorted(stamp
                     for name in names if name in export.series
                     for stamp, _ in export.series[name].samples)
     if not stamps:
-        raise ValueError(f"{export.path}: no samples in {names}")
+        raise AnchorError(f"{export.path}: no samples in {names}")
     window = timedelta(seconds=epsilon_s)
     anchors = []
     for stamp in stamps:
@@ -248,7 +259,7 @@ def cycle_anchors(export, names, epsilon_s=CYCLE_EPSILON_S):
             anchors.append(stamp)
     gaps = anchor_gaps(anchors)
     if gaps and min(gaps) < epsilon_s * 1.5:
-        raise ValueError(
+        raise AnchorError(
             f"{export.path}: cycle epsilon {epsilon_s} s is too close to the smallest gap "
             f"{min(gaps):.1f} s -- real cycles are at risk of being merged")
     return anchors
