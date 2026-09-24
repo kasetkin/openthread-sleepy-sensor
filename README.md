@@ -294,18 +294,21 @@ Two things make it wrong to just set it and hope:
    it cannot respond to our own TX power at all. The entity that can is **"Uplink signal
    strength"**, fed by Thread 1.2 enhanced-ACK probing: the parent stamps its own measurement of
    our frames into the ACKs it returns. That one is absent on a Thread 1.1 border router, in
-   which case "Parent link quality" (0–3) and the TX retry/CCA/no-ack counters are the fallback.
+   which case the TX retry and CCA counters are the fallback.
 2. **The saving cannot be predicted without knowing radio duty cycle.** What reaches the battery
    is `ΔI_avg = ΔI_peak(P) × t_tx / cycle_period`. The **"Radio TX time"** diagnostic entity is
    that `t_tx` term. At ~5 ms/cycle the 20→12 dBm step is worth ~2 µA (≈1% of budget — not worth
    any link margin); at ~50 ms/cycle it is worth ~20 µA (≈10% — worth real work).
 
-Hence the diagnostic entities (Radio TX/RX time, TX retries, CCA failures, TX no-ack expiry,
-Parent link quality, Uplink signal strength), enabled by `CONFIG_OPENTHREAD_RADIO_STATS_ENABLE`
+Hence the diagnostic entities (Radio TX/RX time, TX retries, CCA failures, Uplink signal
+strength), enabled by `CONFIG_OPENTHREAD_RADIO_STATS_ENABLE`
 and `CONFIG_OPENTHREAD_LINK_METRICS` and read once per publish window as per-cycle deltas. They
 change no radio behaviour; they exist so the TX-power decision can be made from measurements
 rather than guessed. Note also that `CONFIG_OPENTHREAD_PARENT_SEARCH_RSS_THRESHOLD=-65` operates
 on *downlink* RSSI and does **not** interact with our transmit power.
+TX no-ack expiry and Parent link quality were published too until 2026-09, when they were dropped
+after reading 0 and 3 for the whole of a 19 h capture; both counters are still read on the device
+(and printed on the UART `link:` line), so an on-device controller can still gate on them.
 
 ### Measured result: the gate says build the knob
 
