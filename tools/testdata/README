@@ -1,0 +1,40 @@
+Regression fixtures for tools/test_ha_log_metrics.py.
+
+These are the two reconciled measurement windows, filtered to the 11 entities the pipeline
+actually reads, then gzipped. The raw exports are 3.8 MB and 3.4 MB and stay untracked as working
+files; these are ~175 KB and ~160 KB, the same order as the already-tracked voltage_history.csv,
+so section 6 of docs/plan_ha_log_metrics.md is a real gate on every machine rather than one that
+silently skips.
+
+  window_a_ss4.csv.gz   2026-08-29T05:00 -> 2026-09-07T09:36, sensor_samples=4,  20 dBm
+  window_b_ss16.csv.gz  2026-08-20T20:00 -> 2026-08-29T04:13, sensor_samples=16, 20 dBm
+
+Window B is deliberately NOT outage-free: it contains a 2 h 16 m connectivity outage, which is
+what exercises the outlier and blackout paths window A does not.
+
+Regenerate (from the repo root, with the raw exports present):
+
+    python3 - <<'PY'
+    import csv, gzip, sys
+    sys.path.insert(0, "tools")
+    import ha_log_metrics as hlm
+    KEEP = set(hlm.PER_CYCLE_ENTITIES) | set(hlm.GUARD_ENTITIES)
+    PREFIX = "esp32_ot_mqtt_outdoor_"
+    for src, dst in [("metrics_history_2026-08-29__to__2026-09-07.csv",
+                      "tools/testdata/window_a_ss4.csv.gz"),
+                     ("metrics_history_2026-08-21__to__2026-08-29.csv",
+                      "tools/testdata/window_b_ss16.csv.gz")]:
+        with open(src, newline="") as fh, gzip.open(dst, "wt", newline="", compresslevel=9) as out:
+            writer = csv.writer(out, lineterminator="\n")
+            writer.writerow(["entity_id", "state", "last_changed"])
+            for row in csv.DictReader(fh):
+                short = row["entity_id"].split(".", 1)[1]
+                if short.startswith(PREFIX):
+                    short = short[len(PREFIX):]
+                if short in KEEP:
+                    writer.writerow([row["entity_id"], row["state"], row["last_changed"]])
+    PY
+
+Changing the filter set changes nothing in the fixtures' numbers as long as it still contains
+every entity in PER_CYCLE_ENTITIES -- the cycle anchor is built from those eight alone, and adding
+a constant like boot_count to the ANCHOR (rather than merely to the file) would invent cycles.
