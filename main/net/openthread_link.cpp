@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <format>
 #include <optional>
 #include <string>
@@ -12,7 +10,6 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "esp_pm.h"
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
 #include "esp_openthread_netif_glue.h"
@@ -728,65 +725,6 @@ static std::string brokerUri(std::string_view broker_address, uint16_t port, boo
     return make_nat64_uri(broker_address, port, use_tls);
 }
 
-// ── PM lock profile around the publish window (CSL power diagnostics) ─────────────────────────
-// With CONFIG_PM_PROFILING, esp_pm_dump_locks() lists every PM lock with its cumulative
-// since-boot hold time, plus the time spent in each PM mode and the light-sleep counts. One dump
-// at each end of the publish window splits a cycle into its two phases: publish = end dump minus
-// start dump of the same window, idle = start dump minus the previous window's end dump.
-// OpenThread's lock is "ot_sleep": esp_openthread_sleep_process() holds it whenever the 802.15.4
-// driver isn't asleep, so its hold time is what the radio costs in lost light sleep, set against
-// "rtos0" (a task was running) and whatever else turns up.
-//
-// esp_pm_dump_locks() reads each counter as it prints that line, and at 115200 baud the ~1 KB
-// dump takes ~90 ms -- printed at the window start, that would land in the very phase being
-// measured. So both dumps are written to memory and printed together after the end one, where
-// the ~0.2 s of output falls into the idle phase instead (in rtos0, not in ot_sleep). Compiled
-// out without CONFIG_PM_PROFILING; drop it with that option once the CSL power question is
-// settled.
-#if CONFIG_PM_PROFILING
-// MQTT task only: both publish-window hooks run there.
-static char *s_pm_profile_at_start = nullptr;
-
-// A malloc'd copy of esp_pm_dump_locks()'s output, or nullptr if the stream couldn't be opened.
-static char *capture_pm_profile()
-{
-    char *text = nullptr;
-    size_t len = 0;
-    FILE *stream = open_memstream(&text, &len);
-    if (stream == nullptr)
-        return nullptr;
-    esp_pm_dump_locks(stream);
-    fclose(stream);
-    return text;
-}
-
-static void print_pm_profile(const char *label, const char *text)
-{
-    ESP_LOGW(TAG, "PM profile at publish window %s:", label);
-    fputs(text != nullptr ? text : "(capture failed)\n", stdout);
-    fflush(stdout);
-}
-
-static void pm_profile_publish_window_begin()
-{
-    free(s_pm_profile_at_start);
-    s_pm_profile_at_start = capture_pm_profile();
-}
-
-static void pm_profile_publish_window_end()
-{
-    char *at_end = capture_pm_profile();
-    print_pm_profile("start", s_pm_profile_at_start);
-    print_pm_profile("end", at_end);
-    free(s_pm_profile_at_start);
-    s_pm_profile_at_start = nullptr;
-    free(at_end);
-}
-#else
-static void pm_profile_publish_window_begin() {}
-static void pm_profile_publish_window_end() {}
-#endif
-
 NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
 {
     s_ot_tlv_hex = cfg.ot_tlv_hex;
@@ -802,10 +740,8 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.waitForReady = wait_for_ot_attached;
     link.brokerUri = brokerUri;
     link.waitForBrokerReachable = waitForBrokerReachable;
-    link.onPublishWindowBegin = []() { pm_profile_publish_window_begin();
-                                       set_poll_period(POLL_FAST_MS); };
-    link.onPublishWindowEnd = []() { set_poll_period(POLL_SLOW_MS);
-                                     pm_profile_publish_window_end(); };
+    link.onPublishWindowBegin = []() { set_poll_period(POLL_FAST_MS); };
+    link.onPublishWindowEnd = []() { set_poll_period(POLL_SLOW_MS); };
     // Nested inside a publish window, so the end hook restores the window's fast poll;
     // the window's own end hook then drops back to slow.
     link.onOtaWindowBegin = []() { ESP_LOGI(TAG, "OTA window: poll %lu ms", (unsigned long)POLL_OTA_MS);

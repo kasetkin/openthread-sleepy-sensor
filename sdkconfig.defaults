@@ -90,10 +90,6 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 # needed once sleep entry is left entirely to the automatic PM-lock-gated path (no more manual
 # esp_light_sleep_start() call to observe the wakeup cause synchronously).
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
-# Diagnostic for the CSL power question: per-lock hold times and time per PM mode, dumped by
-# openthread_link.cpp at both ends of every publish window. Adds a timestamp read to every PM
-# lock acquire/release, so remove it (the dump code compiles out with it) once that's settled.
-CONFIG_PM_PROFILING=y
 CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP=y
 CONFIG_IEEE802154_SLEEP_ENABLE=y
 CONFIG_FREERTOS_HZ=1000
