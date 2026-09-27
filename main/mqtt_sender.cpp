@@ -52,7 +52,7 @@ enum DiscoveryBit : uint16_t {
     DISC_BATT    = 1 << 2,  // covers the Battery + Voltage pair -- always published together
     DISC_UPDATE  = 1 << 3,  // HA `update` entity config + retained installed-version -- always published together
     DISC_RSSI    = 1 << 4,  // Signal strength -- owed once a cycle actually carries an RSSI reading
-    DISC_DIAG    = 1 << 5,  // Boot count + Reset reason + CSL status triplet -- boot-constant, so always available
+    DISC_DIAG    = 1 << 5,  // Boot count + Reset reason pair -- boot-constant, so always available
     DISC_NUMBERS = 1 << 6,  // all 8 HA `number` entities (calibration/threshold config) -- always published together
     DISC_SWITCH  = 1 << 7,  // the ext_antenna HA `switch` entity -- boot-constant, so always available
     DISC_HEATER  = 1 << 8,  // Heater problem + Heater run count pair -- owed once a heater run has ever completed
@@ -252,11 +252,11 @@ static constexpr std::string_view STATE_FMT_HUMID = "{{\"h\":{:.3g}}}";
 // battery variants of the three STATE_FMT_* strings above: that would double them to six.
 static constexpr std::string_view STATE_BATT_SUFFIX_FMT = ",\"b\":{:.2f},\"v\":{:.3f}}}";
 // Same overwrite-the-'}' chaining for the diagnostic values: link RSSI in dBm (only when the
-// transport has a reading this cycle), then boot count + reset reason + CSL status
+// transport has a reading this cycle), then boot count + reset reason
 // (boot-constant, so appended on every state message -- HA's expire_after would otherwise flag
 // those entities unavailable while the rest of the device keeps reporting).
 static constexpr std::string_view STATE_RSSI_SUFFIX_FMT = ",\"r\":{}}}";
-static constexpr std::string_view STATE_DIAG_SUFFIX_FMT = ",\"bc\":{},\"rr\":\"{}\",\"csl\":\"{}\"}}";
+static constexpr std::string_view STATE_DIAG_SUFFIX_FMT = ",\"bc\":{},\"rr\":\"{}\"}}";
 // Heater problem/run-count pair -- absent until the LP core has ever completed a heater run
 // (see hasHeater below), same "omit until real data exists" shape as battery/RSSI above.
 static constexpr std::string_view STATE_HEATER_SUFFIX_FMT = ",\"hp\":\"{}\",\"hc\":{}}}";
@@ -311,11 +311,11 @@ static constexpr size_t MAX_DEVICE_ID_LEN   = MQTT_MAX_DEVICE_ID_LEN;    // mqtt
 static constexpr size_t MAX_DEVICE_NAME_LEN = MQTT_MAX_DEVICE_NAME_LEN;  // mqtt_sender.h
 // Longest of each DiscoverySpec-field literal ever passed, at the publish_discovery() call
 // sites below (Temperature/Humidity/Battery/Voltage/Signal strength/Boot count/Reset reason/
-// CSL status/Heater problem/Heater run count).
+// Heater problem/Heater run count).
 static constexpr size_t MAX_NAME_LEN         = std::max({sizeof("Temperature"), sizeof("Humidity"),
                                                          sizeof("Battery"), sizeof("Voltage"),
                                                          sizeof("Signal strength"), sizeof("Boot count"),
-                                                         sizeof("Reset reason"), sizeof("CSL status"),
+                                                         sizeof("Reset reason"),
                                                          sizeof("Heater problem"),
                                                          sizeof("Heater run count"),
                                                          sizeof("Radio TX time"), sizeof("Radio RX time"),
@@ -328,7 +328,8 @@ static constexpr size_t MAX_DEVICE_CLASS_LEN = std::max({sizeof("temperature"), 
                                                          sizeof("signal_strength"), sizeof("problem")}) - 1;
 // The config topic's path segment -- device_class where one exists, so its lengths are a
 // superset of MAX_DEVICE_CLASS_LEN's plus the class-less sensors' made-up slugs, the retired ones
-// included: retire_old_link_and_phase_diagnostics() still builds their topics.
+// included: retire_old_link_and_phase_diagnostics() and retire_old_csl_status_discovery() still
+// build their topics.
 static constexpr size_t MAX_TOPIC_SLUG_LEN   = std::max({MAX_DEVICE_CLASS_LEN + 1, sizeof("rssi"),
                                                          sizeof("boot_count"), sizeof("reset_reason"),
                                                          sizeof("csl_status"),
@@ -481,7 +482,7 @@ static constexpr size_t STATE_BUF = std::max({
     STATE_FMT_HUMID.size() + MAX_FORMATTED_FLOAT_LEN,
 }) + STATE_BATT_SUFFIX_FMT.size() + MAX_BATTERY_PCT_LEN + MAX_FORMATTED_FLOAT_LEN
    + STATE_RSSI_SUFFIX_FMT.size() + MAX_RSSI_LEN
-   + STATE_DIAG_SUFFIX_FMT.size() + MAX_BOOT_COUNT_LEN + MQTT_MAX_RESET_REASON_LEN + MQTT_MAX_CSL_STATUS_LEN
+   + STATE_DIAG_SUFFIX_FMT.size() + MAX_BOOT_COUNT_LEN + MQTT_MAX_RESET_REASON_LEN
    + STATE_HEATER_SUFFIX_FMT.size() + MAX_ON_OFF_LEN + MAX_HEATER_RUN_COUNT_LEN
    + STATE_RADIO_SUFFIX_FMT.size() + 2 * MAX_FORMATTED_FLOAT_LEN
    + STATE_LINKQ_SUFFIX_FMT.size() + 2 * MAX_LINK_COUNTER_LEN
@@ -916,6 +917,17 @@ static void retire_old_link_and_phase_diagnostics(esp_mqtt_client_handle_t clien
     }
 }
 
+// Retires the "CSL status" diagnostic: Thread CSL was removed from the firmware on 2026-09-27
+// (ESP-IDF's CSL receiver needed four driver/OpenThread workarounds and still cost several times
+// the no-CSL power, and the border router's RCP hung under it), so the entity has nothing left to
+// report. Same empty-retained-payload removal and QoS 0 as retire_old_rtc_cal_mode() above.
+static void retire_old_csl_status_discovery(esp_mqtt_client_handle_t client, std::string_view device_id)
+{
+    std::array<char, TOPIC_BUF> topicBuf;
+    if (format_into(topicBuf, DISCOVERY_TOPIC_FMT, device_id, "csl_status") != 0)
+        esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 0, 1);
+}
+
 // Issues all 11 publish_number_discovery() calls -- the ONE place these entities' HA-visible
 // names/units/ranges are decided; ranges come straight from runtime_config.h so the clamp
 // applied on the device side can never drift from what HA's UI advertises. Current values come
@@ -1233,7 +1245,7 @@ static bool run_publish_cycle(const PublishParams &params)
 
             // Discovery configs still owed this boot for the values present in THIS cycle.
             // DISC_UPDATE (the HA update entity + installed-version pair) and DISC_DIAG (the
-            // boot-constant Boot count + Reset reason + CSL status triplet) aren't tied to any
+            // boot-constant Boot count + Reset reason pair) aren't tied to any
             // sensor value, so they're owed on whichever publishing cycle comes first.
             const auto discoveryWant = static_cast<uint16_t>((hasTemp ? DISC_TEMP : 0)
                                                           | (hasHumid ? DISC_HUM : 0)
@@ -1254,7 +1266,7 @@ static bool run_publish_cycle(const PublishParams &params)
 
             // Expected ACKs must match what we actually publish below: one state message plus one
             // discovery message per still-owed sensor (two for DISC_BATT: Battery and Voltage;
-            // three for DISC_DIAG: Boot count, Reset reason, and CSL status; two for DISC_UPDATE:
+            // two for DISC_DIAG: Boot count and Reset reason; two for DISC_UPDATE:
             // update config and installed-version; NUMBER_ENTITY_MSGS for DISC_NUMBERS, discovery
             // config + current-value state per HA `number` entity, NUMBER_ENTITY_COUNT entities x 2
             // messages; two for DISC_SWITCH, discovery config + current-value state; two for DISC_HEATER: Heater
@@ -1267,7 +1279,7 @@ static bool run_publish_cycle(const PublishParams &params)
                                      + ((discoveryNeed & DISC_HUM) ? 1 : 0)
                                      + ((discoveryNeed & DISC_BATT) ? 2 : 0)
                                      + ((discoveryNeed & DISC_RSSI) ? 1 : 0)
-                                     + ((discoveryNeed & DISC_DIAG) ? 3 : 0)
+                                     + ((discoveryNeed & DISC_DIAG) ? 2 : 0)
                                      + ((discoveryNeed & DISC_UPDATE) ? 2 : 0)
                                      + ((discoveryNeed & DISC_NUMBERS) ? NUMBER_ENTITY_MSGS : 0)
                                      + ((discoveryNeed & DISC_SWITCH) ? 2 : 0)
@@ -1318,9 +1330,7 @@ static bool run_publish_cycle(const PublishParams &params)
                 publish_discovery(client, dev, dev_name,
                     {.name = "Reset reason", .topic_slug = "reset_reason", .key = "rr",
                      .diagnostic = true});
-                publish_discovery(client, dev, dev_name,
-                    {.name = "CSL status", .topic_slug = "csl_status", .key = "csl",
-                     .diagnostic = true});
+                retire_old_csl_status_discovery(client, dev);
             }
             if (discoveryNeed & DISC_HEATER) {
                 publish_binary_discovery(client, dev, dev_name,
@@ -1420,13 +1430,12 @@ static bool run_publish_cycle(const PublishParams &params)
                 if (stateLen > 0 && hasUplinkRssi)
                     stateLen = format_append(stateBuf, stateLen - 1, STATE_UPLINK_SUFFIX_FMT,
                                              *link->uplinkRssiDbm);
-                // Boot count, reset reason and CSL status are boot-constant, so they're re-sent on
+                // Boot count and reset reason are boot-constant, so they're re-sent on
                 // every state message -- otherwise their entities would go stale-then-unavailable
                 // under expire_after while the rest of the device keeps reporting.
                 if (stateLen > 0)
                     stateLen = format_append(stateBuf, stateLen - 1, STATE_DIAG_SUFFIX_FMT,
-                                             s_cfg.boot_count, s_cfg.reset_reason,
-                                             s_link->cslStatus ? s_link->cslStatus() : std::string_view("n/a"));
+                                             s_cfg.boot_count, s_cfg.reset_reason);
                 // TX power in effect right now -- also boot-constant availability (always some
                 // value, table max at the very least), so also re-sent every state message.
                 if (stateLen > 0)

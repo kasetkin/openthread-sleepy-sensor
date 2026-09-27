@@ -193,13 +193,6 @@ public:
     using RefreshNat64 = std::function<void()>;
     void configureRefreshNat64(RefreshNat64 refreshNat64);
 
-    /// Reports this cycle's real outcome (a confirmed, broker-ACKed publish, or false) for
-    /// link-layer state machines that need proof of a working round trip before trusting a
-    /// risky setting -- today just CSL engagement (see main/net/openthread_link.cpp). Injected
-    /// by main; called at the same tap points as runtime_config_tx_power_note_cycle_result().
-    using NoteCycleResult = std::function<void(bool ok)>;
-    void configureNoteCycleResult(NoteCycleResult noteCycleResult);
-
 private:
     /// Recovery: reboot after this many CONSECUTIVE confirmed LP-core-stall wakes (a full
     /// safeguard window with zero LP heartbeat progress -- see executeTask()). This is the
@@ -238,7 +231,6 @@ private:
     SensorsReadyEvent m_readyEvent;
     AttachGate m_attachGate;
     RefreshNat64 m_refreshNat64;
-    NoteCycleResult m_noteCycleResult;
 
     adc_oneshot_unit_handle_t adc1_handle = nullptr;
     adc_cali_handle_t adc1_cali_chan0_handle = nullptr;

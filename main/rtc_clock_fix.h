@@ -12,7 +12,7 @@
 // 1024-cycle ones); its moment is what's wrong.
 //
 // So calibrate RTC_SLOW in a light-sleep exit callback instead, right after the wake and before
-// OpenThread turns the radio on (a CSL window opens >= 2.3 ms later), while the die is still at its
+// OpenThread turns the radio on, while the die is still at its
 // sleeping temperature, and hand the mean of the last few such "cold" values to ESP-IDF's sleep path
 // through a -Wl,--wrap=rtc_clk_cal. Same 10-cycle calibration, same cost, different moment. Measured
 // against the border router's clock: +670..+830 ppm -> -48 +-0.7 ppm (2026-09-23, 19 h, 8 samples).
@@ -20,8 +20,8 @@
 // ESP-IDF stores whatever the sleep path got as the global RTC_SLOW calibration
 // (esp_clk_slowclk_cal_set() in sleep_modes.c), so everything else timed off RTC_SLOW gets the cold
 // value too -- the LP core's wake timer, which reads it back every time it re-arms, among them. And
-// every wake calibrates: each CSL window, lwIP's ~1 s timers, the 70 s idle data poll. So the value
-// is as fresh as the wake cadence, whether CSL is on or not and however seldom data is published.
+// every wake calibrates: lwIP's ~1 s timers, the 70 s idle data poll, each publish. So the value
+// is as fresh as the wake cadence, however seldom data is published.
 //
 // A single calibration scatters by ~590 ppm. A moving average only smooths that over its own span --
 // it preserves the sum of its inputs, so over tens of seconds the clock barely notices the count --

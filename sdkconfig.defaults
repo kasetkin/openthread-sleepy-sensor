@@ -43,19 +43,6 @@ CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
 # IEEE802154_TIMING_OPTIMIZATION and OPENTHREAD_TIMING_OPTIMIZATION.
 CONFIG_OPENTHREAD_RADIO_STATS_ENABLE=y
 CONFIG_OPENTHREAD_LINK_METRICS=y
-# CSL (Coordinated Sampled Listening, Thread 1.2+): builds the CSL receiver in. It only runs
-# when device_config.yaml's csl_period_ms is non-zero -- see openthread_link.cpp. It adds
-# scheduled receive windows on top of data polling, not instead of it. Already selects
-# IEEE802154_TIMING_OPTIMIZATION/OPENTHREAD_TIMING_OPTIMIZATION, but
-# CONFIG_OPENTHREAD_LINK_METRICS above already selects both.
-CONFIG_OPENTHREAD_CSL_ENABLE=y
-# Our clock accuracy as seen by CSL, in +-ppm; default 50. Each receive window is widened by
-# (this + the parent's ppm) x time since the last sync, so raising it costs power on every
-# window. Held at the default while the UART capture measures what the windows actually cost:
-# the rxat win_us/lead_us counters make the widening observable, and 255 (the uint8 maximum)
-# was going to change both the thing being measured and the measurement. Raise it only if that
-# capture leaves clock drift as a live explanation for the idle delivery misses.
-CONFIG_OPENTHREAD_CSL_ACCURACY=50
 # end of OpenThread
 
 #
