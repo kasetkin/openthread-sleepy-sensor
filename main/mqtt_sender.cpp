@@ -29,6 +29,8 @@ static const char *TAG = "mqtt-sender";
 static constexpr EventBits_t BIT_CONNECTED = BIT0;
 static constexpr EventBits_t BIT_ALL_ACKED = BIT1;
 static constexpr EventBits_t BIT_ERROR     = BIT2;
+// Pulsed on every PUBACK/SUBACK/UNSUBACK -- wakes wait_outbox_empty() to re-check the outbox.
+static constexpr EventBits_t BIT_ACK_EVENT = BIT3;
 
 // Separate, module-level event group used only to signal "no publish cycle in flight".
 static constexpr EventBits_t BIT_IDLE = BIT0;
@@ -38,6 +40,10 @@ static constexpr EventBits_t BIT_IDLE = BIT0;
 // learned, only for an IPv4 broker; Wi-Fi: always immediate). After attach a NAT64
 // route can land slightly late; a few seconds covers the gap.
 static constexpr uint32_t BROKER_REACHABLE_WAIT_MS = 5000;
+
+// Upper bound on wait_outbox_empty() at the end of a healthy cycle: two 500 ms fast polls, enough
+// for the last PUBACK/SUBACK to come down without letting a stalled one hold the radio awake.
+static constexpr uint32_t OUTBOX_DRAIN_CAP_MS = 1000;
 
 // Which sensors' HA-discovery configs have been confirmed sent this boot. Per-sensor bits, not
 // one bool: each cycle publishes configs only for the values actually present, so a first cycle
@@ -547,6 +553,13 @@ static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
     case MQTT_EVENT_PUBLISHED:
         if (ctx->received_acks.fetch_add(1) + 1 >= ctx->expected_acks.load())
             xEventGroupSetBits(ctx->eg, BIT_ALL_ACKED);
+        xEventGroupSetBits(ctx->eg, BIT_ACK_EVENT);
+        break;
+    case MQTT_EVENT_SUBSCRIBED:
+    case MQTT_EVENT_UNSUBSCRIBED:
+        // SUBSCRIBEs sit in the outbox until their SUBACK just like QoS-1 publishes do, so the
+        // outbox drain must wake on these too, not only on PUBACKs.
+        xEventGroupSetBits(ctx->eg, BIT_ACK_EVENT);
         break;
     case MQTT_EVENT_DATA: {
         // Inbound traffic exists solely for OTA (retained manifest/install replies, and the
@@ -659,7 +672,7 @@ static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
 {
     esp_mqtt_client_config_t cfg = build_client_config(uri, OTA_MQTT_RX_BUFFER_SIZE);
     ESP_LOGI(TAG, "connecting (OTA) to %s (tls=%d)", uri, static_cast<int>(s_cfg.use_tls));
-    xEventGroupClearBits(ctx.eg, BIT_CONNECTED | BIT_ALL_ACKED | BIT_ERROR);
+    xEventGroupClearBits(ctx.eg, BIT_CONNECTED | BIT_ALL_ACKED | BIT_ERROR | BIT_ACK_EVENT);
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(client, MQTT_EVENT_ANY, mqtt_event_handler, &ctx);
     esp_mqtt_client_start(client);
@@ -691,7 +704,7 @@ static esp_mqtt_client_handle_t start_persistent_client(const char *uri)
     }
 
     ESP_LOGI(TAG, "connecting (persistent) to %s (tls=%d)", uri, static_cast<int>(s_cfg.use_tls));
-    xEventGroupClearBits(s_persistentEg, BIT_CONNECTED | BIT_ALL_ACKED | BIT_ERROR);
+    xEventGroupClearBits(s_persistentEg, BIT_CONNECTED | BIT_ALL_ACKED | BIT_ERROR | BIT_ACK_EVENT);
     esp_mqtt_client_start(s_persistentClient);
     return s_persistentClient;
 }
@@ -859,36 +872,39 @@ static void publish_number_discovery(esp_mqtt_client_handle_t client, std::strin
 // the wrong unit). Publishing an empty retained payload to its old discovery topic is MQTT
 // discovery's standard removal convention, so HA drops the stale entity instead of showing it
 // permanently "unavailable". Safe to publish every discovery cycle indefinitely -- idempotent
-// and negligible cost -- so no one-shot guard is needed.
+// and negligible cost -- so no one-shot guard is needed. QoS 0: nothing waits for it, and a
+// QoS-1 PUBACK would be counted towards the discovery ACKs the cycle does wait for, firing
+// BIT_ALL_ACKED one real ACK early.
 static void retire_old_max_skip_cycles_discovery(esp_mqtt_client_handle_t client, std::string_view device_id)
 {
     std::array<char, TOPIC_BUF> topicBuf;
     const size_t topicLen = format_into(topicBuf, NUMBER_DISCOVERY_TOPIC_FMT, device_id, "max_skip_cycles");
     if (topicLen == 0)
         return;  // format_into() already logged the truncation
-    esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 1, 1);
+    esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 0, 1);
 }
 
 // Retires the short-lived "Battery ADC time" diagnostic (confirmed negligible, ~2 ms/cycle, by
 // the light-sleep power investigation -- see project_light_sleep_power_investigation memory),
-// same "empty retained payload to the old discovery topic" removal convention as
-// retire_old_max_skip_cycles_discovery() above, called from the same kind of already-gated call
-// site (see its call in the DISC_BATT block below) rather than unconditionally every cycle.
+// same "empty retained payload to the old discovery topic" removal convention and QoS 0 (same
+// reason) as retire_old_max_skip_cycles_discovery() above, called from the same kind of
+// already-gated call site (see its call in the DISC_BATT block below) rather than
+// unconditionally every cycle.
 static void retire_old_battery_adc_time_discovery(esp_mqtt_client_handle_t client, std::string_view device_id)
 {
     std::array<char, TOPIC_BUF> topicBuf;
     const size_t topicLen = format_into(topicBuf, DISCOVERY_TOPIC_FMT, device_id, "battery_adc_time");
     if (topicLen == 0)
         return;  // format_into() already logged the truncation
-    esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 1, 1);
+    esp_mqtt_client_publish(client, topicBuf.data(), "", 0, 0, 1);
 }
 
 // Retires the "Sleep clock cal mode" HA entity (cfg/rtc_cal_mode: 0 = ESP-IDF, 1 = latest cold
 // calibration, 2 = mean of the cold ones), replaced by "Sleep clock cal samples" (0 = ESP-IDF,
 // N = mean of the last N) -- and its retained value with it, which the cfg/# subscription would
-// otherwise keep handing back every wake. Same empty-retained-payload removal as above, but at
-// QoS 0: nothing waits for these, and a PUBACK here would count towards the discovery ACKs the
-// cycle does wait for (the two helpers above publish at QoS 1 without being counted).
+// otherwise keep handing back every wake. Same empty-retained-payload removal as above, and like
+// every retire_old_*() helper at QoS 0: nothing waits for these, and an uncounted PUBACK would
+// count towards the discovery ACKs the cycle does wait for.
 static void retire_old_rtc_cal_mode(esp_mqtt_client_handle_t client, std::string_view device_id)
 {
     std::array<char, TOPIC_BUF> topicBuf;
@@ -1075,6 +1091,27 @@ static void replay_history_if_pending(esp_mqtt_client_handle_t client, std::stri
         }
         history_log_advance(replayed.size());
         ESP_LOGI(TAG, "replayed %zu backlog entries", replayed.size());
+    }
+}
+
+// Waits until esp-mqtt's outbox is empty, i.e. every QoS-1 PUBACK and SUBACK is in: an ACK still
+// in flight at close() is unread data, lwIP answers it with RST instead of FIN, and the broker's
+// reply then waits 70 s at the border router for the next idle poll. esp-mqtt deletes the outbox
+// entry before dispatching the matching event, so each BIT_ACK_EVENT wake sees the new size; a
+// stale bit from earlier in the cycle only costs one extra check. Elapsed-vs-cap, never
+// `now >= deadline`: the 1 kHz tick wraps every ~49.7 days of uptime.
+static void wait_outbox_empty(esp_mqtt_client_handle_t client, EventGroupHandle_t eg, uint32_t cap_ms)
+{
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t cap = pdMS_TO_TICKS(cap_ms);
+    while (esp_mqtt_client_get_outbox_size(client) > 0) {
+        const TickType_t elapsed = xTaskGetTickCount() - start;
+        if (elapsed >= cap) {
+            ESP_LOGW(TAG, "closing with %d outbox bytes unacknowledged",
+                     esp_mqtt_client_get_outbox_size(client));
+            return;
+        }
+        xEventGroupWaitBits(eg, BIT_ACK_EVENT, pdTRUE, pdFALSE, cap - elapsed);
     }
 }
 
@@ -1482,6 +1519,13 @@ static bool run_publish_cycle(const PublishParams &params)
             // than risk being delayed behind a potentially multi-minute OTA session.
             if (ok || !hasAny)
                 runtime_config_apply_pending(client);
+
+            // Last step before stop(): let the uncounted QoS-1 traffic above (the runtime-config
+            // echoes, the SUBACKs) finish so the close is a clean FIN -- see wait_outbox_empty().
+            // Healthy cycles only: on a failed one the unACKed state message would just burn
+            // another second on a link that already missed its 4 s ACK wait.
+            if (ok || !hasAny)
+                wait_outbox_empty(client, eg, OUTBOX_DRAIN_CAP_MS);
         } else {
             ESP_LOGE(TAG, "MQTT connection failed, skipping cycle");
         }
