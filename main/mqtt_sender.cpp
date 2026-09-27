@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <format>
 #include <memory>
@@ -20,6 +21,7 @@
 #include "mqtt_client.h"
 #include "lwip/priv/tcp_priv.h"     // tcp_active_pcbs / tcp_tw_pcbs
 #include "lwip/priv/tcpip_priv.h"   // tcpip_api_call()
+#include "lwip/sockets.h"           // setsockopt() / SO_LINGER
 
 #include "ota_updater.h"
 #include "history_log.h"
@@ -1141,6 +1143,33 @@ static bool lwip_tcp_idle()
     return tcpip_api_call(tcp_idle_fn, &call) == ERR_OK;
 }
 
+// SO_LINGER {1, 0}: lwIP then aborts (RST, PCB freed at once) only when close() finds unsent or
+// unacked data -- a failed ACK wait, or stop() racing the MQTT task before the DISCONNECT is
+// ACKed. A normal close with everything ACKed is still a FIN, so close_session()'s healthy path
+// is unchanged. Without it such a close parks the PCB in FIN_WAIT_1, retransmitting on
+// exponential backoff (up to TCP_MAXRTX) while lwIP's 250 ms TCP timer keeps waking us for
+// minutes -- and lwip_tcp_idle() would see it and run every later healthy close to its cap. No
+// last will is configured, so the broker seeing an RST changes nothing in HA. Must run on every
+// connect: each one is a new socket.
+static void set_abortive_close(esp_mqtt_client_handle_t client)
+{
+    // esp_mqtt_client_get_transport() takes a non-const char *; the transport list is keyed by
+    // the scheme of the URI brokerUri() built (mqttScheme()). "mqtts" fits the SSO buffer.
+    std::string scheme(mqttScheme(s_cfg.use_tls));
+    const esp_transport_handle_t transport = esp_mqtt_client_get_transport(client, scheme.data());
+    const int fd = transport ? esp_transport_get_socket(transport) : -1;
+    if (fd < 0) {
+        ESP_LOGW(TAG, "abortive close: no socket for %s transport", scheme.c_str());
+        return;
+    }
+
+    struct linger lg = {};
+    lg.l_onoff = 1;
+    lg.l_linger = 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)) != 0)
+        ESP_LOGW(TAG, "abortive close: SO_LINGER on fd %d failed, errno %d", fd, errno);
+}
+
 // Closes the persistent client's session. The broker closes first, so our socket ends in
 // LAST_ACK waiting for the broker's final ACK, which reaches the parent ~4 ms after our FIN --
 // at the window's 500 ms poll (or the 70 s idle poll right after) it would sit there while
@@ -1314,6 +1343,8 @@ static bool run_publish_cycle(const PublishParams &params)
             : EventBits_t{0};
 
         if (bits & BIT_CONNECTED) {
+            set_abortive_close(client);  // fresh socket every connect
+
             MqttCtx &ctx = s_persistentCtx;
             const EventGroupHandle_t eg = s_persistentEg;
             const std::string_view dev = s_cfg.device_id;

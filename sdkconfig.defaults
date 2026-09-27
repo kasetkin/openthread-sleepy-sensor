@@ -59,6 +59,16 @@ CONFIG_LWIP_ND6=y
 # SLAAC (RFC 4862) global/ULA address generation on the Wi-Fi STA netif, for
 # wifi_address_family: "ipv6". Needs CONFIG_LWIP_ND6=y above to process Router Advertisements.
 CONFIG_LWIP_IPV6_AUTOCONFIG=y
+# Closing-socket lifetimes. lwIP's on-demand 250 ms TCP timer runs while any PCB is active or
+# in TIME_WAIT, and every tick is a light-sleep wake. TCP_MSL only sets the LAST_ACK and
+# TIME_WAIT (2xMSL) lifetimes; 2 s instead of 120 s of TIME_WAIT loses nothing here, since
+# every connect uses a fresh ephemeral port.
+CONFIG_LWIP_TCP_MSL=1000
+# FIN_WAIT_2 lifetime when the broker never sends its FIN: 2 s instead of 20 s of timer wakes.
+CONFIG_LWIP_TCP_FIN_WAIT_TIMEOUT=2000
+# Lets mqtt_sender.cpp set SO_LINGER {1, 0} on the MQTT socket: a close() that still has unacked
+# data (failed ACK wait) then sends RST instead of retransmitting a FIN for minutes.
+CONFIG_LWIP_SO_LINGER=y
 # end of lwIP
 
 #
