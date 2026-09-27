@@ -89,6 +89,14 @@ struct NetworkLink
     std::function<void()> onOtaWindowBegin;
     std::function<void()> onOtaWindowEnd;
 
+    // MQTT session-close hooks (OT: a short burst of very fast polls so the broker's closing
+    // ACK/FIN come down while the socket is still in its close handshake, instead of waiting at
+    // the parent for the next poll while lwIP's TCP timer keeps waking us; Wi-Fi: no-op). They
+    // bracket the persistent client's close and, like the OTA hooks, nest inside a publish
+    // window, so onSessionClosed restores the window's fast period.
+    std::function<void()> onSessionClosing;
+    std::function<void()> onSessionClosed;
+
     // Recovery after a failed publish (OT: re-scan NAT64 route; Wi-Fi: reconnect kick).
     std::function<void()> refresh;
 

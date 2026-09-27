@@ -63,9 +63,19 @@ static std::string s_ot_tlv_hex;
 // parent-buffered downlink) must flow with gaps well under esp-mqtt's ~1 s mid-message
 // no-progress abort, and the nominal period bounds the first-frame latency of every burst
 // (frame-pending chaining keeps subsequent polls back-to-back on its own).
-static constexpr uint32_t POLL_FAST_MS = 500;
-static constexpr uint32_t POLL_OTA_MS  = 50;
-static constexpr uint32_t POLL_SLOW_MS = 70000;
+// The MQTT session close gets a short burst of its own: the broker closes first, and its
+// final ACK reaches the parent ~4 ms after our FIN -- at the window period it would wait for
+// the next poll while lwIP's 250 ms TCP timer keeps waking us, or at the slow period until
+// our FIN retransmit. Under an external period (otLinkSetPollPeriod) OT's poll timer is
+// free-running (ResetKeepAliveTimer() only acts at the MLE default period), and switching to
+// a shorter period fires the first poll after kMinPollPeriod, usually before the reply is
+// queued, so 1-2 empty polls are expected. 40 ms is ~10x the router->broker->router
+// turnaround and well above OT's 10 ms minimum; like the OTA burst it only changes the poll
+// period -- the hardware-proven-safe kind of radio change, unlike rx-on-when-idle or CSL.
+static constexpr uint32_t POLL_FAST_MS  = 500;
+static constexpr uint32_t POLL_OTA_MS   = 50;
+static constexpr uint32_t POLL_CLOSE_MS = 40;
+static constexpr uint32_t POLL_SLOW_MS  = 70000;
 
 static void set_poll_period(uint32_t ms)
 {
@@ -527,6 +537,9 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
                                    set_poll_period(POLL_OTA_MS); };
     link.onOtaWindowEnd = []() { ESP_LOGI(TAG, "OTA window end: poll %lu ms", (unsigned long)POLL_FAST_MS);
                                  set_poll_period(POLL_FAST_MS); };
+    // Same nesting as the OTA hooks, but silent: these run every cycle.
+    link.onSessionClosing = []() { set_poll_period(POLL_CLOSE_MS); };
+    link.onSessionClosed = []() { set_poll_period(POLL_FAST_MS); };
     link.refresh = refresh_nat64_prefix;
     link.readLinkStats = read_link_stats;
     link.setTxPowerDbm = set_tx_power_dbm;

@@ -18,6 +18,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "mqtt_client.h"
+#include "lwip/priv/tcp_priv.h"     // tcp_active_pcbs / tcp_tw_pcbs
+#include "lwip/priv/tcpip_priv.h"   // tcpip_api_call()
 
 #include "ota_updater.h"
 #include "history_log.h"
@@ -41,9 +43,16 @@ static constexpr EventBits_t BIT_IDLE = BIT0;
 // route can land slightly late; a few seconds covers the gap.
 static constexpr uint32_t BROKER_REACHABLE_WAIT_MS = 5000;
 
-// Upper bound on wait_outbox_empty() at the end of a healthy cycle: two 500 ms fast polls, enough
-// for the last PUBACK/SUBACK to come down without letting a stalled one hold the radio awake.
+// Upper bound on wait_outbox_empty() at the end of a healthy cycle: two 500 ms window polls (the
+// drain runs inside the 40 ms close burst, so a normal one takes tens of ms), enough for the last
+// PUBACK/SUBACK to come down without letting a stalled one hold the radio awake.
 static constexpr uint32_t OUTBOX_DRAIN_CAP_MS = 1000;
+// Upper bound on close_session()'s tail (stop() returned, lwIP still holds the PCB): a few FIN/ACK
+// round trips at the 40 ms close poll; past it the link is misbehaving, so give up on the burst.
+static constexpr uint32_t CLOSE_TAIL_CAP_MS = 300;
+// How often that tail re-checks lwIP: half the close poll period, so the burst usually ends
+// before one more poll goes out.
+static constexpr uint32_t CLOSE_TAIL_CHECK_MS = 20;
 
 // Which sensors' HA-discovery configs have been confirmed sent this boot. Per-sensor bits, not
 // one bool: each cycle publishes configs only for the values actually present, so a first cycle
@@ -1115,6 +1124,64 @@ static void wait_outbox_empty(esp_mqtt_client_handle_t client, EventGroupHandle_
     }
 }
 
+// Runs on the tcpip thread (via tcpip_api_call(); core locking is off in this build, so the
+// lists can't be read from here directly). tcp_active_pcbs || tcp_tw_pcbs is exactly the
+// condition that keeps lwIP's on-demand 250 ms TCP timer armed.
+static err_t tcp_idle_fn(struct tcpip_api_call_data *)
+{
+    return (tcp_active_pcbs || tcp_tw_pcbs) ? ERR_INPROGRESS : ERR_OK;
+}
+
+// True once lwIP holds no TCP connection in any state that keeps its 250 ms timer running.
+// MQTT is this firmware's only TCP user, and the temporary OTA client is never alive when this
+// is called -- it runs after the persistent client's close.
+static bool lwip_tcp_idle()
+{
+    tcpip_api_call_data call{};
+    return tcpip_api_call(tcp_idle_fn, &call) == ERR_OK;
+}
+
+// Closes the persistent client's session. The broker closes first, so our socket ends in
+// LAST_ACK waiting for the broker's final ACK, which reaches the parent ~4 ms after our FIN --
+// at the window's 500 ms poll (or the 70 s idle poll right after) it would sit there while
+// lwIP's 250 ms TCP timer keeps waking us and our FIN gets retransmitted. So the whole close
+// runs inside a 40 ms poll burst (NetworkLink::onSessionClosing) that lasts until lwIP holds no
+// TCP PCB. The outbox drain is inside the burst on purpose: an echo PUBACK still in flight then
+// comes down within ~40 ms instead of ~500 ms, shortening the connection and its timer too.
+static void close_session(esp_mqtt_client_handle_t client, EventGroupHandle_t eg, bool healthy)
+{
+    if (!healthy) {
+        // Failed cycle: the router/broker isn't answering, fast polls would only burn frames.
+        esp_mqtt_client_stop(client);
+        return;
+    }
+
+    s_link->onSessionClosing();
+    const TickType_t drainStart = xTaskGetTickCount();
+    wait_outbox_empty(client, eg, OUTBOX_DRAIN_CAP_MS);
+    const TickType_t stopStart = xTaskGetTickCount();
+    esp_mqtt_client_stop(client);  // DISCONNECT out, broker's FIN in, our FIN out
+    const TickType_t tailStart = xTaskGetTickCount();
+
+    // Elapsed-vs-cap, wrap-safe like wait_outbox_empty().
+    const TickType_t tailCap = pdMS_TO_TICKS(CLOSE_TAIL_CAP_MS);
+    bool idle = lwip_tcp_idle();
+    while (!idle && xTaskGetTickCount() - tailStart < tailCap) {
+        vTaskDelay(pdMS_TO_TICKS(CLOSE_TAIL_CHECK_MS));
+        idle = lwip_tcp_idle();
+    }
+    const TickType_t end = xTaskGetTickCount();
+
+    // INFO for hardware verification (expected tail ~40-120 ms, never the cap on a healthy
+    // link); demote to DEBUG once verified.
+    ESP_LOGI(TAG, "close: drain %lu ms, stop %lu ms, tail %lu ms%s",
+             static_cast<unsigned long>(pdTICKS_TO_MS(stopStart - drainStart)),
+             static_cast<unsigned long>(pdTICKS_TO_MS(tailStart - stopStart)),
+             static_cast<unsigned long>(pdTICKS_TO_MS(end - tailStart)),
+             idle ? "" : " (cap)");
+    s_link->onSessionClosed();  // OT: back to the window's 500 ms poll
+}
+
 // Runs the OTA session when one is due, then — the v5 stability core — reconnects and
 // resumes IN THIS CYCLE for as long as sessions keep dying by connection loss while making
 // progress. v4 ended the cycle on the first abort, so every ~1 s radio hiccup cost the
@@ -1519,13 +1586,6 @@ static bool run_publish_cycle(const PublishParams &params)
             // than risk being delayed behind a potentially multi-minute OTA session.
             if (ok || !hasAny)
                 runtime_config_apply_pending(client);
-
-            // Last step before stop(): let the uncounted QoS-1 traffic above (the runtime-config
-            // echoes, the SUBACKs) finish so the close is a clean FIN -- see wait_outbox_empty().
-            // Healthy cycles only: on a failed one the unACKed state message would just burn
-            // another second on a link that already missed its 4 s ACK wait.
-            if (ok || !hasAny)
-                wait_outbox_empty(client, eg, OUTBOX_DRAIN_CAP_MS);
         } else {
             ESP_LOGE(TAG, "MQTT connection failed, skipping cycle");
         }
@@ -1535,8 +1595,13 @@ static bool run_publish_cycle(const PublishParams &params)
         // started, parks itself in a periodically-waking reconnect-wait loop rather than
         // exiting on its own (traced in mqtt_client.c's MQTT_STATE_WAIT_RECONNECT case) --
         // left running between cycles it would repeatedly defeat automatic light sleep.
+        // close_session() stops it either way; only a healthy cycle (same bar as replay/config
+        // above) also drains the uncounted QoS-1 traffic (runtime-config echoes, SUBACKs) so the
+        // close is a clean FIN, and runs the fast-poll close burst -- on a failed one the unACKed
+        // state message would just burn another second on a link that already missed its 4 s
+        // ACK wait.
         if (client)
-            esp_mqtt_client_stop(client);
+            close_session(client, s_persistentEg, (bits & BIT_CONNECTED) && (ok || !hasAny));
     }
 
     // A staged update only starts from a healthy cycle: for a data-carrying cycle that means

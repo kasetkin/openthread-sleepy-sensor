@@ -192,6 +192,8 @@ NetworkLink makeWifiLink(const NetworkLinkConfig &cfg)
     link.onPublishWindowEnd = noop;
     link.onOtaWindowBegin = noop;   // Wi-Fi STA is already always-RX during the awake window
     link.onOtaWindowEnd = noop;
+    link.onSessionClosing = noop;
+    link.onSessionClosed = noop;
     link.refresh = refresh;
     link.readLinkStats = readApLinkStats;
     link.setTxPowerDbm = set_tx_power_dbm;
