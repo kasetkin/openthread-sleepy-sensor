@@ -74,32 +74,6 @@ static void set_poll_period(uint32_t ms)
     esp_openthread_lock_release();
 }
 
-// Whether the current Thread parent advertises CSL support (Mle::IsCslSupported(): attached AND
-// parent is Thread 1.2+) -- read-only, engages nothing. Deliberately NOT calling
-// otLinkSetCslPeriod() anywhere: that call is not passive observation -- since a sleepy child is
-// already marked CSL-capable the moment it attaches to a 1.2+ parent, SetPeriod(nonzero)
-// immediately flips Mac::mIsCslEnabled and reprograms the radio's real receive schedule via
-// otPlatRadioEnableCsl(). Calling that right after attach (this project's first attempt, wired
-// through onFirstAttach) is the same hazard class as the mRxOnWhenIdle mid-attach black-hole
-// documented below: hardware-confirmed across two OTA flashes to leave every publish cycle
-// unable to reach the broker (reset reason "ota_unconfirmed" both times) for the rest of the
-// boot, since nothing ever calls SetPeriod(0) to undo it. Re-enabling real CSL needs a much more
-// careful staging (not at first-attach, with a revert path from the start) -- see the CSL
-// integration plan/memory before trying again.
-static std::string_view cslStatus()
-{
-    otInstance *ot = esp_openthread_get_instance();
-
-    esp_openthread_lock_acquire(portMAX_DELAY);
-    const otDeviceRole role = otThreadGetDeviceRole(ot);
-    const bool supported = otLinkIsCslSupported(ot);
-    esp_openthread_lock_release();
-
-    if (role == OT_DEVICE_ROLE_DISABLED || role == OT_DEVICE_ROLE_DETACHED)
-        return "detached";
-    return supported ? "supported" : "unsupported";
-}
-
 static esp_err_t set_tx_power_dbm(int8_t dbm)
 {
     esp_openthread_lock_acquire(portMAX_DELAY);
@@ -293,8 +267,8 @@ static std::optional<LinkStats> read_link_stats()
 // OTA-download link boost. Deliberately just a faster data-poll cadence, NOT
 // rx-on-when-idle: flipping mRxOnWhenIdle mid-attach was tried and hardware-observed to
 // black-hole downlink right after the switch (the child stops polling immediately while
-// the parent still queues frames for a "sleepy" child until the MLE mode renegotiation —
-// and its CSL scheduling — fully lands), which trips esp-mqtt's ~1 s mid-message
+// the parent still queues frames for a "sleepy" child until the MLE mode renegotiation
+// fully lands), which trips esp-mqtt's ~1 s mid-message
 // no-progress abort on the very first chunk, every time. Fast polling is the same
 // mechanism every ordinary publish window uses, so there is no mode change to renegotiate
 // and no new radio state to trust; frame-pending chaining keeps the effective chunk
@@ -556,6 +530,5 @@ NetworkLink makeThreadLink(const NetworkLinkConfig &cfg)
     link.refresh = refresh_nat64_prefix;
     link.readLinkStats = read_link_stats;
     link.setTxPowerDbm = set_tx_power_dbm;
-    link.cslStatus = cslStatus;
     return link;
 }

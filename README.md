@@ -137,6 +137,8 @@ survives a power cycle.
 | Heater high-RH trigger | `heater_high_rh_trigger_minutes` | 0 .. 1440 min |
 | Sensor samples | `sensor_samples` | 1 .. 16 |
 | External antenna | *(no YAML key — HA/NVS only)* | on/off |
+| Sleep clock cal samples | `rtc_cal_samples` | 0 .. 32 (0 = ESP-IDF's own) |
+| Sleep clock cal period | `rtc_cal_period_sec` | 0 (off), 30 .. 3600 s |
 
 Each entity is backed by one retained MQTT topic, `<device_id>/cfg/<name>` (see
 [runtime_config.h](main/runtime_config.h) for the exact contract), which the device subscribes
@@ -144,13 +146,20 @@ to as a single `<device_id>/cfg/#` wildcard each wake — same "retained command
 can't miss" idiom the OTA `install` topic uses above. `state_topic` and `command_topic` are the
 same topic: HA publishes a new value there (retained), and after validating/clamping it the
 device applies it and republishes its own retained echo of the value actually in effect, so
-HA's display always matches reality, not just what was requested.
+HA's display always matches reality, not just what was requested. A value that's already in effect
+is left alone: every wake's subscribe hands back all the retained values, and the device receives
+its own echoes too, so a normal cycle applies, saves and publishes nothing. A TX power that fails
+its trial is the one exception that does get an echo: the known-good value, published over the
+failed one so the broker stops handing it back.
 
 The first 8 rows go straight into the LP core's shared-memory config block (the same one
 `lp_sensor_core_init()` populates at boot from `device_config.yaml`) and take effect on the LP
 core's very next wake. The external antenna switch is a GPIO-level analog RF-switch selection
 ([common_utils.h](main/common_utils.h)'s `enableExtAntenna()`) — also applied immediately, no
 reboot, since the switch is transparent to everything above the radio's physical layer.
+The two sleep-clock rows change how the HP core times its light sleeps
+([rtc_clock_fix.h](main/rtc_clock_fix.h)): the sample count from the very next sleep, the status
+period from the next status wake.
 
 Precedence at boot is **NVS override (if HA has ever set one) → `device_config.yaml` → compiled
 default** — editing `device_config.yaml` still works exactly as before for a device that has
@@ -289,18 +298,21 @@ Two things make it wrong to just set it and hope:
    it cannot respond to our own TX power at all. The entity that can is **"Uplink signal
    strength"**, fed by Thread 1.2 enhanced-ACK probing: the parent stamps its own measurement of
    our frames into the ACKs it returns. That one is absent on a Thread 1.1 border router, in
-   which case "Parent link quality" (0–3) and the TX retry/CCA/no-ack counters are the fallback.
+   which case the TX retry and CCA counters are the fallback.
 2. **The saving cannot be predicted without knowing radio duty cycle.** What reaches the battery
    is `ΔI_avg = ΔI_peak(P) × t_tx / cycle_period`. The **"Radio TX time"** diagnostic entity is
    that `t_tx` term. At ~5 ms/cycle the 20→12 dBm step is worth ~2 µA (≈1% of budget — not worth
    any link margin); at ~50 ms/cycle it is worth ~20 µA (≈10% — worth real work).
 
-Hence the diagnostic entities (Radio TX/RX time, TX retries, CCA failures, TX no-ack expiry,
-Parent link quality, Uplink signal strength), enabled by `CONFIG_OPENTHREAD_RADIO_STATS_ENABLE`
+Hence the diagnostic entities (Radio TX/RX time, TX retries, CCA failures, Uplink signal
+strength), enabled by `CONFIG_OPENTHREAD_RADIO_STATS_ENABLE`
 and `CONFIG_OPENTHREAD_LINK_METRICS` and read once per publish window as per-cycle deltas. They
 change no radio behaviour; they exist so the TX-power decision can be made from measurements
 rather than guessed. Note also that `CONFIG_OPENTHREAD_PARENT_SEARCH_RSS_THRESHOLD=-65` operates
 on *downlink* RSSI and does **not** interact with our transmit power.
+TX no-ack expiry and Parent link quality were published too until 2026-09, when they were dropped
+after reading 0 and 3 for the whole of a 19 h capture; both counters are still read on the device
+(and printed on the UART `link:` line), so an on-device controller can still gate on them.
 
 ### Measured result: the gate says build the knob
 

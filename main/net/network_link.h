@@ -112,12 +112,6 @@ struct NetworkLink
     // awake and the readings are fresh -- and so the delta fields cover exactly one cycle.
     // Calling it more than once per cycle would split those deltas across the calls.
     std::function<std::optional<LinkStats>()> readLinkStats;
-
-    // Whether the current Thread parent advertises CSL support: "supported"/"unsupported"/
-    // "detached" (OT), or "n/a" (Wi-Fi -- no Thread-CSL equivalent). Read-only -- does not
-    // engage CSL (see openthread_link.cpp's cslStatus() for why that's deliberate). Not folded
-    // into LinkStats: it's attach-scoped state, not a per-cycle telemetry delta.
-    std::function<std::string_view()> cslStatus;
 };
 
 struct NetworkLinkConfig

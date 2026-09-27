@@ -17,6 +17,7 @@
 #include "mqtt_sender.h"
 #include "runtime_config.h"
 #include "hp_awake_stats.h"
+#include "rtc_clock_fix.h"
 
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -217,6 +218,15 @@ extern "C" void app_main(void)
     // OpenThread's own radio-state PM lock (esp_openthread_sleep_init(), see esp_openthread
     // component) only gates sleep through this automatic path.
     ESP_ERROR_CHECK(enableAutomaticLightSleep());
+    // The light-sleep clock fix (see rtc_clock_fix.h). Started ahead of every other light-sleep
+    // exit callback so its wake-time calibration is the first thing after each wake. A failure
+    // leaves ESP-IDF's own calibration in charge, i.e. the fast clock, so it's logged, not fatal.
+    const uint32_t rtc_cal_samples = runtime_config_nvs_override(
+        parse_as_uint32_or(device_config_yaml(), "rtc_cal_samples", RTC_CAL_SAMPLES_DEFAULT), "rtc_cal_samples");
+    const uint32_t rtc_cal_period_sec = runtime_config_nvs_override(
+        parse_as_uint32_or(device_config_yaml(), "rtc_cal_period_sec", RTC_CAL_PERIOD_SEC_DEFAULT), "rtc_cal_per_s");
+    if (const esp_err_t err = rtc_clock_fix_start(rtc_cal_samples, rtc_cal_period_sec); err != ESP_OK)
+        ESP_LOGW("main", "rtc_clock_fix_start failed: %s", esp_err_to_name(err));
     // Sleep time before this point is untracked -- same ordering constraint as the call above.
     ESP_ERROR_CHECK(hp_awake_stats_init());
 

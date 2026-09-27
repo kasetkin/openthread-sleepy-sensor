@@ -38,3 +38,7 @@ cat > ~/.vscode-server/data/Machine/settings.json <<EOF
   }
 }
 EOF
+
+# Python deps of the project's own scripts that the IDF python env lacks
+# (tools/ota_push.py). Installed into the IDF env, which is `python3` on PATH.
+python -m pip install --quiet paho-mqtt
