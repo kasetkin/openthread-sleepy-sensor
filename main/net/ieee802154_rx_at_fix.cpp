@@ -40,9 +40,9 @@
 //    isn't receiving. Fix: remember that a window was armed, and on the next immediate receive
 //    cancel it with the driver's esp_ieee802154_sleep() first (stops timer1 and the ETM trigger),
 //    so RX really starts. Losing that one window costs nothing: the radio is in continuous RX from
-//    here until OpenThread schedules the next window. PART B stays correct without PART A: a flag
-//    left set for a window the driver itself skipped (or that already ran) is harmless, because
-//    sleep() is a no-op on a sleeping radio.
+//    here until OpenThread schedules the next window. PART B stays correct without PART A: PART A
+//    skips a window without touching the flag, and the flag still describes whatever was armed
+//    before. The flag is shared with PART C and kept exact for it -- see "The window flag" below.
 //    Accepted residual risk: if OpenThread asked for immediate RX while a window was actually
 //    mid-frame, sleep() would drop that frame. The poll path can't hit this -- the poll's own TX
 //    already cancelled any earlier window.
@@ -60,16 +60,20 @@
 //    Before the rework, SubMac put the radio to sleep from its CSL sampling whenever it wasn't
 //    sampling; since then it only does so for radios without receive timing. So here, with CSL
 //    on, SubMac::Sleep() calls RadioSample(), which never calls Radio::Sleep() and leaves it to the
-//    next CSL window to switch the radio off. The driver sleeps on its own after a finished TX or
-//    a received and ACKed frame, but a continuous receive that ends without a frame (the MAC's
-//    wait for data after a poll, its sleep delay between fragments) keeps listening -- holding the
-//    PM lock -- for up to a whole CSL period. Hardware-measured 2026-09-21 with
+//    next CSL window to switch the radio off. Meanwhile the radio listens, holding the PM lock, for
+//    up to a whole CSL period: after a continuous receive that ended without a frame (the MAC's
+//    wait for data after a poll, its sleep delay between fragments), and also after EVERY
+//    transmission and received frame. The ESP port turns the driver's rx_when_idle on at init
+//    (esp_openthread_radio.c) and OpenThread never turns it off (it only would through the
+//    RX_ON_WHEN_IDLE capability, off with CONFIG_OPENTHREAD_RX_ON_WHEN_IDLE unset), so the
+//    driver's next_operation() goes into continuous receive after each of those. Without CSL,
+//    SubMac::Sleep() -> Radio::Sleep() stops it at once. Hardware-measured 2026-09-21 with
 //    CONFIG_PM_PROFILING: the radio held the core awake for 89 % of every CSL publish window (39 %
 //    without CSL), in ~35 long stretches instead of hundreds of short ones.
 //    Fix: after the real SubMac::Sleep(), put a radio still in RX to sleep, unless a receive
-//    window was armed since the last immediate receive -- that RX state is the window's. Otherwise
-//    RX can only be a continuous receive the MAC is done with, since arming a window stops any
-//    continuous one. #13472 itself calls Radio::Sleep() unconditionally, relying on the radio
+//    window is armed or open -- that RX state is the window's. Otherwise RX can only be a
+//    continuous receive the MAC is done with, since arming a window stops any continuous one.
+//    #13472 itself calls Radio::Sleep() unconditionally, relying on the radio
 //    contract that sleep does not cancel a scheduled receive window; this driver's
 //    esp_ieee802154_sleep() does cancel it, so a verbatim port would drop the window re-armed
 //    after every data poll.
@@ -88,8 +92,24 @@
 //    call of it -- unconditionally, as #13472's Radio::Sleep() does. Without CSL the real
 //    SubMac::Sleep() has just recorded it, and recording it again adds nothing.
 //
+// ── The window flag (PARTs B and C) ── "a receive window is armed or open". Set by every window
+//    actually armed; cleared by every driver call that cancels one: receive() (after PART B's
+//    sleep), sleep(), transmit_at(), and transmit() unless it refused to start (the driver
+//    refuses while a frame is being received, and then the window stays). All of those stop
+//    timer1 and the ETM trigger before doing anything else (stop_current_operation() ->
+//    event_end_process() in esp_ieee802154_dev.c). A window that ends on its own is cleared too:
+//    its end queues a deferred sleep that the port applies through esp_ieee802154_sleep().
+//    Until 2026-09-27 only receive() cleared it, so after a window ended it stayed set until the
+//    next data wait. PART C then skipped the radio left in RX after nearly every data poll without
+//    pending data, and after the publish's last frame, until the next window rearmed the radio --
+//    ~P/2 of listening each. That was the whole-seconds-per-cycle idle cost that grew with the
+//    period (~20 s of HP awake per 300 s at a 10 s period against ~3 s expected), hidden from the
+//    radio statistics because PART C records the sleep anyway. energy_detect() and cca() also
+//    cancel a window but are not wrapped: OpenThread only uses them for scans, never while CSL
+//    runs, and PART C would at worst leave the radio listening until the next window again.
+//
 // Re-check all parts on any IDF upgrade (OpenThread #13491 reworks timed RX), and delete this
-// file plus the four --wrap flags once the driver and OpenThread are fixed upstream. PART C wraps
+// file plus the seven --wrap flags once the driver and OpenThread are fixed upstream. PART C wraps
 // two C++ symbols: if one is renamed, the link fails on its __real_ name; if a call moves into the
 // object that defines the function, the wrap silently stops applying -- check in the ELF that
 // Mac::UpdateIdleMode() still calls __wrap__ZN2ot3Mac6SubMac5SleepEv, and that some SubMac
@@ -109,6 +129,12 @@ extern "C" esp_err_t __real_esp_ieee802154_receive(void);
 extern "C" esp_err_t __real_esp_ieee802154_receive_at(uint32_t time, uint32_t duration);
 extern "C" esp_err_t __wrap_esp_ieee802154_receive(void);
 extern "C" esp_err_t __wrap_esp_ieee802154_receive_at(uint32_t time, uint32_t duration);
+extern "C" esp_err_t __real_esp_ieee802154_sleep(void);
+extern "C" esp_err_t __real_esp_ieee802154_transmit(const uint8_t *frame, bool cca);
+extern "C" esp_err_t __real_esp_ieee802154_transmit_at(const uint8_t *frame, bool cca, uint32_t time);
+extern "C" esp_err_t __wrap_esp_ieee802154_sleep(void);
+extern "C" esp_err_t __wrap_esp_ieee802154_transmit(const uint8_t *frame, bool cca);
+extern "C" esp_err_t __wrap_esp_ieee802154_transmit_at(const uint8_t *frame, bool cca, uint32_t time);
 
 // ot::Mac::SubMac::Sleep(): a member function returning ot::Error (a typedef of otError), so on
 // this ABI it is a plain function taking `this` as its only argument.
@@ -128,13 +154,14 @@ static constexpr uint8_t RADIO_STATS_STATUS_SLEEP = 1;
 // task only, like everything that reads it.
 static void *s_radio_stats = nullptr;
 
-// Set when a receive window is armed, cleared by the next immediate receive: "the radio's RX state
-// may be a window's, not a continuous receive's". PART B cancels that window before receiving;
-// PART C leaves the radio alone while it is set.
+// "A receive window is armed or open, so the radio's RX state may be the window's, not a
+// continuous receive's" -- see "The window flag" above for what sets and clears it. PART B cancels
+// that window before receiving; PART C leaves the radio alone while it is set.
 static std::atomic<bool> s_rx_at_scheduled{false};
 static std::atomic<uint32_t> s_rx_at_fix_count{0};
 static std::atomic<uint32_t> s_rx_at_skip_count{0};
 static std::atomic<uint32_t> s_idle_rx_stop_count{0};
+static std::atomic<uint32_t> s_idle_rx_keep_count{0};
 
 // Diagnostics only -- see the header. The sums are 64-bit because at a 500 ms period they take
 // on the order of 10 ms per window, which would wrap a uint32 of microseconds within the hour.
@@ -209,15 +236,43 @@ esp_err_t __wrap_esp_ieee802154_receive(void)
     return __real_esp_ieee802154_receive();
 }
 
+// The window flag: every call below cancels an armed window before it does anything else.
+esp_err_t __wrap_esp_ieee802154_sleep(void)
+{
+    s_rx_at_scheduled.store(false, std::memory_order_relaxed);
+    return __real_esp_ieee802154_sleep();
+}
+
+esp_err_t __wrap_esp_ieee802154_transmit_at(const uint8_t *frame, bool cca, uint32_t time)
+{
+    s_rx_at_scheduled.store(false, std::memory_order_relaxed);
+    return __real_esp_ieee802154_transmit_at(frame, cca, time);
+}
+
+esp_err_t __wrap_esp_ieee802154_transmit(const uint8_t *frame, bool cca)
+{
+    const esp_err_t err = __real_esp_ieee802154_transmit(frame, cca);
+    // A transmit that started left the driver in a TX state; one it refused, because a frame is
+    // being received, left it in RX with the window untouched. (A frame can't finish before this
+    // check unless the task is preempted for its whole airtime; the flag then just stays set, as
+    // it always did before.)
+    if (esp_ieee802154_get_state() != ESP_IEEE802154_RADIO_RECEIVE)
+        s_rx_at_scheduled.store(false, std::memory_order_relaxed);
+    return err;
+}
+
 // PART C
 otError __wrap__ZN2ot3Mac6SubMac5SleepEv(void *sub_mac)
 {
     const otError error = __real__ZN2ot3Mac6SubMac5SleepEv(sub_mac);
 
-    if (!s_rx_at_scheduled.load(std::memory_order_relaxed) &&
-        esp_ieee802154_get_state() == ESP_IEEE802154_RADIO_RECEIVE) {
-        esp_ieee802154_sleep();
-        s_idle_rx_stop_count.fetch_add(1, std::memory_order_relaxed);
+    if (esp_ieee802154_get_state() == ESP_IEEE802154_RADIO_RECEIVE) {
+        if (!s_rx_at_scheduled.load(std::memory_order_relaxed)) {
+            esp_ieee802154_sleep();
+            s_idle_rx_stop_count.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            s_idle_rx_keep_count.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (s_radio_stats != nullptr)
         __real__ZN2ot5Radio10Statistics17RecordStateChangeENS1_6StatusE(s_radio_stats,
@@ -245,6 +300,11 @@ uint32_t ieee802154_rx_at_skip_count()
 uint32_t ieee802154_idle_rx_stop_count()
 {
     return s_idle_rx_stop_count.load(std::memory_order_relaxed);
+}
+
+uint32_t ieee802154_idle_rx_keep_count()
+{
+    return s_idle_rx_keep_count.load(std::memory_order_relaxed);
 }
 
 uint64_t ieee802154_rx_at_total_count()

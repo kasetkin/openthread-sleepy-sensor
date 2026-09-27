@@ -151,7 +151,7 @@ static bool set_csl_period_us(uint32_t period_us)
 // parent retransmits because it doesn't accept our enhanced ACKs); tx abort counts transmits
 // cut short when a CSL receive window opens mid-TX (an ESP radio-port quirk); rxat_fix (PART B),
 // rxat_skip (PART A) and idle_rx_stop (PART C) count the workarounds in ieee802154_rx_at_fix.cpp
-// firing.
+// firing; idle_rx_keep counts PART C leaving RX alone for an armed window (should stay small).
 // Cumulative so it can't disturb read_link_stats()'s per-cycle deltas -- compare two lines.
 static void log_csl_diag(const char *reason)
 {
@@ -166,6 +166,7 @@ static void log_csl_diag(const char *reason)
     const uint32_t rx_at_fixes = ieee802154_rx_at_fix_count();
     const uint32_t rx_at_skips = ieee802154_rx_at_skip_count();
     const uint32_t idle_rx_stops = ieee802154_idle_rx_stop_count();
+    const uint32_t idle_rx_keeps = ieee802154_idle_rx_keep_count();
     const uint64_t rx_at_total = ieee802154_rx_at_total_count();
     const uint64_t rx_at_window_us = ieee802154_rx_at_window_us();
     const uint64_t rx_at_lead_us = ieee802154_rx_at_lead_us();
@@ -178,7 +179,7 @@ static void log_csl_diag(const char *reason)
 
     ESP_LOGW(TAG, "CSL %s: enabled=%d period=%lu us | tx=%lu poll=%lu retry=%lu abort=%lu "
                   "cca_fail=%lu no_ack=%lu | rx=%lu data=%lu dup=%lu err_sec=%lu err_fcs=%lu "
-                  "no_frame=%lu | rxat_fix=%lu rxat_skip=%lu idle_rx_stop=%lu",
+                  "no_frame=%lu | rxat_fix=%lu rxat_skip=%lu idle_rx_stop=%lu idle_rx_keep=%lu",
              reason, enabled, static_cast<unsigned long>(period_us),
              static_cast<unsigned long>(mac.mTxTotal),
              static_cast<unsigned long>(mac.mTxDataPoll),
@@ -194,7 +195,8 @@ static void log_csl_diag(const char *reason)
              static_cast<unsigned long>(mac.mRxErrNoFrame),
              static_cast<unsigned long>(rx_at_fixes),
              static_cast<unsigned long>(rx_at_skips),
-             static_cast<unsigned long>(idle_rx_stops));
+             static_cast<unsigned long>(idle_rx_stops),
+             static_cast<unsigned long>(idle_rx_keeps));
 
     // Second line, for the CSL power question: how many receive windows OpenThread asked for,
     // how wide, how far ahead it armed them, and what that did to light sleep. Everything but

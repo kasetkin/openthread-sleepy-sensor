@@ -17,6 +17,11 @@ uint32_t ieee802154_rx_at_skip_count();
 // kept listening through until the next CSL window. Stays 0 without CSL.
 uint32_t ieee802154_idle_rx_stop_count();
 
+// PART C: idle RX the wrapper left alone because a receive window was armed or open. Should stay
+// a small fraction of idle_rx_stop; climbing by several per cycle means the window flag has gone
+// stale again and the radio listens until the next window (see "The window flag" in the .cpp).
+uint32_t ieee802154_idle_rx_keep_count();
+
 // ── Diagnostics (not a workaround; delete once the CSL power question is settled) ─────────────
 // Every CSL receive window OpenThread asks for, skipped ones included. Divided by the cycle's
 // wall-clock this says whether CSL really runs all cycle (~2 windows/s at a 500 ms period) or
