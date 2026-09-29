@@ -209,7 +209,9 @@ static constexpr std::string_view DISC_PART_TAIL =
 // HA MQTT `update` entity: gives the device an "Install" button + version pair in HA.
 // installed_version comes from the retained <id>/ota/installed topic (plain version string),
 // latest_version straight from the retained OTA manifest, and HA's Install click publishes
-// a RETAINED command (retain:true below) so the sleeping device can't miss it — see
+// a RETAINED command (retain:true below) so the sleeping device can't miss it: a subscribe hands
+// it back. qos:1 so the broker also queues it while the device sleeps -- Mosquitto delivers at
+// min(publish, subscription) QoS and queues only QoS >= 1 for an offline client. See
 // ota_updater.h for the topic contract. device_class "firmware" files it with the device's
 // firmware section; the device block matches the sensors' so all entities share one HA device.
 static constexpr std::string_view UPDATE_DISCOVERY_FMT =
@@ -221,7 +223,7 @@ static constexpr std::string_view UPDATE_DISCOVERY_FMT =
     "\"latest_version_template\":\"{{{{ value_json.version }}}}\","
     "\"command_topic\":\"{}\","
     "\"payload_install\":\"install\","
-    "\"retain\":true,"
+    "\"retain\":true,\"qos\":1,"
     "\"unique_id\":\"{}_fw\","
     "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\",\"sw_version\":\"{}\","
     "\"manufacturer\":\"Seeed Studio\",\"model\":\"XIAO ESP32-C6\",\"serial_number\":\"{}\"}}"
@@ -232,7 +234,9 @@ static constexpr std::string_view UPDATE_DISCOVERY_FMT =
 // of DISC_PART_DIAGNOSTIC's "diagnostic" (read-only) above. Unlike the sensor/update families,
 // state_topic == command_topic for both: HA's documented pattern for a number/switch entity to
 // read its current value back from the very topic it publishes commands to, since
-// runtime_config.cpp republishes a retained echo of the applied value on that same topic. No
+// runtime_config.cpp republishes a retained echo of the applied value on that same topic. HA's
+// commands are retained so a subscribe hands them back, and qos:1 so the broker queues them for a
+// sleeping device (retain/qos in CMD_PART_TAIL; see UPDATE_DISCOVERY_FMT's comment). No
 // value_template: bare scalar payload, not JSON.
 static constexpr std::string_view CMD_PART_CONFIG_CAT = "\"entity_category\":\"config\",";
 // HA `number` only: forces the plain type-a-value box regardless of range/step. Omitting this
@@ -247,7 +251,7 @@ static constexpr std::string_view CMD_PART_PAYLOADS    = "\"payload_on\":\"{}\",
 static constexpr std::string_view CMD_PART_TAIL =
     "\"state_topic\":\"{}\","
     "\"command_topic\":\"{}\","
-    "\"retain\":true,"
+    "\"retain\":true,\"qos\":1,"
     "\"unique_id\":\"{}_{}\","
     "\"device\":{{\"identifiers\":[\"{}\"],\"name\":\"{}\",\"sw_version\":\"{}\","
     "\"manufacturer\":\"Seeed Studio\",\"model\":\"XIAO ESP32-C6\",\"serial_number\":\"{}\"}}"
