@@ -173,6 +173,16 @@ static std::optional<size_t> parse_size_field(std::string_view json, std::string
 
 static void handle_manifest(const char *data, size_t data_len, size_t total)
 {
+    if (total == 0) {
+        // ota_push.py deletes the retained manifest with an empty message (--clear, and before
+        // every re-stage), which the persistent session delivers like any other: the staged
+        // image is gone, so forget it instead of offering it until the next reboot.
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_manifest = Manifest{};
+        xSemaphoreGive(s_mutex);
+        ESP_LOGI(TAG, "manifest: cleared");
+        return;
+    }
     if (data_len != total) {
         // Can't happen for a sane manifest (RX buffer is 8.5 KB); refuse rather than
         // stitch together segments for a message that has no business being that big.
