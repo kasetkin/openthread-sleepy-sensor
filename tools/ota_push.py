@@ -13,7 +13,8 @@ Options:
     --install   also set the retained install flag (bench workflow: no HA click needed)
     --force     manifest carries "force":true (device skips its battery gate)
     --watch     stay connected and tail <id>/ota/status + <id>/ota/installed
-    --clear     remove all retained OTA messages for the device instead of staging
+    --clear     remove all retained OTA messages for the device instead of staging, then
+                tell HA latest = installed (non-retained, on <id>/ota/installed)
 
 Broker address/port/credentials are read from secrets.yaml (same file the firmware embeds);
 the optional ota_push_broker_address / ota_push_broker_port / ota_push_tls keys override
@@ -104,30 +105,51 @@ def publish_retained(client: mqtt.Client, topic: str, payload, label: str,
         print(f"  staged {label}: {topic} ({size} bytes, retained)")
 
 
-def collect_retained_ota_topics(client: mqtt.Client, device: str, wait_s: float = 3.0) -> set[str]:
-    """Every retained <device>/ota/* topic currently on the broker (image chunks included)."""
-    topics: set[str] = set()
+def collect_retained_ota_topics(client: mqtt.Client, device: str,
+                                wait_s: float = 3.0) -> dict[str, bytes]:
+    """Every retained <device>/ota/* topic currently on the broker (image chunks included),
+    mapped to its payload."""
+    retained: dict[str, bytes] = {}
 
     def on_message(_c, _u, msg):
         if msg.retain and msg.payload:
-            topics.add(msg.topic)
+            retained[msg.topic] = msg.payload
 
     client.on_message = on_message
     client.subscribe(f"{device}/ota/#", qos=0)
     time.sleep(wait_s)
     client.unsubscribe(f"{device}/ota/#")
     client.on_message = None
-    return topics
+    return retained
 
 
-def clear_stale(client: mqtt.Client, device: str, keep: set[str]) -> None:
+def clear_stale(client: mqtt.Client, device: str, keep: set[str]) -> dict[str, bytes]:
     """Delete retained OTA messages not in `keep` — old chunks past a new image's count,
-    the pre-chunking single-blob topic, manifests from other stagings, and so on."""
-    for topic in sorted(collect_retained_ota_topics(client, device) - keep):
+    the pre-chunking single-blob topic, manifests from other stagings, and so on. Returns
+    what was retained beforehand, device-owned topics included."""
+    retained = collect_retained_ota_topics(client, device)
+    for topic in sorted(retained.keys() - keep):
         if topic.endswith("/ota/installed") or topic.endswith("/ota/status"):
             continue  # device-owned topics, not staging artifacts
         publish_retained(client, topic, None, f"(cleared) {topic}", quiet=True)
         print(f"  cleared stale retained: {topic}")
+    return retained
+
+
+def tell_ha_up_to_date(client: mqtt.Client, installed_topic: str, version: str) -> None:
+    """Set the HA update entity's latest_version back to the installed one.
+
+    HA ignores the empty payload a clear leaves on the manifest topic — its
+    latest_version_topic handler only takes a non-empty rendered version — so it would keep
+    offering the deleted version until it restarts. Its state_topic (ota/installed, no
+    value_template) also takes a JSON object carrying both versions. Nothing on the device
+    subscribes to ota/installed, so this reaches HA only; and NOT retained, so the device's
+    own retained plain-string version stays as it is."""
+    payload = json.dumps({"installed_version": version, "latest_version": version})
+    info = client.publish(installed_topic, payload, qos=1, retain=False)
+    info.wait_for_publish(timeout=60)
+    if not info.is_published():
+        sys.exit(f"publishing the HA version reset to {installed_topic} timed out")
 
 
 def main() -> None:
@@ -151,7 +173,9 @@ def main() -> None:
     ap.add_argument("--watch", action="store_true",
                     help="stay connected and print <id>/ota/status + installed-version updates")
     ap.add_argument("--clear", action="store_true",
-                    help="delete all retained OTA staging messages for the device and exit")
+                    help="delete all retained OTA staging messages for the device, tell HA "
+                         "latest = installed (non-retained, so it stops offering the cleared "
+                         "version) and exit")
     args = ap.parse_args()
 
     secrets = read_secrets(args.secrets)
@@ -162,8 +186,17 @@ def main() -> None:
     client = connect(secrets)
     try:
         if args.clear:
-            clear_stale(client, args.device, keep=set())
+            retained = clear_stale(client, args.device, keep=set())
             print("retained OTA staging messages cleared")
+            installed = retained.get(t["installed"])
+            if installed is None:
+                print(f"note: no retained {t['installed']} — HA not told; it may keep "
+                      "offering the cleared version until it restarts")
+                return
+            installed_version = installed.decode(errors="replace")
+            tell_ha_up_to_date(client, t["installed"], installed_version)
+            print(f"HA told latest = installed = {installed_version} "
+                  f"(non-retained, on {t['installed']})")
             return
 
         image = args.image.read_bytes()
