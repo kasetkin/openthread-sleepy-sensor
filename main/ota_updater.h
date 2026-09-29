@@ -23,7 +23,8 @@
 // one boot), so the next cycle continues from the first missing chunk instead of restarting.
 //
 // Split of responsibilities with mqtt_sender.cpp (which owns the per-cycle client):
-//   - mqtt_sender subscribes to the manifest/install topics each cycle, routes every
+//   - mqtt_sender keeps the manifest/install topics subscribed in its persistent MQTT session
+//     (subscribing once per boot, or again when the broker lost the session), routes every
 //     MQTT_EVENT_DATA/ERROR/DISCONNECTED here, and calls ota_run_session() after a
 //     confirmed state publish when ota_update_due() says an update is pending.
 //   - this module owns the manifest/install state, the chunk-pull state machine, the
@@ -69,7 +70,7 @@ void ota_on_mqtt_data(const char *topic, size_t topic_len,
 void ota_on_mqtt_error();
 
 // True once a retained manifest with a version different from the running image AND a
-// retained install request have both been seen this cycle (and the consecutive-no-progress
+// retained install request have both been seen since boot (and the consecutive-no-progress
 // attempt budget is not exhausted). Cleared implicitly by rebooting into the new image.
 bool ota_update_due();
 

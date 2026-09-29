@@ -11,14 +11,16 @@
 
 // HA-tunable device parameters over MQTT, applied without a reflash. Split of responsibilities
 // with mqtt_sender.cpp (which owns the per-cycle client), mirroring ota_updater.h/.cpp's shape:
-//   - mqtt_sender subscribes to the wildcard below each cycle, routes every MQTT_EVENT_DATA
-//     here, and calls runtime_config_apply_pending() after the cycle's own publish work.
+//   - mqtt_sender keeps the wildcard below subscribed in its persistent MQTT session (see
+//     run_publish_cycle()), routes every MQTT_EVENT_DATA here, and calls
+//     runtime_config_apply_pending() after the cycle's own publish work.
 //   - this module owns the pending-change state, the NVS persistence, the live application
 //     (LP shared-memory config block for the 8 numeric fields, enableExtAntenna() for the 9th),
 //     and the boot-time NVS-override resolver main.cpp uses.
 //
-// Every topic is retained (the device is not a long-lived MQTT client -- see mqtt_sender.cpp --
-// so a briefly-connected wake could miss a non-retained command), and every payload is a bare
+// Every topic is retained (the persistent session queues HA's QoS-1 commands while the device
+// sleeps, but the subscribe after a boot or a lost session can only hand back retained values --
+// see run_publish_cycle() in mqtt_sender.cpp), and every payload is a bare
 // scalar, not JSON: this lets HA's MQTT `number`/`switch` entities use state_topic ==
 // command_topic (their documented pattern for reading current value back from the same retained
 // topic they command), and keeps this module consistent with the project's hand-parsed-over-
@@ -39,8 +41,8 @@ inline constexpr std::string_view CFG_SUFFIX_TX_POWER_DBM       = "cfg/tx_power_
 inline constexpr std::string_view CFG_SUFFIX_SENSOR_SAMPLES     = "cfg/sensor_samples";
 inline constexpr std::string_view CFG_SUFFIX_RTC_CAL_SAMPLES    = "cfg/rtc_cal_samples";
 inline constexpr std::string_view CFG_SUFFIX_RTC_CAL_PERIOD_SEC = "cfg/rtc_cal_period_sec";
-// One SUBSCRIBE for all 12 topics, not one per topic -- minimizes SUBSCRIBE-packet overhead in
-// the brief per-cycle awake window (see run_publish_cycle()'s existing manifest/install subscribes).
+// One filter for all 12 topics, not one per topic -- keeps small the one SUBSCRIBE packet that
+// run_publish_cycle() sends it in, together with the manifest/install filters.
 inline constexpr std::string_view CFG_SUFFIX_WILDCARD           = "cfg/#";
 
 inline constexpr std::string_view EXT_ANTENNA_PAYLOAD_ON  = "ON";

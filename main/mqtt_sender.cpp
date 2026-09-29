@@ -15,6 +15,7 @@
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -137,6 +138,10 @@ struct MqttCtx
     EventGroupHandle_t eg;  // borrowed from run_publish_cycle()'s EventGroupPtr; never owned here
     std::atomic<int>   expected_acks{0};
     std::atomic<int>   received_acks{0};
+    // From this connection's CONNACK: the broker still held a session for our client id.
+    std::atomic<bool>  session_present{false};
+    // A SUBACK arrived on this connection with no failure code.
+    std::atomic<bool>  subscribed{false};
 };
 
 // ── persistent client for the common (non-OTA) case ────────────────────────────
@@ -167,6 +172,18 @@ static constexpr size_t SENSOR_MQTT_RX_BUFFER_SIZE = 2048;
 static EventGroupHandle_t s_persistentEg = nullptr;
 static MqttCtx s_persistentCtx;
 static esp_mqtt_client_handle_t s_persistentClient = nullptr;
+
+// The persistent client's MQTT client id, which is also the broker's key for its session:
+// esp-mqtt's own default ("ESP32_" + the last three Wi-Fi-station MAC bytes, in its odd case
+// mix -- platform_create_id_string()), built here so an esp-mqtt update can't change it and
+// orphan the session. 12 characters, not device_id's 37: the CONNECT is 116 B of IPv6, ~104 B
+// after 6LoWPAN compression, and just fits one 802.15.4 frame (106 B of payload).
+static std::string s_client_id;
+
+// True while the broker's session for our client id holds our subscriptions AND this boot has
+// had the retained set they bring. RAM only, on purpose: a reboot empties the OTA manifest/install
+// state, and only a subscribe makes the broker re-send it.
+static bool s_session_subscribed = false;
 
 // One HA sensor entity's discovery config, declaratively. publish_discovery() appends only
 // the parts whose field is set, so entities without a device_class or unit (Boot count,
@@ -563,6 +580,8 @@ static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
     auto *ctx = static_cast<MqttCtx *>(handler_arg);
     switch (static_cast<esp_mqtt_event_id_t>(event_id)) {
     case MQTT_EVENT_CONNECTED:
+        // Before BIT_CONNECTED, so the publish task sees it as soon as it wakes.
+        ctx->session_present.store(static_cast<esp_mqtt_event_handle_t>(event_data)->session_present != 0);
         xEventGroupSetBits(ctx->eg, BIT_CONNECTED);
         break;
     case MQTT_EVENT_PUBLISHED:
@@ -571,16 +590,22 @@ static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
         xEventGroupSetBits(ctx->eg, BIT_ACK_EVENT);
         break;
     case MQTT_EVENT_SUBSCRIBED:
+        // esp-mqtt flags a SUBACK holding any code >= 0x80 (e.g. an ACL refusal) this way.
+        if (static_cast<esp_mqtt_event_handle_t>(event_data)->error_handle->error_type
+                != MQTT_ERROR_TYPE_SUBSCRIBE_FAILED)
+            ctx->subscribed.store(true);
+        [[fallthrough]];
     case MQTT_EVENT_UNSUBSCRIBED:
         // SUBSCRIBEs sit in the outbox until their SUBACK just like QoS-1 publishes do, so the
         // outbox drain must wake on these too, not only on PUBACKs.
         xEventGroupSetBits(ctx->eg, BIT_ACK_EVENT);
         break;
     case MQTT_EVENT_DATA: {
-        // Inbound traffic exists solely for OTA (retained manifest/install replies, and the
-        // broker-streamed image during a download session) — route it all to ota_updater,
-        // which demuxes by topic. Blocking in there (flash writes) is deliberate: it stalls
-        // this task's socket reads so TCP backpressure paces the broker.
+        // Inbound traffic is the retained replies to a subscribe, the changes the broker queued
+        // for our session while we slept, and the broker-streamed image during a download
+        // session — route it all to ota_updater, which demuxes by topic. Blocking in there
+        // (flash writes) is deliberate: it stalls this task's socket reads so TCP backpressure
+        // paces the broker.
         const auto *ev = static_cast<esp_mqtt_event_handle_t>(event_data);
         ota_on_mqtt_data(ev->topic, static_cast<size_t>(ev->topic_len),
                          ev->data, static_cast<size_t>(ev->data_len),
@@ -615,15 +640,21 @@ static void mqtt_event_handler(void *handler_arg, esp_event_base_t /*base*/,
 }
 
 // ── start a fresh client; clears event bits before connecting ─────────────────
-// Shared config, parameterized only by the RX buffer size (OTA_MQTT_RX_BUFFER_SIZE for the
-// temporary OTA client below, SENSOR_MQTT_RX_BUFFER_SIZE for the persistent one) -- every
-// other field is identical between the two clients.
-static esp_mqtt_client_config_t build_client_config(const char *uri, size_t rx_buffer_size)
+// Shared config, parameterized by the RX buffer size (OTA_MQTT_RX_BUFFER_SIZE for the
+// temporary OTA client below, SENSOR_MQTT_RX_BUFFER_SIZE for the persistent one), the client
+// id and the clean-session choice -- every other field is identical between the two clients.
+static esp_mqtt_client_config_t build_client_config(const char *uri, size_t rx_buffer_size,
+                                                    const char *client_id, bool persistent_session)
 {
     esp_mqtt_client_config_t cfg = {};
     cfg.broker.address.uri       = uri;
     cfg.credentials.username     = s_cfg.username.c_str();
     cfg.credentials.authentication.password = s_cfg.password.c_str();
+    // esp-mqtt copies the id (esp_mqtt_set_if_config() strdup()s it), so a temporary is fine.
+    cfg.credentials.client_id = client_id;
+    // Clean session off: the broker keeps this client's subscriptions between wakes and queues
+    // QoS-1 messages for it while we sleep -- see the subscribe block in run_publish_cycle().
+    cfg.session.disable_clean_session = persistent_session;
     // Keepalive OFF, deliberately. The OTA image arrives as ONE multi-minute MQTT message;
     // esp-mqtt pings keepalive/2 after the last control packet and hard-aborts when the
     // PINGRESP misses the deadline (process_keepalive() in mqtt_client.c) — but the broker's
@@ -645,7 +676,7 @@ static esp_mqtt_client_config_t build_client_config(const char *uri, size_t rx_b
     // rx_buffer_size is OTA_MQTT_RX_BUFFER_SIZE for the temporary OTA client (so a max-size
     // image chunk arrives as ONE MQTT_EVENT_DATA event -- the property the chunked OTA
     // protocol rests on, see ota_updater.h) or the much smaller SENSOR_MQTT_RX_BUFFER_SIZE for
-    // the persistent client (CONNACK + 3 SUBACKs + a small retained OTA-manifest/cfg echo, not
+    // the persistent client (CONNACK, at most one SUBACK, and small OTA-manifest/cfg messages, not
     // chunk data -- see its doc comment). Out-buffer stays a single small size either way: the
     // largest outbound message is a ~700 B discovery config, and leaving out_size 0 would
     // clone the (possibly much bigger) RX size.
@@ -685,7 +716,11 @@ static esp_mqtt_client_config_t build_client_config(const char *uri, size_t rx_b
 // chunked protocol).
 static esp_mqtt_client_handle_t start_client(const char *uri, MqttCtx &ctx)
 {
-    esp_mqtt_client_config_t cfg = build_client_config(uri, OTA_MQTT_RX_BUFFER_SIZE);
+    // Never the persistent client's id: a clean CONNECT under it would delete that session
+    // (MQTT 3.1.1 §3.1.2.4), and the next wake would have to subscribe again.
+    const std::string client_id = s_cfg.device_id + "-ota";
+    esp_mqtt_client_config_t cfg = build_client_config(uri, OTA_MQTT_RX_BUFFER_SIZE,
+                                                       client_id.c_str(), false);
     ESP_LOGI(TAG, "connecting (OTA) to %s (tls=%d)", uri, static_cast<int>(s_cfg.use_tls));
     xEventGroupClearBits(ctx.eg, BIT_CONNECTED | BIT_ALL_ACKED | BIT_ERROR | BIT_ACK_EVENT);
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&cfg);
@@ -709,7 +744,8 @@ static esp_mqtt_client_handle_t start_persistent_client(const char *uri)
             return nullptr;
         s_persistentCtx.eg = s_persistentEg;
 
-        esp_mqtt_client_config_t cfg = build_client_config(uri, SENSOR_MQTT_RX_BUFFER_SIZE);
+        esp_mqtt_client_config_t cfg = build_client_config(uri, SENSOR_MQTT_RX_BUFFER_SIZE,
+                                                           s_client_id.c_str(), true);
         s_persistentClient = esp_mqtt_client_init(&cfg);
         if (!s_persistentClient)
             return nullptr;
@@ -720,6 +756,8 @@ static esp_mqtt_client_handle_t start_persistent_client(const char *uri)
 
     ESP_LOGI(TAG, "connecting (persistent) to %s (tls=%d)", uri, static_cast<int>(s_cfg.use_tls));
     xEventGroupClearBits(s_persistentEg, BIT_CONNECTED | BIT_ALL_ACKED | BIT_ERROR | BIT_ACK_EVENT);
+    s_persistentCtx.session_present.store(false);
+    s_persistentCtx.subscribed.store(false);
     esp_mqtt_client_start(s_persistentClient);
     return s_persistentClient;
 }
@@ -916,8 +954,8 @@ static void retire_old_battery_adc_time_discovery(esp_mqtt_client_handle_t clien
 
 // Retires the "Sleep clock cal mode" HA entity (cfg/rtc_cal_mode: 0 = ESP-IDF, 1 = latest cold
 // calibration, 2 = mean of the cold ones), replaced by "Sleep clock cal samples" (0 = ESP-IDF,
-// N = mean of the last N) -- and its retained value with it, which the cfg/# subscription would
-// otherwise keep handing back every wake. Same empty-retained-payload removal as above, and like
+// N = mean of the last N) -- and its retained value with it, which every cfg/# subscribe would
+// otherwise keep handing back. Same empty-retained-payload removal as above, and like
 // every retire_old_*() helper at QoS 0: nothing waits for these, and an uncounted PUBACK would
 // count towards the discovery ACKs the cycle does wait for.
 static void retire_old_rtc_cal_mode(esp_mqtt_client_handle_t client, std::string_view device_id)
@@ -1354,15 +1392,25 @@ static bool run_publish_cycle(const PublishParams &params)
             const std::string_view dev = s_cfg.device_id;
             const std::string_view dev_name = s_cfg.device_name;
 
-            // OTA check rides the publish window: subscribing now means the broker's retained
-            // manifest/install replies (if it holds any) arrive while we're waiting for the
-            // publish ACKs below — near-zero added awake time on the common no-update cycle.
-            // QoS 0: retained delivery over an already-reliable TCP link. See ota_updater.h.
-            esp_mqtt_client_subscribe(client, ota_topic_manifest(), 0);
-            esp_mqtt_client_subscribe(client, ota_topic_install(), 0);
-            // <id>/cfg/# -- one SUBSCRIBE packet for all 10 HA-tunable-parameter topics (see
-            // runtime_config.h), same "ride the publish window" reasoning as the OTA subscribes.
-            esp_mqtt_client_subscribe(client, runtime_config_topic_wildcard(), 0);
+            // A resumed session still holds our subscriptions, and the broker delivers any QoS-1
+            // change made while we slept right after CONNACK -- so a normal wake sends no SUBSCRIBE
+            // and gets no retained set back, which also leaves Nagle nothing to hold. QoS 1, or
+            // nothing is queued: the broker sends each message at min(publish, subscription) QoS
+            // and queues only QoS >= 1 for an offline client.
+            if (!ctx.session_present.load())
+                s_session_subscribed = false;
+            const bool subscribe = !s_session_subscribed;
+            if (subscribe) {
+                const esp_mqtt_topic_t topics[] = {
+                    {ota_topic_manifest(), 1},
+                    {ota_topic_install(), 1},
+                    {runtime_config_topic_wildcard(), 1},
+                };
+                esp_mqtt_client_subscribe_multiple(client, topics, static_cast<int>(std::size(topics)));
+            }
+            // INFO for hardware verification; demote to DEBUG once verified.
+            ESP_LOGI(TAG, "session %s, %s", ctx.session_present.load() ? "resumed" : "new",
+                     subscribe ? "subscribed" : "no subscribe");
 
             // Link telemetry is read here, not passed in with the sensor values: it's transport
             // state, and inside the publish window the radio is awake with the connect exchange
@@ -1601,6 +1649,12 @@ static bool run_publish_cycle(const PublishParams &params)
                     // never have reached the broker, and the next successful cycle resends them.
                     if (ok)
                         s_discovery_sent_mask.fetch_or(discoveryNeed);
+                    // The state PUBACK follows the SUBACK and the retained set on the same stream,
+                    // so an ACKed state message means both arrived. Anything less subscribes again
+                    // next wake, even if its CONNACK reports a session: the broker creates one at
+                    // CONNECT, so a SUBSCRIBE that died with this connection leaves it empty.
+                    if (ok && subscribe && ctx.subscribed.load())
+                        s_session_subscribed = true;
                 }
             } else {
                 // Not a warning any more: with a pending update, sensorstask deliberately fires
@@ -1682,6 +1736,11 @@ void mqtt_sender_init(const MqttConfig &cfg, const NetworkLink *link)
     s_link = link;
     s_tls_ca_cert_pem = wrap_pem_certificate(cfg.tls_ca_cert_b64);  // "" if tls_ca_cert_b64 is empty
     ota_updater_init(s_cfg.device_id, link);  // builds the <device_id>/ota/* topic strings
+    uint8_t mac[6] = {};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    s_client_id = std::format("ESP32_{:02x}{:02X}{:02X}", mac[3], mac[4], mac[5]);
+    ESP_LOGI(TAG, "MQTT client ids: %s (persistent session), %s-ota (OTA, clean)",
+             s_client_id.c_str(), s_cfg.device_id.c_str());
     if (!s_idle_eg) {
         s_idle_eg = xEventGroupCreate();
         if (s_idle_eg)

@@ -67,9 +67,11 @@ static uint32_t s_tx_power_unconfirmed_cycles = 0;
 static int8_t s_tx_power_active_dbm = TX_POWER_TABLE_MAX_DBM;
 static bool s_tx_power_first_attach_done = false;
 // The TX power that last failed its trial, or was left unconfirmed by a previous boot, until a
-// different one is tried. The broker goes on serving it -- every wake's cfg/# subscribe hands it
-// back -- until an echo of the value in effect replaces it, and trying it again each time would
-// turn the revert into an endless trial/revert loop.
+// different one is tried. The broker goes on serving it -- every cfg/# subscribe hands it back --
+// until an echo of the value in effect replaces it, and trying it again each time would turn the
+// revert into an endless trial/revert loop. Only a subscribe cycle hands it back, though (once per
+// boot, or after the broker lost the session), so after a revert HA shows the rejected value until
+// the next boot's discovery publishes the one in effect -- an accepted gap.
 static int8_t s_tx_power_rejected = 0;
 static bool s_tx_power_has_rejected = false;
 // Deliberately shorter than UNCONFIRMED_OTA_REBOOT_AFTER_CYCLES (5, sensorstask.h): a bad TX
@@ -78,9 +80,10 @@ static bool s_tx_power_has_rejected = false;
 static constexpr uint32_t TX_POWER_REVERT_AFTER_CYCLES = 3;
 
 // Every value received since the last runtime_config_apply_pending() call, as received (clamping
-// happens there), guarded by s_mutex. Mostly NOT changes: every wake's cfg/# subscribe hands back
-// all the retained values, and the device receives its own echoes too -- apply_pending() sorts out
-// which ones differ from what's in effect. Mirrors ota_updater.cpp's Manifest/s_mutex pattern: the
+// happens there), guarded by s_mutex. Mostly NOT changes: a cfg/# subscribe hands back all the
+// retained values, and the device receives its own echoes too -- apply_pending() sorts out which
+// ones differ from what's in effect. Between subscribes, only HA's changes queued for our session
+// and those echoes arrive. Mirrors ota_updater.cpp's Manifest/s_mutex pattern: the
 // event-handler-context writer takes the mutex only for a fast, non-blocking struct copy.
 struct PendingCfg
 {
