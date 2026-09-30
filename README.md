@@ -3,9 +3,20 @@ Firmware for ESP32-C6 based sensor with low power consumption.
 
 The node is a Thread sleepy end device (MTD). Each cycle it wakes, reads the SHT3x sensor,
 connects to an MQTT broker to publish, then light-sleeps. The broker is reached directly
-over IPv6 when `mqtt_broker_address` is an IPv6 literal (use an address the Border Router
-can route — its own OMR-prefix address or the broker host's LAN ULA/GUA, never the
-mesh-local prefix), or over IPv4 mapped through the Border Router's NAT64 prefix.
+over IPv6 when `mqtt_broker_address` is an IPv6 literal, or over IPv4 mapped through the
+Border Router's NAT64 prefix. Which IPv6 address to use depends on where the broker runs:
+
+- **Broker on the Border Router's own host** (e.g. the Mosquitto add-on next to the OTBR
+  add-on in Home Assistant): use the Border Router's mesh-local EID (`ot-ctl ipaddr mleid`).
+  It comes from the Thread dataset, so it stays reachable when the host's LAN link is down,
+  whereas the OMR prefix and NAT64 are withdrawn after the LAN link drops (OMR addresses are
+  removed 5 minutes later). **This requires the OTBR firewall to be off**: with it on, the
+  broker's replies to the device's mesh-local address are dropped. The firmware lets
+  OpenThread choose the source address (`CONFIG_LWIP_HOOK_IP6_SELECT_SRC_ADDR_CUSTOM`), so
+  these connections leave from the device's own mesh-local EID, not its OMR address.
+- **Broker on another host:** use an address the Border Router routes — its own OMR-prefix
+  address or the broker host's LAN ULA/GUA — never a mesh-local address, because mesh-local
+  traffic is never routed off the mesh.
 
 Configuration is split by sensitivity across two files embedded at build time: credentials
 and network settings go in `secrets.yaml` (gitignored; see
