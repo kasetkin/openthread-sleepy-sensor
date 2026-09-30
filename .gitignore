@@ -5,3 +5,4 @@ secrets.yaml
 /managed_components/
 /logs/
 /tools/__pycache__/
+/tickets_and_plans/
