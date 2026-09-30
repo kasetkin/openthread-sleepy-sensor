@@ -50,6 +50,12 @@ CONFIG_OPENTHREAD_LINK_METRICS=y
 #
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
 CONFIG_LWIP_IPV6_NUM_ADDRESSES=8
+# ESP-IDF adds Thread mesh-local addresses to lwIP as deprecated, so lwIP's own source
+# selection sends to a mesh-local broker (the OTBR's ML-EID) from the OMR address. This hook
+# (esp_openthread_lwip_netif.c) asks OpenThread instead, which picks the ML-EID. CUSTOM, not
+# DEFAULT: DEFAULT's weak NULL stub would silently win if OpenThread's hook were not linked.
+# See docs/plan_mqtt_ml_eid_source_address.html.
+CONFIG_LWIP_HOOK_IP6_SELECT_SRC_ADDR_CUSTOM=y
 # IPV4 + ND6 on for Wi-Fi (direct IPv4 connect; ND6/RA needed for SLAAC). Thread's netif
 # doesn't use either (it's IPv6-only via NAT64, and does neighbor/route discovery at its
 # own MLE layer via esp_openthread_netif_glue, bypassing lwIP's ND6 state machine) but
