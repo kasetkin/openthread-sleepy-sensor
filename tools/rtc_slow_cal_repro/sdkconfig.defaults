@@ -1,0 +1,15 @@
+CONFIG_IDF_TARGET="esp32c6"
+
+# Automatic light sleep, timed by the internal RC as RTC_SLOW, calibrated before every sleep:
+# the configuration that shows the warm-calibration bias.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
+CONFIG_RTC_CLK_SRC_INT_RC=y
+CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_INTERVAL=1
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+
+# Output on UART0 only. USB-Serial-JTAG drops out in light sleep and can deliver buffered lines
+# late, which would corrupt the host-side timestamps.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y

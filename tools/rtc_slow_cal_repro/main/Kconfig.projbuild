@@ -1,0 +1,44 @@
+menu "RTC_SLOW calibration reproducer"
+
+    config REPRO_WAKE_PERIOD_MS
+        int "Light-sleep period between wakes (ms)"
+        default 1000
+        range 100 60000
+
+    config REPRO_BUSY_MS
+        int "CPU busy time after each wake (ms)"
+        default 50
+        range 0 1000
+        help
+            Busy-loops the CPU after every wake to warm the die, the way a radio burst or
+            a sensor read would. ESP-IDF calibrates RTC_SLOW at the next sleep entry, at
+            the end of this busy time.
+
+    config REPRO_REPORT_EVERY
+        int "Print a CLK line every N wakes"
+        default 10
+        range 1 1000
+
+    config REPRO_EMULATE_CAL_AFTER_WAKEUP
+        bool "Emulate the calibrate-after-wakeup fix in the app"
+        default y
+        help
+            Wraps rtc_clk_cal() so that the light-sleep path uses a reading taken right
+            after the previous wake (die still cold) instead of measuring at sleep entry.
+            Turn off when building against an ESP-IDF that has the fix itself.
+
+    config REPRO_MODE_SWITCH_PERIOD_S
+        int "Alternate stock / emulated fix every N seconds (0 = never)"
+        depends on REPRO_EMULATE_CAL_AFTER_WAKEUP
+        default 1800
+        range 0 86400
+        help
+            Interleaves both modes in one run, so both see the same board, temperature and
+            reference clock. 0 keeps the mode chosen below for the whole run.
+
+    config REPRO_START_WITH_FIX
+        bool "Start with the emulated fix on"
+        depends on REPRO_EMULATE_CAL_AFTER_WAKEUP
+        default n
+
+endmenu
