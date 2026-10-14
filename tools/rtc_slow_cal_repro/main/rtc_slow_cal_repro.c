@@ -8,15 +8,20 @@
  * REPRO_REPORT_EVERY wakes prints a line with esp_timer_get_time():
  *
  *     CLK n=<wakes> t_us=<esp_timer> mode=<stock|fix-emul|fix-idf> cal=<RTC_SLOW period, Q19 us>
+ *         die_cold=<C, right after the wake> die_warm=<C, at the end of the busy time>
  *
  * clock_drift.py timestamps each line on arrival and fits esp_timer against the host clock.
  */
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 
+#include "driver/temperature_sensor.h"
 #include "esp_attr.h"
+#include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_err.h"
 #include "esp_idf_version.h"
 #include "esp_pm.h"
@@ -77,6 +82,41 @@ static const char *mode_name(void)
 #endif
 }
 
+// Readings averaged per die temperature value, and the gap between them: the sensor's output
+// only moves once per conversion.
+#define DIE_TEMP_SAMPLES        16
+#define DIE_TEMP_SPACING_US     50
+
+// Installs the sensor for each reading and uninstalls it after, so it is never left powered (and
+// holding its power domain) during light sleep. NAN if the sensor fails.
+static float die_temp_read(void)
+{
+    const temperature_sensor_config_t config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+    temperature_sensor_handle_t tsens = NULL;
+    if (temperature_sensor_install(&config, &tsens) != ESP_OK) {
+        return NAN;
+    }
+    float result = NAN;
+    if (temperature_sensor_enable(tsens) == ESP_OK) {
+        float sum = 0;
+        int count = 0;
+        for (int i = 0; i < DIE_TEMP_SAMPLES; i++) {
+            float celsius = 0;
+            if (temperature_sensor_get_celsius(tsens, &celsius) == ESP_OK) {
+                sum += celsius;
+                count++;
+            }
+            esp_rom_delay_us(DIE_TEMP_SPACING_US);
+        }
+        if (count > 0) {
+            result = sum / count;
+        }
+        temperature_sensor_disable(tsens);
+    }
+    temperature_sensor_uninstall(tsens);
+    return result;
+}
+
 static void busy_for_ms(uint32_t ms)
 {
     const int64_t end = esp_timer_get_time() + (int64_t)ms * 1000;
@@ -92,6 +132,8 @@ void app_main(void)
         .light_sleep_enable = true,
     };
     ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+    // The driver logs its measuring range on every install, and this installs on every reading.
+    esp_log_level_set("temperature_sensor", ESP_LOG_WARN);
 
 #if CONFIG_REPRO_EMULATE_CAL_AFTER_WAKEUP
     esp_pm_sleep_cbs_register_config_t cbs_conf = {
@@ -116,10 +158,13 @@ void app_main(void)
 
     for (uint32_t n = 1;; n++) {
         vTaskDelay(pdMS_TO_TICKS(CONFIG_REPRO_WAKE_PERIOD_MS));
+        const bool report = (n % CONFIG_REPRO_REPORT_EVERY == 0);
+        const float die_cold = report ? die_temp_read() : NAN;
         busy_for_ms(CONFIG_REPRO_BUSY_MS);
-        if (n % CONFIG_REPRO_REPORT_EVERY == 0) {
-            printf("CLK n=%" PRIu32 " t_us=%" PRId64 " mode=%s cal=%" PRIu32 "\n",
-                   n, esp_timer_get_time(), mode_name(), esp_clk_slowclk_cal_get());
+        if (report) {
+            const float die_warm = die_temp_read();
+            printf("CLK n=%" PRIu32 " t_us=%" PRId64 " mode=%s cal=%" PRIu32 " die_cold=%.2f die_warm=%.2f\n",
+                   n, esp_timer_get_time(), mode_name(), esp_clk_slowclk_cal_get(), die_cold, die_warm);
         }
 #if CONFIG_REPRO_EMULATE_CAL_AFTER_WAKEUP
         if (switch_period_us != 0 && esp_timer_get_time() >= next_switch_us) {

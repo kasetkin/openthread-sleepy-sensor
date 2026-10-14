@@ -19,6 +19,7 @@ steps it, so the host should be NTP-synced and must not suspend during a capture
 
 Captured line format:   <UTC ISO time> <host monotonic ns> <device line>
 Device CLK line:        CLK n=<wakes> t_us=<esp_timer> mode=<stock|fix-emul|fix-idf> cal=<Q19 period>
+                            [die_cold=<C after wake> die_warm=<C after the busy time>]
 """
 
 import argparse
@@ -29,7 +30,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-CLK_RE = re.compile(r"CLK n=(\d+) t_us=(-?\d+) mode=(\S+) cal=(\d+)")
+CLK_RE = re.compile(r"CLK n=(\d+) t_us=(-?\d+) mode=(\S+) cal=(\d+)(?: die_cold=(\S+) die_warm=(\S+))?")
 RTC_CLK_CAL_FRACT = 19
 
 
@@ -40,6 +41,8 @@ class Point:
     dev_s: float
     n: int
     cal: int
+    die_cold: float = math.nan
+    die_warm: float = math.nan
 
 
 @dataclass
@@ -48,15 +51,23 @@ class Segment:
     points: list[Point] = field(default_factory=list)
 
 
-def parse_clk(text: str) -> tuple[int, float, str, int] | None:
+def parse_clk(text: str) -> tuple[int, float, str, int, float, float] | None:
     m = CLK_RE.search(text)
     if m is None:
         return None
-    return int(m[1]), int(m[2]) / 1e6, m[3], int(m[4])
+    # die_* are absent in captures from before they were added, and "nan" if the sensor failed.
+    die_cold = float(m[5]) if m[5] else math.nan
+    die_warm = float(m[6]) if m[6] else math.nan
+    return int(m[1]), int(m[2]) / 1e6, m[3], int(m[4]), die_cold, die_warm
 
 
 def cal_khz(cal: float) -> float:
     return 1e3 * (1 << RTC_CLK_CAL_FRACT) / cal if cal else 0.0
+
+
+def mean_finite(values) -> float:
+    vals = [v for v in values if math.isfinite(v)]
+    return sum(vals) / len(vals) if vals else math.nan
 
 
 def fit(points: list[Point]) -> tuple[float, float, float]:
@@ -93,13 +104,13 @@ def split_segments(lines) -> list[Segment]:
         clk = parse_clk(parts[2])
         if clk is None:
             continue
-        n, dev_s, mode, cal = clk
+        n, dev_s, mode, cal, die_cold, die_warm = clk
         cur = segments[-1] if segments else None
         if cur is None or cur.mode not in ("", mode) or (cur.points and (n <= cur.points[-1].n or dev_s <= cur.points[-1].dev_s)):
             cur = Segment(mode=mode)
             segments.append(cur)
         cur.mode = mode
-        cur.points.append(Point(parts[0], host_s, dev_s, n, cal))
+        cur.points.append(Point(parts[0], host_s, dev_s, n, cal, die_cold, die_warm))
     return [s for s in segments if s.points]
 
 
@@ -134,25 +145,25 @@ def cmd_log(args) -> None:
                 if text.startswith("REPRO "):
                     seg = Segment(mode="")
                 continue
-            n, dev_s, mode, cal = clk
+            n, dev_s, mode, cal, die_cold, die_warm = clk
             if seg.mode not in ("", mode) or (seg.points and n <= seg.points[-1].n):
                 seg = Segment(mode=mode)
             seg.mode = mode
-            seg.points.append(Point(wall, mono_ns / 1e9, dev_s, n, cal))
+            seg.points.append(Point(wall, mono_ns / 1e9, dev_s, n, cal, die_cold, die_warm))
             span_min = (seg.points[-1].host_s - seg.points[0].host_s) / 60
             if len(seg.points) >= 3:
                 ppm, se, _ = fit(seg.points)
                 rate = f"{ppm:+8.1f} ±{se:5.1f} ppm over {span_min:5.1f} min"
             else:
                 rate = "(fit after 3 lines)"
-            print(f"{wall} {mode:8} n={n:7} {cal_khz(cal):8.3f} kHz  {rate}", flush=True)
+            print(f"{wall} {mode:8} n={n:7} {cal_khz(cal):8.3f} kHz  {die_cold:6.2f} C  {rate}", flush=True)
 
 
 def cmd_fit(args) -> None:
     with open(args.file, encoding="utf-8") as f:
         segments = split_segments(f)
 
-    print(f"{'mode':8} {'start (UTC host)':>16} {'min':>6} {'lines':>5} {'ppm':>9} {'±SE':>6} {'rms ms':>6} {'cal kHz':>9}")
+    print(f"{'mode':8} {'start (UTC host)':>16} {'min':>6} {'lines':>5} {'ppm':>9} {'±SE':>6} {'rms ms':>6} {'cal kHz':>9} {'die C':>6} {'warm-up':>7}")
     per_mode: dict[str, list[tuple[float, float]]] = {}
     for seg in segments:
         pts = [p for p in seg.points if p.host_s - seg.points[0].host_s >= args.skip]
@@ -161,8 +172,10 @@ def cmd_fit(args) -> None:
         ppm, se, rms = fit(pts)
         minutes = (pts[-1].host_s - pts[0].host_s) / 60
         mean_cal = sum(p.cal for p in pts) / len(pts)
+        die_cold = mean_finite(p.die_cold for p in pts)
+        warm_up = mean_finite(p.die_warm - p.die_cold for p in pts)
         start = pts[0].wall[5:16].replace("T", " ")
-        print(f"{seg.mode:8} {start:>16} {minutes:6.1f} {len(pts):5} {ppm:+9.1f} {se:6.1f} {rms:6.2f} {cal_khz(mean_cal):9.3f}")
+        print(f"{seg.mode:8} {start:>16} {minutes:6.1f} {len(pts):5} {ppm:+9.1f} {se:6.1f} {rms:6.2f} {cal_khz(mean_cal):9.3f} {die_cold:6.2f} {warm_up:+7.2f}")
         per_mode.setdefault(seg.mode, []).append((ppm, minutes))
 
     print()
