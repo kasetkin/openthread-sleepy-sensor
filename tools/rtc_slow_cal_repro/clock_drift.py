@@ -109,7 +109,9 @@ def cmd_log(args) -> None:
     port = serial.Serial()
     port.port = args.port
     port.baudrate = args.baud
-    port.timeout = 1
+    # Block until a whole line is in: readline() with a timeout returns a partial line when the
+    # timeout runs out mid-line, which splits a CLK line and stamps both halves wrong.
+    port.timeout = None
     # Don't toggle the adapter's control lines on open: on some boards they reset the chip.
     port.dtr = False
     port.rts = False
@@ -120,8 +122,6 @@ def cmd_log(args) -> None:
         print(f"capturing {args.port} @ {args.baud} -> {args.output}", file=sys.stderr)
         while True:
             raw = port.readline()
-            if not raw:
-                continue
             mono_ns = time.monotonic_ns()
             wall = datetime.datetime.now(datetime.UTC).isoformat(timespec="milliseconds")
             text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
