@@ -92,7 +92,7 @@ void app_main(void)
     // The driver logs its measuring range on every install, and this installs on every reading.
     esp_log_level_set(LOGID, ESP_LOG_WARN);
 
-    ESP_LOGI(LOGID, "REPRO idf=%s wake_ms=%d busy_ms=%d report_every=%d",
+    ESP_LOGW(LOGID, "REPRO idf=%s wake_ms=%d busy_ms=%d report_every=%d",
            esp_get_idf_version(), CONFIG_REPRO_WAKE_PERIOD_MS, CONFIG_REPRO_BUSY_MS, CONFIG_REPRO_REPORT_EVERY
           );
 
@@ -103,7 +103,7 @@ void app_main(void)
         busy_for_ms(CONFIG_REPRO_BUSY_MS);
         if (report) {
             const float die_warm = die_temp_read();
-            ESP_LOGI(LOGID, "CLK n=%" PRIu32 " t_us=%" PRId64 " mode=%s cal=%" PRIu32 " die_cold=%.2f die_warm=%.2f\n",
+            ESP_LOGW(LOGID, "CLK n=%" PRIu32 " t_us=%" PRId64 " mode=%s cal=%" PRIu32 " die_cold=%.2f die_warm=%.2f",
                    n, esp_timer_get_time(), mode_name(), esp_clk_slowclk_cal_get(), die_cold, die_warm);
         }
     }
