@@ -6,3 +6,4 @@ secrets.yaml
 /logs/
 /tools/__pycache__/
 /tickets_and_plans/
+/private_git_key/
