@@ -69,14 +69,40 @@ static void set_fix(bool on)
     s_cold_period = 0;
     s_fix_on = on;
 }
+
+static bool fix_on(void)
+{
+    return s_fix_on;
+}
+#endif
+
+#if CONFIG_REPRO_IDF_TEST_SWITCH
+// Defined only by the TEST ONLY commit on top of the ESP-IDF patch, not by upstream ESP-IDF.
+extern bool esp_sleep_test_rtc_cal_after_wakeup;
+
+static void set_fix(bool on)
+{
+    esp_sleep_test_rtc_cal_after_wakeup = on;
+}
+
+static bool fix_on(void)
+{
+    return esp_sleep_test_rtc_cal_after_wakeup;
+}
+#endif
+
+#if CONFIG_REPRO_EMULATE_CAL_AFTER_WAKEUP || CONFIG_REPRO_IDF_TEST_SWITCH
+#define REPRO_SWITCHABLE 1
 #endif
 
 static const char *mode_name(void)
 {
-#if CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP
+#if CONFIG_REPRO_IDF_TEST_SWITCH
+    return fix_on() ? "fix-idf" : "stock";
+#elif CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP
     return "fix-idf";
 #elif CONFIG_REPRO_EMULATE_CAL_AFTER_WAKEUP
-    return s_fix_on ? "fix-emul" : "stock";
+    return fix_on() ? "fix-emul" : "stock";
 #else
     return "stock";
 #endif
@@ -140,6 +166,9 @@ void app_main(void)
         .exit_cb = on_light_sleep_exit,
     };
     ESP_ERROR_CHECK(esp_pm_light_sleep_register_cbs(&cbs_conf));
+#endif
+#if REPRO_SWITCHABLE
+    set_fix(false);
 #if CONFIG_REPRO_START_WITH_FIX
     set_fix(true);
 #endif
@@ -149,7 +178,7 @@ void app_main(void)
 
     printf("REPRO idf=%s wake_ms=%d busy_ms=%d report_every=%d switch_s=%d\n",
            esp_get_idf_version(), CONFIG_REPRO_WAKE_PERIOD_MS, CONFIG_REPRO_BUSY_MS, CONFIG_REPRO_REPORT_EVERY,
-#if CONFIG_REPRO_EMULATE_CAL_AFTER_WAKEUP
+#if REPRO_SWITCHABLE
            CONFIG_REPRO_MODE_SWITCH_PERIOD_S
 #else
            0
@@ -166,9 +195,9 @@ void app_main(void)
             printf("CLK n=%" PRIu32 " t_us=%" PRId64 " mode=%s cal=%" PRIu32 " die_cold=%.2f die_warm=%.2f\n",
                    n, esp_timer_get_time(), mode_name(), esp_clk_slowclk_cal_get(), die_cold, die_warm);
         }
-#if CONFIG_REPRO_EMULATE_CAL_AFTER_WAKEUP
+#if REPRO_SWITCHABLE
         if (switch_period_us != 0 && esp_timer_get_time() >= next_switch_us) {
-            set_fix(!s_fix_on);
+            set_fix(!fix_on());
             next_switch_us += switch_period_us;
         }
 #endif

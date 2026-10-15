@@ -27,9 +27,18 @@ menu "RTC_SLOW calibration reproducer"
             after the previous wake (die still cold) instead of measuring at sleep entry.
             Turn off when building against an ESP-IDF that has the fix itself.
 
+    config REPRO_IDF_TEST_SWITCH
+        bool "Alternate the ESP-IDF fix through its test-only runtime switch"
+        depends on PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP && !REPRO_EMULATE_CAL_AFTER_WAKEUP
+        default n
+        help
+            For an ESP-IDF that has CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP plus the TEST ONLY commit that
+            exposes esp_sleep_test_rtc_cal_after_wakeup. The app then switches the ESP-IDF fix off and on
+            like the emulation, and reports mode=fix-idf / mode=stock. Fails to link on any other ESP-IDF.
+
     config REPRO_MODE_SWITCH_PERIOD_S
-        int "Alternate stock / emulated fix every N seconds (0 = never)"
-        depends on REPRO_EMULATE_CAL_AFTER_WAKEUP
+        int "Alternate stock / fix every N seconds (0 = never)"
+        depends on REPRO_EMULATE_CAL_AFTER_WAKEUP || REPRO_IDF_TEST_SWITCH
         default 1800
         range 0 86400
         help
@@ -37,8 +46,8 @@ menu "RTC_SLOW calibration reproducer"
             reference clock. 0 keeps the mode chosen below for the whole run.
 
     config REPRO_START_WITH_FIX
-        bool "Start with the emulated fix on"
-        depends on REPRO_EMULATE_CAL_AFTER_WAKEUP
+        bool "Start with the fix on"
+        depends on REPRO_EMULATE_CAL_AFTER_WAKEUP || REPRO_IDF_TEST_SWITCH
         default n
 
 endmenu
