@@ -7,8 +7,8 @@
  * The app wakes every REPRO_WAKE_PERIOD_MS, busy-loops REPRO_BUSY_MS to warm the die, and every
  * REPRO_REPORT_EVERY wakes prints a line with esp_timer_get_time():
  *
- *     CLK n=<wakes> t_us=<esp_timer> mode=<stock|fix-emul|fix-idf> cal=<RTC_SLOW period, Q19 us>
- *         die_cold=<C, right after the wake> die_warm=<C, at the end of the busy time>
+ *     CLK n=<wakes> t_us=<esp_timer> cal=<RTC_SLOW period, Q19 us>
+ *     die_cold=<C, right after the wake> die_warm=<C, at the end of the busy time>
  *
  * clock_drift.py timestamps each line on arrival and fits esp_timer against the host clock.
  */
@@ -32,77 +32,11 @@
 #include "sdkconfig.h"
 #include "soc/rtc.h"
 
-#if CONFIG_REPRO_EMULATE_CAL_AFTER_WAKEUP
-// RTC_CLK_SRC_CAL_CYCLES in esp_hw_support/sleep_modes.c: only the light-sleep path calibrates
-// RTC_SLOW with this length.
-#define SLEEP_PATH_CAL_CYCLES   10
-// A shorter sleep doesn't let the die cool from what came before it.
-#define COLD_MIN_SLEEP_US       (50 * 1000)
-
-static volatile bool s_fix_on = false;
-// Taken right after the last long-enough sleep; 0 until the first one.
-static volatile uint32_t s_cold_period = 0;
-
-uint32_t __real_rtc_clk_cal(soc_clk_freq_calculation_src_t cal_clk_sel, uint32_t slowclk_cycles);
-
-// The sleep path calls rtc_clk_cal() from IRAM with interrupts off.
-IRAM_ATTR uint32_t __wrap_rtc_clk_cal(soc_clk_freq_calculation_src_t cal_clk_sel, uint32_t slowclk_cycles)
-{
-    if (s_fix_on && s_cold_period != 0 && cal_clk_sel == CLK_CAL_RTC_SLOW && slowclk_cycles == SLEEP_PATH_CAL_CYCLES) {
-        return s_cold_period;
-    }
-    return __real_rtc_clk_cal(cal_clk_sel, slowclk_cycles);
-}
-
-// Runs from the IDLE task right after each light sleep, before any other task warms the die.
-static esp_err_t on_light_sleep_exit(int64_t sleep_time_us, void *arg)
-{
-    if (s_fix_on && sleep_time_us >= COLD_MIN_SLEEP_US) {
-        s_cold_period = __real_rtc_clk_cal(CLK_CAL_RTC_SLOW, SLEEP_PATH_CAL_CYCLES);
-    }
-    return ESP_OK;
-}
-
-static void set_fix(bool on)
-{
-    // A reading from before an earlier stretch with the fix off may be long stale.
-    s_cold_period = 0;
-    s_fix_on = on;
-}
-
-static bool fix_on(void)
-{
-    return s_fix_on;
-}
-#endif
-
-#if CONFIG_REPRO_IDF_TEST_SWITCH
-// Defined only by the TEST ONLY commit on top of the ESP-IDF patch, not by upstream ESP-IDF.
-extern bool esp_sleep_test_rtc_cal_after_wakeup;
-
-static void set_fix(bool on)
-{
-    esp_sleep_test_rtc_cal_after_wakeup = on;
-}
-
-static bool fix_on(void)
-{
-    return esp_sleep_test_rtc_cal_after_wakeup;
-}
-#endif
-
-#if CONFIG_REPRO_EMULATE_CAL_AFTER_WAKEUP || CONFIG_REPRO_IDF_TEST_SWITCH
-#define REPRO_SWITCHABLE 1
-#endif
 
 static const char *mode_name(void)
 {
-#if CONFIG_REPRO_IDF_TEST_SWITCH
-    return fix_on() ? "fix-idf" : "stock";
-#elif CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP
+#if CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP
     return "fix-idf";
-#elif CONFIG_REPRO_EMULATE_CAL_AFTER_WAKEUP
-    return fix_on() ? "fix-emul" : "stock";
 #else
     return "stock";
 #endif
@@ -119,9 +53,9 @@ static float die_temp_read(void)
 {
     const temperature_sensor_config_t config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
     temperature_sensor_handle_t tsens = NULL;
-    if (temperature_sensor_install(&config, &tsens) != ESP_OK) {
+    if (temperature_sensor_install(&config, &tsens) != ESP_OK)
         return NAN;
-    }
+
     float result = NAN;
     if (temperature_sensor_enable(tsens) == ESP_OK) {
         float sum = 0;
@@ -146,8 +80,9 @@ static float die_temp_read(void)
 static void busy_for_ms(uint32_t ms)
 {
     const int64_t end = esp_timer_get_time() + (int64_t)ms * 1000;
-    while (esp_timer_get_time() < end) {
-    }
+    volatile int32_t trash = 0;
+    while (esp_timer_get_time() < end)
+        trash = (trash + 239) % 1001;
 }
 
 void app_main(void)
@@ -161,28 +96,8 @@ void app_main(void)
     // The driver logs its measuring range on every install, and this installs on every reading.
     esp_log_level_set("temperature_sensor", ESP_LOG_WARN);
 
-#if CONFIG_REPRO_EMULATE_CAL_AFTER_WAKEUP
-    esp_pm_sleep_cbs_register_config_t cbs_conf = {
-        .exit_cb = on_light_sleep_exit,
-    };
-    ESP_ERROR_CHECK(esp_pm_light_sleep_register_cbs(&cbs_conf));
-#endif
-#if REPRO_SWITCHABLE
-    set_fix(false);
-#if CONFIG_REPRO_START_WITH_FIX
-    set_fix(true);
-#endif
-    const int64_t switch_period_us = (int64_t)CONFIG_REPRO_MODE_SWITCH_PERIOD_S * 1000000;
-    int64_t next_switch_us = esp_timer_get_time() + switch_period_us;
-#endif
-
-    printf("REPRO idf=%s wake_ms=%d busy_ms=%d report_every=%d switch_s=%d\n",
-           esp_get_idf_version(), CONFIG_REPRO_WAKE_PERIOD_MS, CONFIG_REPRO_BUSY_MS, CONFIG_REPRO_REPORT_EVERY,
-#if REPRO_SWITCHABLE
-           CONFIG_REPRO_MODE_SWITCH_PERIOD_S
-#else
-           0
-#endif
+    printf("REPRO idf=%s wake_ms=%d busy_ms=%d report_every=%d",
+           esp_get_idf_version(), CONFIG_REPRO_WAKE_PERIOD_MS, CONFIG_REPRO_BUSY_MS, CONFIG_REPRO_REPORT_EVERY
           );
 
     for (uint32_t n = 1;; n++) {
@@ -195,11 +110,5 @@ void app_main(void)
             printf("CLK n=%" PRIu32 " t_us=%" PRId64 " mode=%s cal=%" PRIu32 " die_cold=%.2f die_warm=%.2f\n",
                    n, esp_timer_get_time(), mode_name(), esp_clk_slowclk_cal_get(), die_cold, die_warm);
         }
-#if REPRO_SWITCHABLE
-        if (switch_period_us != 0 && esp_timer_get_time() >= next_switch_us) {
-            set_fix(!fix_on());
-            next_switch_us += switch_period_us;
-        }
-#endif
     }
 }
