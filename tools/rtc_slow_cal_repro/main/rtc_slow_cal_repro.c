@@ -13,24 +13,19 @@
  * clock_drift.py timestamps each line on arrival and fits esp_timer against the host clock.
  */
 
-#include <inttypes.h>
-#include <math.h>
 #include <stdbool.h>
-#include <stdio.h>
+#include <inttypes.h>
+#include <math.h>                           // NAN
 
-#include "driver/temperature_sensor.h"
-#include "esp_attr.h"
-#include "esp_log.h"
-#include "esp_rom_sys.h"
-#include "esp_err.h"
-#include "esp_idf_version.h"
-#include "esp_pm.h"
-#include "esp_private/esp_clk.h"
-#include "esp_timer.h"
+#include "driver/temperature_sensor.h"      // read die temperature
+#include "esp_log.h"                        // debug output
+#include "esp_idf_version.h"                // for esp_get_idf_version() debug output
+#include "esp_pm.h"                         // enable light sleep
+#include "esp_private/esp_clk.h"            // for esp_clk_slowclk_cal_get() debug output
+#include "esp_timer.h"                      
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "sdkconfig.h"
-#include "soc/rtc.h"
+#include "sdkconfig.h"                      // get config option for mode_name() debug output
 
 
 static const char *mode_name(void)
@@ -87,6 +82,7 @@ static void busy_for_ms(uint32_t ms)
 
 void app_main(void)
 {
+    const char *LOGID = "temperature_sensor";
     const esp_pm_config_t pm_config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
@@ -94,9 +90,9 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
     // The driver logs its measuring range on every install, and this installs on every reading.
-    esp_log_level_set("temperature_sensor", ESP_LOG_WARN);
+    esp_log_level_set(LOGID, ESP_LOG_WARN);
 
-    printf("REPRO idf=%s wake_ms=%d busy_ms=%d report_every=%d",
+    ESP_LOGI(LOGID, "REPRO idf=%s wake_ms=%d busy_ms=%d report_every=%d",
            esp_get_idf_version(), CONFIG_REPRO_WAKE_PERIOD_MS, CONFIG_REPRO_BUSY_MS, CONFIG_REPRO_REPORT_EVERY
           );
 
@@ -107,7 +103,7 @@ void app_main(void)
         busy_for_ms(CONFIG_REPRO_BUSY_MS);
         if (report) {
             const float die_warm = die_temp_read();
-            printf("CLK n=%" PRIu32 " t_us=%" PRId64 " mode=%s cal=%" PRIu32 " die_cold=%.2f die_warm=%.2f\n",
+            ESP_LOGI(LOGID, "CLK n=%" PRIu32 " t_us=%" PRId64 " mode=%s cal=%" PRIu32 " die_cold=%.2f die_warm=%.2f\n",
                    n, esp_timer_get_time(), mode_name(), esp_clk_slowclk_cal_get(), die_cold, die_warm);
         }
     }
