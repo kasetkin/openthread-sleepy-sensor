@@ -27,6 +27,7 @@ Older captures:         CLK n=<wakes> t_us=<esp_timer> mode=<mode> cal=<Q19 peri
 
 import argparse
 import datetime
+import itertools
 import math
 import re
 import sys
@@ -229,8 +230,7 @@ def cmd_fit(args) -> None:
     )
     per_mode: dict[str, list[tuple[float, float]]] = {}
     for seg in segments:
-        t0 = seg.points[0].host_s
-        pts = [p for p in seg.points if args.skip <= p.host_s - t0 and (args.length is None or p.host_s - t0 <= args.length)]
+        pts = window(seg, args.skip, args.length)
         if len(pts) < 3:
             continue
         ppm, se, rms = fit(pts)
@@ -255,6 +255,204 @@ def cmd_fit(args) -> None:
         print(f"{mode:12} {len(rows):3} segments, {total:7.1f} min, duration-weighted {mean:+8.1f} ppm")
 
 
+@dataclass
+class Sleep:
+    """One light sleep, from two consecutive report lines (the one after it and the one before)."""
+
+    slept_s: float  # its length (s= of the line after it)
+    prev_s: float  # the light sleep before it, which decides where its RTC_SLOW period came from
+    error_s: float  # device minus host time over the interval holding it: only the sleep is RC-timed
+    host_s: float  # host time of that interval
+    cal: int  # the period it was timed with (c= of the line after it)
+    post_wake: bool | None  # period from the reading after the previous wake; None = too close to call
+    rc_local_ppm: float = math.nan  # RC frequency at its calibration against the neighbouring sleeps' (+ = faster = colder)
+
+
+# The firmware compares the pure RTC sleep time with the threshold, s= also holds the sleep entry and
+# exit, so a previous sleep this close to the threshold can't be assigned to either side.
+SOURCE_GUARD_US = 2000
+# Sleeps on each side whose mean period is the local reference for one period (about +-40 s).
+RC_NEIGHBOURS = 30
+
+
+def mode_threshold_us(mode: str) -> float | None:
+    """CONFIG_..._MIN_SLP_MS of a mode in us, None for stock (every sleep timed by the entry reading)."""
+    m = re.fullmatch(r"fix-\w+?(?:-(\d+))?", mode)
+    if m is None:
+        return None
+    return int(m[1]) * 1000 if m[1] else 50_000  # fix-idf / fix-emul before the option: 50 ms
+
+
+def collect_sleeps(pts: list[Point], threshold_us: float | None) -> list[Sleep]:
+    """Sleeps whose own and previous line are consecutive, each with exactly one light sleep."""
+    sleeps = []
+    for before, prev, cur in zip(pts, pts[1:], pts[2:]):
+        if cur.n != prev.n + 1 or prev.n != before.n + 1 or cur.sleeps != 1 or prev.sleeps != 1:
+            continue
+        if threshold_us is None:
+            post_wake = False
+        elif abs(prev.slept_us - threshold_us) < SOURCE_GUARD_US:
+            post_wake = None
+        else:
+            post_wake = prev.slept_us > threshold_us
+        host_s = cur.host_s - prev.host_s
+        error_s = (cur.dev_s - prev.dev_s) - host_s
+        sleeps.append(Sleep(cur.slept_us / 1e6, prev.slept_us / 1e6, error_s, host_s, cur.cal, post_wake))
+    # The die (and the RC with it) drifts by many degrees within a run, far more than the effect of a
+    # warm or cold reading, so each period is compared with the mean of its neighbours in time.
+    for i, x in enumerate(sleeps):
+        lo = max(0, i - RC_NEIGHBOURS)
+        near = [y.cal for y in sleeps[lo : i + RC_NEIGHBOURS + 1]]
+        local = (sum(near) - x.cal) / (len(near) - 1)
+        x.rc_local_ppm = (local / x.cal - 1) * 1e6
+    return sleeps
+
+
+def log_bins(per_decade: int) -> list[tuple[float, float, str]]:
+    """Sleep-length bins from 1 ms to 10 s (the last one open-ended), as (low s, high s, label)."""
+
+    def label(sec: float) -> str:
+        return f"{sec * 1e3:.3g}ms" if sec < 1 else f"{sec:.3g}s"
+
+    edges = [10 ** (-3 + i / per_decade) for i in range(4 * per_decade + 1)]
+    bins = [(lo, hi, f"{label(lo)}-{label(hi)}") for lo, hi in itertools.pairwise(edges)]
+    bins[-1] = (bins[-1][0], math.inf, bins[-1][2])
+    bins[0] = (0.0, bins[0][1], bins[0][2])
+    return bins
+
+
+def sleep_rate(sleeps: list[Sleep]) -> tuple[float, float]:
+    """Clock error over these sleeps, ppm of their sleep time, and its standard error."""
+    total = sum(x.slept_s for x in sleeps)
+    if len(sleeps) < 3 or total <= 0:
+        return math.nan, math.nan
+    rate = sum(x.error_s for x in sleeps) / total
+    resid = [x.error_s - rate * x.slept_s for x in sleeps]
+    var = sum(r * r for r in resid) / (len(sleeps) - 1)
+    return rate * 1e6, math.sqrt(len(sleeps) * var) / total * 1e6
+
+
+def mean_se(values: list[float]) -> tuple[float, float]:
+    if len(values) < 3:
+        return math.nan, math.nan
+    mean = sum(values) / len(values)
+    sd = math.sqrt(sum((v - mean) ** 2 for v in values) / (len(values) - 1))
+    return mean, sd / math.sqrt(len(values))
+
+
+def per_sleep_us(sleeps: list[Sleep]) -> tuple[float, float]:
+    """Mean clock error per sleep, us, and its standard error: the honest unit for short sleeps,
+    where a fixed per-sleep offset divided by a tiny sleep length gives meaningless ppm."""
+    mean, se = mean_se([x.error_s for x in sleeps])
+    return mean * 1e6, se * 1e6
+
+
+def rc_offset(sleeps: list[Sleep]) -> tuple[float, float]:
+    """RC frequency when these sleeps' periods were measured, ppm against their neighbours in time
+    (positive = faster = colder die), and its standard error."""
+    return mean_se([x.rc_local_ppm for x in sleeps])
+
+
+def pm(value: float, se: float) -> str:
+    return "-" if not math.isfinite(value) else f"{value:+.0f}±{se:.0f}"
+
+
+def share(part: list[Sleep], cond) -> str:
+    known = [x for x in part if x.post_wake is not None]
+    return f"{100 * sum(cond(x) for x in known) / len(known):.0f}" if known else "-"
+
+
+def cmd_bins(args) -> None:
+    with open(args.file, encoding="utf-8") as f:
+        segments = split_segments(f)
+    bins = log_bins(args.per_decade)
+    runs: list[tuple[str, list[Sleep]]] = []
+
+    for seg in segments:
+        pts = window(seg, args.skip, args.length)
+        threshold_us = mode_threshold_us(seg.mode)
+        sleeps = collect_sleeps(pts, threshold_us)
+        if len(sleeps) < 10:
+            continue
+        name = f"{seg.mode}#{len(runs) + 1}"
+        runs.append((name, sleeps))
+        dies = [p.die_cold for p in pts if math.isfinite(p.die_cold)]
+        die = f"{min(dies):.1f}..{max(dies):.1f} C (mean {sum(dies) / len(dies):.1f})" if dies else "-"
+        total_host = sum(x.host_s for x in sleeps)
+        run_ppm = sum(x.error_s for x in sleeps) / total_host * 1e6
+        sleep_ppm, sleep_se = sleep_rate(sleeps)
+        threshold = "none (stock: entry reading)" if threshold_us is None else f"{threshold_us / 1000:g} ms"
+        print(f"== {name}  {pts[0].wall[5:16].replace('T', ' ')} UTC, {len(sleeps)} sleeps, threshold {threshold}, die {die}")
+        print(f"   run: {run_ppm:+.1f} ppm of wall time (fit-comparable), {pm(sleep_ppm, sleep_se)} ppm of sleep time")
+        print("   by the sleep's own length: its clock error, and what it adds to the run's ppm")
+        print(f"   {'sleep':14} {'n':>5} {'time%':>6} {'post-wake%':>10} {'us per sleep':>13} {'ppm of sleep':>14} {'adds ppm':>9}")
+        total_sleep = sum(x.slept_s for x in sleeps)
+        for lo, hi, label in bins:
+            part = [x for x in sleeps if lo <= x.slept_s < hi]
+            if not part:
+                continue
+            rate, se = sleep_rate(part)
+            adds = sum(x.error_s for x in part) / total_host * 1e6
+            time_share = 100 * sum(x.slept_s for x in part) / total_sleep
+            us, us_se = per_sleep_us(part)
+            print(f"   {label:14} {len(part):5} {time_share:6.1f} {share(part, lambda x: x.post_wake):>10} {pm(us, us_se):>13} {pm(rate, se):>14} {adds:+9.1f}")
+        print(f"   by the previous sleep's length (it decides the period source): RC at calibration vs its neighbours, and the clock error of sleeps >= {args.min_own:g} s")
+        print(f"   {'prev sleep':14} {'n':>5} {'post-wake%':>10} {'RC ppm':>10} {'n>=':>5} {'ppm of sleep':>14}")
+        for lo, hi, label in bins:
+            part = [x for x in sleeps if lo <= x.prev_s < hi]
+            if not part:
+                continue
+            rc, rc_se = rc_offset(part)
+            long = [x for x in part if x.slept_s >= args.min_own]
+            rate, se = sleep_rate(long)
+            print(f"   {label:14} {len(part):5} {share(part, lambda x: x.post_wake):>10} {pm(rc, rc_se):>10} {len(long):5} {pm(rate, se):>14}")
+        print()
+
+    if not runs:
+        print("no usable sleeps: bins needs report lines with s= and k= (captures from 2026-10-20 on)")
+        return
+    if len(runs) < 2:
+        return
+    width = max(14, *(len(name) + 1 for name, _ in runs))
+    stock = [x for name, sleeps in runs if name.startswith("stock#") for x in sleeps]
+
+    def pivot(title: str, key, select, value, vs_stock: bool = False) -> None:
+        cols = [(name, sleeps) for name, sleeps in runs if not (vs_stock and name.startswith("stock#"))]
+        if not cols or (vs_stock and not stock):
+            return
+        print(f"== {title}")
+        print(f"   {'':14}" + "".join(f"{name:>{width}}" for name, _ in cols))
+        for lo, hi, label in bins:
+            ref = value([x for x in stock if lo <= key(x) < hi and select(x)]) if vs_stock else (0.0, 0.0)
+            cells = []
+            for _, sleeps in cols:
+                v, se = value([x for x in sleeps if lo <= key(x) < hi and select(x)])
+                cells.append(pm(v - ref[0], math.hypot(se, ref[1])))
+            print(f"   {label:14}" + "".join(f"{c:>{width}}" for c in cells))
+        print()
+
+    own = lambda x: x.slept_s
+    prev = lambda x: x.prev_s
+    long_own = lambda x: x.slept_s >= args.min_own
+    pivot("us of clock error per sleep, by the sleep's own length", own, lambda x: True, per_sleep_us)
+    pivot(
+        "difference to stock (all stock runs pooled), us per sleep, by the sleep's own length: the effect of the period source",
+        own,
+        lambda x: True,
+        per_sleep_us,
+        vs_stock=True,
+    )
+    pivot("ppm of sleep time, by the sleep's own length", own, lambda x: True, sleep_rate)
+    pivot(f"ppm of sleep time of sleeps >= {args.min_own:g} s, by the previous sleep's length", prev, long_own, sleep_rate)
+    pivot("RC frequency at calibration vs its neighbours in time, ppm (+ = colder die), by the previous sleep's length", prev, lambda x: True, rc_offset)
+
+
+def window(seg: Segment, skip: float, length: float | None) -> list[Point]:
+    """The points of a segment from skip to length seconds after its start (host time)."""
+    t0 = seg.points[0].host_s
+    return [p for p in seg.points if skip <= p.host_s - t0 and (length is None or p.host_s - t0 <= length)]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -275,6 +473,14 @@ def main() -> None:
         help="use only the first LENGTH seconds of each segment (counted from its start, like --skip), so runs of different length cover the same sleeps",
     )
     p_fit.set_defaults(func=cmd_fit)
+
+    p_bins = sub.add_parser("bins", help="clock error per sleep-length bin, by the sleep's own and the previous sleep's length")
+    p_bins.add_argument("file")
+    p_bins.add_argument("--skip", type=float, default=0, help="seconds to drop at the start of each segment")
+    p_bins.add_argument("--length", type=float, default=None, help="use only the first LENGTH seconds of each segment")
+    p_bins.add_argument("--per-decade", type=int, default=2, help="bins per decade of sleep length (default 2)")
+    p_bins.add_argument("--min-own", type=float, default=1.0, help="shortest own sleep (s) for the by-previous-sleep clock error (default 1)")
+    p_bins.set_defaults(func=cmd_bins)
 
     args = parser.parse_args()
     try:
