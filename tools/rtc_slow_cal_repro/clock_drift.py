@@ -18,7 +18,10 @@ The reference is the host's CLOCK_MONOTONIC. NTP keeps its frequency right (slew
 steps it, so the host should be NTP-synced and must not suspend during a capture.
 
 Captured line format:   <UTC ISO time> <host monotonic ns> <device line>
-Device CLK line:        CLK n=<wakes> t_us=<esp_timer> mode=<stock|fix-emul|fix-idf> cal=<Q19 period>
+Device boot banner:     REPRO idf=<version> mode=<stock|fix-idf-<MIN_SLP_MS>> wake_ms=.. busy_ms=.. ...
+Device report line:     C n=.. t=.. c=.. [d=..] r=.. s=.. k=.. [o=..]
+                        (fields are described in main/rtc_slow_cal_repro.c; the mode comes from the banner)
+Older captures:         CLK n=<wakes> t_us=<esp_timer> mode=<mode> cal=<Q19 period>
                             [die_cold=<C after wake> die_warm=<C after the busy time>]
 """
 
@@ -31,7 +34,24 @@ import time
 from dataclasses import dataclass, field
 
 CLK_RE = re.compile(r"CLK n=(\d+) t_us=(-?\d+) mode=(\S+) cal=(\d+)(?: die_cold=(\S+) die_warm=(\S+))?")
+SHORT_RE = re.compile(r"^C ((?:\w+=-?\d+ ?)+)$")
+BANNER_MODE_RE = re.compile(r"\bmode=(\S+)")
 RTC_CLK_CAL_FRACT = 19
+
+
+@dataclass
+class Clk:
+    """One report line. mode is None in the short format: it comes from the boot banner."""
+
+    n: int
+    dev_s: float
+    mode: str | None
+    cal: int
+    die_cold: float = math.nan
+    die_warm: float = math.nan
+    slept_us: int | None = None
+    sleeps: int | None = None
+    overruns: int = 0
 
 
 @dataclass
@@ -43,6 +63,13 @@ class Point:
     cal: int
     die_cold: float = math.nan
     die_warm: float = math.nan
+    slept_us: int | None = None
+    sleeps: int | None = None
+    overruns: int = 0
+
+    @classmethod
+    def from_clk(cls, wall: str, host_s: float, clk: Clk) -> "Point":
+        return cls(wall, host_s, clk.dev_s, clk.n, clk.cal, clk.die_cold, clk.die_warm, clk.slept_us, clk.sleeps, clk.overruns)
 
 
 @dataclass
@@ -51,14 +78,33 @@ class Segment:
     points: list[Point] = field(default_factory=list)
 
 
-def parse_clk(text: str) -> tuple[int, float, str, int, float, float] | None:
+def parse_clk(text: str) -> Clk | None:
+    m = SHORT_RE.match(text)
+    if m is not None:
+        f = dict(tok.split("=", 1) for tok in m[1].split())
+        if not {"n", "t", "c"} <= f.keys():
+            return None
+        die = int(f["d"]) / 10 if "d" in f else math.nan  # left out if the sensor failed
+        slept_us = int(f["s"]) if "s" in f else None
+        sleeps = int(f["k"]) if "k" in f else None
+        return Clk(int(f["n"]), int(f["t"]) / 1e6, None, int(f["c"]), die, math.nan, slept_us, sleeps, int(f.get("o", 0)))
     m = CLK_RE.search(text)
     if m is None:
         return None
     # die_* are absent in captures from before they were added, and "nan" if the sensor failed.
     die_cold = float(m[5]) if m[5] else math.nan
     die_warm = float(m[6]) if m[6] else math.nan
-    return int(m[1]), int(m[2]) / 1e6, m[3], int(m[4]), die_cold, die_warm
+    return Clk(int(m[1]), int(m[2]) / 1e6, m[3], int(m[4]), die_cold, die_warm)
+
+
+def banner_mode(text: str) -> str | None:
+    """The mode of a boot banner line ("" if it names none), or None if it is not a banner.
+
+    Also matches older banners that went through ESP_LOGW and carry its prefix."""
+    if "REPRO " not in text:
+        return None
+    m = BANNER_MODE_RE.search(text)
+    return m[1] if m else ""
 
 
 def cal_khz(cal: float) -> float:
@@ -98,20 +144,33 @@ def split_segments(lines) -> list[Segment]:
         if len(parts) < 3:
             continue
         host_s = int(parts[1]) / 1e9
-        if parts[2].startswith("REPRO "):
-            segments.append(Segment(mode=""))  # boot: never join across it
+        boot_mode = banner_mode(parts[2])
+        if boot_mode is not None:
+            segments.append(Segment(mode=boot_mode))  # boot: never join across it
             continue
         clk = parse_clk(parts[2])
         if clk is None:
             continue
-        n, dev_s, mode, cal, die_cold, die_warm = clk
         cur = segments[-1] if segments else None
-        if cur is None or cur.mode not in ("", mode) or (cur.points and (n <= cur.points[-1].n or dev_s <= cur.points[-1].dev_s)):
+        # A short line has no mode: it runs the firmware of the last banner. A reset without a
+        # banner (lost on the wire) is still the same firmware.
+        mode = clk.mode or (cur.mode if cur is not None and cur.mode else "?")
+        if cur is None or cur.mode not in ("", mode) or (cur.points and (clk.n <= cur.points[-1].n or clk.dev_s <= cur.points[-1].dev_s)):
             cur = Segment(mode=mode)
             segments.append(cur)
         cur.mode = mode
-        cur.points.append(Point(parts[0], host_s, dev_s, n, cal, die_cold, die_warm))
+        cur.points.append(Point.from_clk(parts[0], host_s, clk))
     return [s for s in segments if s.points]
+
+
+def sleep_share(points: list[Point]) -> float:
+    """Share of the device time spent in light sleep, from the lines after the first (each line
+    counts the sleeps since the line before it). NaN for captures without the s= field."""
+    slept = [p.slept_us for p in points[1:]]
+    if not slept or None in slept:
+        return math.nan
+    span_s = points[-1].dev_s - points[0].dev_s
+    return sum(slept) / 1e6 / span_s if span_s > 0 else math.nan
 
 
 def cmd_log(args) -> None:
@@ -142,28 +201,32 @@ def cmd_log(args) -> None:
             clk = parse_clk(text)
             if clk is None:
                 print(f"{wall} {text}", flush=True)
-                if text.startswith("REPRO "):
-                    seg = Segment(mode="")
+                boot_mode = banner_mode(text)
+                if boot_mode is not None:
+                    seg = Segment(mode=boot_mode)
                 continue
-            n, dev_s, mode, cal, die_cold, die_warm = clk
-            if seg.mode not in ("", mode) or (seg.points and n <= seg.points[-1].n):
+            mode = clk.mode or seg.mode or "?"
+            if seg.mode not in ("", mode) or (seg.points and clk.n <= seg.points[-1].n):
                 seg = Segment(mode=mode)
             seg.mode = mode
-            seg.points.append(Point(wall, mono_ns / 1e9, dev_s, n, cal, die_cold, die_warm))
+            seg.points.append(Point.from_clk(wall, mono_ns / 1e9, clk))
             span_min = (seg.points[-1].host_s - seg.points[0].host_s) / 60
             if len(seg.points) >= 3:
                 ppm, se, _ = fit(seg.points)
                 rate = f"{ppm:+8.1f} ±{se:5.1f} ppm over {span_min:5.1f} min"
             else:
                 rate = "(fit after 3 lines)"
-            print(f"{wall} {mode:8} n={n:7} {cal_khz(cal):8.3f} kHz  {die_cold:6.2f} C  {rate}", flush=True)
+            overrun = f"  OVERRUN x{clk.overruns}" if clk.overruns else ""
+            print(f"{wall} {mode:12} n={clk.n:7} {cal_khz(clk.cal):8.3f} kHz  {clk.die_cold:6.2f} C  {rate}{overrun}", flush=True)
 
 
 def cmd_fit(args) -> None:
     with open(args.file, encoding="utf-8") as f:
         segments = split_segments(f)
 
-    print(f"{'mode':8} {'start (UTC host)':>16} {'min':>6} {'lines':>5} {'ppm':>9} {'±SE':>6} {'rms ms':>6} {'cal kHz':>9} {'die C':>6} {'warm-up':>7}")
+    print(
+        f"{'mode':12} {'start (UTC host)':>16} {'min':>6} {'lines':>5} {'ppm':>9} {'±SE':>6} {'rms ms':>6} {'cal kHz':>9} {'die C':>6} {'warm-up':>7} {'sleep%':>6} {'ovr':>4}"
+    )
     per_mode: dict[str, list[tuple[float, float]]] = {}
     for seg in segments:
         pts = [p for p in seg.points if p.host_s - seg.points[0].host_s >= args.skip]
@@ -175,14 +238,18 @@ def cmd_fit(args) -> None:
         die_cold = mean_finite(p.die_cold for p in pts)
         warm_up = mean_finite(p.die_warm - p.die_cold for p in pts)
         start = pts[0].wall[5:16].replace("T", " ")
-        print(f"{seg.mode:8} {start:>16} {minutes:6.1f} {len(pts):5} {ppm:+9.1f} {se:6.1f} {rms:6.2f} {cal_khz(mean_cal):9.3f} {die_cold:6.2f} {warm_up:+7.2f}")
+        share = 100 * sleep_share(pts)
+        overruns = pts[-1].overruns - pts[0].overruns
+        print(
+            f"{seg.mode:12} {start:>16} {minutes:6.1f} {len(pts):5} {ppm:+9.1f} {se:6.1f} {rms:6.2f} {cal_khz(mean_cal):9.3f} {die_cold:6.2f} {warm_up:+7.2f} {share:6.1f} {overruns:4}"
+        )
         per_mode.setdefault(seg.mode, []).append((ppm, minutes))
 
     print()
     for mode, rows in per_mode.items():
         total = sum(m for _, m in rows)
         mean = sum(p * m for p, m in rows) / total
-        print(f"{mode:8} {len(rows):3} segments, {total:7.1f} min, duration-weighted {mean:+8.1f} ppm")
+        print(f"{mode:12} {len(rows):3} segments, {total:7.1f} min, duration-weighted {mean:+8.1f} ppm")
 
 
 def main() -> None:

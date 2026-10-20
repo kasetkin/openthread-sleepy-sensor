@@ -10,9 +10,12 @@ menu "RTC_SLOW calibration reproducer"
         default 200
         range 0 1000
         help
-            Busy-loops the CPU after every wake to warm the die, the way a radio burst or
-            a sensor read would. ESP-IDF calibrates RTC_SLOW at the next sleep entry, at
-            the end of this busy time.
+            Active window after every wake, counted from the wakeup. The report line and the
+            die temperature reading are done first, inside the window, then the CPU busy-loops
+            until its end to warm the die, the way a radio burst or a sensor read would. So the
+            logging never changes the active time. ESP-IDF calibrates RTC_SLOW at the next sleep
+            entry, at the end of this window. If the work ever runs past the window, the report
+            line counts it in its o= field.
 
     config REPRO_REPORT_EVERY
         int "Print a CLK line every N wakes"
