@@ -229,7 +229,8 @@ def cmd_fit(args) -> None:
     )
     per_mode: dict[str, list[tuple[float, float]]] = {}
     for seg in segments:
-        pts = [p for p in seg.points if p.host_s - seg.points[0].host_s >= args.skip]
+        t0 = seg.points[0].host_s
+        pts = [p for p in seg.points if args.skip <= p.host_s - t0 and (args.length is None or p.host_s - t0 <= args.length)]
         if len(pts) < 3:
             continue
         ppm, se, rms = fit(pts)
@@ -265,6 +266,12 @@ def main() -> None:
     p_fit = sub.add_parser("fit", help="fit the clock rate per segment and per mode")
     p_fit.add_argument("file")
     p_fit.add_argument("--skip", type=float, default=0, help="seconds to drop at the start of each segment")
+    p_fit.add_argument(
+        "--length",
+        type=float,
+        default=None,
+        help="use only the first LENGTH seconds of each segment (counted from its start, like --skip), so runs of different length cover the same sleeps",
+    )
     p_fit.set_defaults(func=cmd_fit)
 
     args = parser.parse_args()

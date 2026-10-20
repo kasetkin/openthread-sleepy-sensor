@@ -6,7 +6,7 @@
 #   ./sweep.sh flash <v>           flash build-sweep-<v> over USB-Serial-JTAG; the board must already
 #                                  be in download mode (hold BOOT, tap RESET); tap RESET after it
 #   ./sweep.sh capture <log>       start the UART capture detached, so it survives the shell/session
-#   ./sweep.sh status <log>        is the capture running, last lines, fit per segment
+#   ./sweep.sh status <log>        is the capture running, last lines, fit per segment (minutes 10-70)
 #   ./sweep.sh stop                stop the capture
 #
 # Values: "stock" (option off) or a MIN_SLP_MS value. Environment overrides: JTAG, UART, BUSY_MS.
@@ -88,7 +88,9 @@ cmd_status() {
     echo "capture pid(s): $(capture_pids)"
     [ -s "$log.err" ] && { echo "--- $log.err:"; tail -5 "$log.err"; }
     echo "--- last lines:"; tail -3 "$log"
-    echo "--- fit:"; uv run --script "$HERE/clock_drift.py" fit "$log" --skip 600
+    # Each run lasts 70 min: drop the first 10 (settling after the reflash), cut at 70 so that
+    # every run covers the same part of the seeded sleep sequence.
+    echo "--- fit (minutes 10-70 of each run):"; uv run --script "$HERE/clock_drift.py" fit "$log" --skip 600 --length 4200
 }
 
 cmd_stop() {
