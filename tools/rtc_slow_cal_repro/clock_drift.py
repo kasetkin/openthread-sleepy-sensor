@@ -137,14 +137,25 @@ def fit(points: list[Point]) -> tuple[float, float, float]:
     return (slope - 1) * 1e6, se * 1e6, math.sqrt(sse / k) * 1e3
 
 
-def split_segments(lines) -> list[Segment]:
-    """One segment per run of CLK lines with the same mode and no reset in between."""
+def wire_time_s(text: str, baud: int) -> float:
+    """Time the line took on the UART: 10 bits per byte, plus the CR LF the console adds.
+
+    The host stamps a line when its last byte arrives, so without this a line's stamp moves by
+    86.8 us (at 115200) per character: r= and s= gain digits at 10 ms, 100 ms and 1 s, which made
+    up a per-sleep "error" of +-600 us that depended on the lengths of the sleeps around it."""
+    return (len(text.encode("utf-8", errors="replace")) + 2) * 10 / baud
+
+
+def split_segments(lines, baud: int = 115200) -> list[Segment]:
+    """One segment per run of CLK lines with the same mode and no reset in between.
+
+    Host times are those of the start of each line on the wire (see wire_time_s)."""
     segments: list[Segment] = []
     for line in lines:
         parts = line.rstrip("\n").split(" ", 2)
         if len(parts) < 3:
             continue
-        host_s = int(parts[1]) / 1e9
+        host_s = int(parts[1]) / 1e9 - wire_time_s(parts[2], baud)
         boot_mode = banner_mode(parts[2])
         if boot_mode is not None:
             segments.append(Segment(mode=boot_mode))  # boot: never join across it
@@ -210,7 +221,7 @@ def cmd_log(args) -> None:
             if seg.mode not in ("", mode) or (seg.points and clk.n <= seg.points[-1].n):
                 seg = Segment(mode=mode)
             seg.mode = mode
-            seg.points.append(Point.from_clk(wall, mono_ns / 1e9, clk))
+            seg.points.append(Point.from_clk(wall, mono_ns / 1e9 - wire_time_s(text, args.baud), clk))
             span_min = (seg.points[-1].host_s - seg.points[0].host_s) / 60
             if len(seg.points) >= 3:
                 ppm, se, _ = fit(seg.points)
@@ -223,7 +234,7 @@ def cmd_log(args) -> None:
 
 def cmd_fit(args) -> None:
     with open(args.file, encoding="utf-8") as f:
-        segments = split_segments(f)
+        segments = split_segments(f, args.baud)
 
     print(
         f"{'mode':12} {'start (UTC host)':>16} {'min':>6} {'lines':>5} {'ppm':>9} {'±SE':>6} {'rms ms':>6} {'cal kHz':>9} {'die C min..max':>14} {'mean':>5} {'warm-up':>7} {'sleep%':>6} {'ovr':>4}"
@@ -364,7 +375,7 @@ def share(part: list[Sleep], cond) -> str:
 
 def cmd_bins(args) -> None:
     with open(args.file, encoding="utf-8") as f:
-        segments = split_segments(f)
+        segments = split_segments(f, args.baud)
     bins = log_bins(args.per_decade)
     runs: list[tuple[str, list[Sleep]]] = []
 
@@ -447,6 +458,62 @@ def cmd_bins(args) -> None:
     pivot("RC frequency at calibration vs its neighbours in time, ppm (+ = colder die), by the previous sleep's length", prev, lambda x: True, rc_offset)
 
 
+def cmd_matrix(args) -> None:
+    """Per run: rows = the previous sleep's length (it decides the period source), columns = the
+    length of the sleep being timed, cell = that sleep's clock error."""
+    with open(args.file, encoding="utf-8") as f:
+        segments = split_segments(f, args.baud)
+    bins = log_bins(args.per_decade)
+    runs: list[tuple[str, list[Sleep], str, str]] = []
+    for seg in segments:
+        pts = window(seg, args.skip, args.length)
+        threshold_us = mode_threshold_us(seg.mode)
+        sleeps = collect_sleeps(pts, threshold_us)
+        if len(sleeps) < 10:
+            continue
+        dies = [p.die_cold for p in pts if math.isfinite(p.die_cold)]
+        die = f"{min(dies):.1f}..{max(dies):.1f} C (mean {sum(dies) / len(dies):.1f})" if dies else "-"
+        threshold = "none (entry reading)" if threshold_us is None else f"{threshold_us / 1000:g} ms"
+        runs.append((f"{seg.mode}#{len(runs) + 1}", sleeps, die, threshold))
+    if not runs:
+        print("no usable sleeps: matrix needs report lines with s= and k= (captures from 2026-10-20 on)")
+        return
+
+    value = sleep_rate if args.unit == "ppm" else per_sleep_us
+    unit = "ppm of sleep time" if args.unit == "ppm" else "us per sleep"
+    stock = [x for name, sleeps, _, _ in runs if name.startswith("stock#") for x in sleeps]
+    if args.vs_stock and not stock:
+        print("--vs-stock needs a stock run in the file")
+        return
+
+    def cell(sleeps: list[Sleep], row: tuple[float, float, str], col: tuple[float, float, str]) -> list[Sleep]:
+        return [x for x in sleeps if row[0] <= x.prev_s < row[1] and col[0] <= x.slept_s < col[1]]
+
+    for name, sleeps, die, threshold in runs:
+        if args.vs_stock and name.startswith("stock#"):
+            continue
+        what = f"{unit}, minus the pooled stock runs' same cell" if args.vs_stock else unit
+        print(f"== {name}, threshold {threshold}, die {die}, {len(sleeps)} sleeps")
+        print(f"   rows: previous sleep [share timed by the post-wake reading]; columns: the timed sleep; cells: {what} ±SE (n)")
+        texts = []
+        for row in bins:
+            cells = []
+            for col in bins:
+                part = cell(sleeps, row, col)
+                v, se = value(part)
+                if args.vs_stock and math.isfinite(v):
+                    ref, ref_se = value(cell(stock, row, col))
+                    v, se = v - ref, math.hypot(se, ref_se)
+                cells.append("-" if not math.isfinite(v) else f"{v:+.0f}±{se:.0f} ({len(part)})")
+            texts.append((f"{row[2]} [{share([x for x in sleeps if row[0] <= x.prev_s < row[1]], lambda x: x.post_wake)}%]", cells))
+        width = max(len(c) for _, cells in texts for c in cells + [b[2] for b in bins]) + 2
+        label_width = max(len(label) for label, _ in texts) + 2
+        print(f"   {'prev \\ timed':{label_width}}" + "".join(f"{b[2]:>{width}}" for b in bins))
+        for label, cells in texts:
+            print(f"   {label:{label_width}}" + "".join(f"{c:>{width}}" for c in cells))
+        print()
+
+
 def window(seg: Segment, skip: float, length: float | None) -> list[Point]:
     """The points of a segment from skip to length seconds after its start (host time)."""
     t0 = seg.points[0].host_s
@@ -465,6 +532,7 @@ def main() -> None:
 
     p_fit = sub.add_parser("fit", help="fit the clock rate per segment and per mode")
     p_fit.add_argument("file")
+    p_fit.add_argument("-b", "--baud", type=int, default=115200, help="UART baud rate of the capture, for the line wire-time correction")
     p_fit.add_argument("--skip", type=float, default=0, help="seconds to drop at the start of each segment")
     p_fit.add_argument(
         "--length",
@@ -476,11 +544,22 @@ def main() -> None:
 
     p_bins = sub.add_parser("bins", help="clock error per sleep-length bin, by the sleep's own and the previous sleep's length")
     p_bins.add_argument("file")
+    p_bins.add_argument("-b", "--baud", type=int, default=115200, help="UART baud rate of the capture, for the line wire-time correction")
     p_bins.add_argument("--skip", type=float, default=0, help="seconds to drop at the start of each segment")
     p_bins.add_argument("--length", type=float, default=None, help="use only the first LENGTH seconds of each segment")
     p_bins.add_argument("--per-decade", type=int, default=2, help="bins per decade of sleep length (default 2)")
     p_bins.add_argument("--min-own", type=float, default=1.0, help="shortest own sleep (s) for the by-previous-sleep clock error (default 1)")
     p_bins.set_defaults(func=cmd_bins)
+
+    p_mx = sub.add_parser("matrix", help="per run: clock error of a sleep by the previous sleep's length (rows) and its own (columns)")
+    p_mx.add_argument("file")
+    p_mx.add_argument("-b", "--baud", type=int, default=115200, help="UART baud rate of the capture, for the line wire-time correction")
+    p_mx.add_argument("--skip", type=float, default=0, help="seconds to drop at the start of each segment")
+    p_mx.add_argument("--length", type=float, default=None, help="use only the first LENGTH seconds of each segment")
+    p_mx.add_argument("--per-decade", type=int, default=1, help="bins per decade of sleep length (default 1)")
+    p_mx.add_argument("--unit", choices=("ppm", "us"), default="ppm", help="ppm of sleep time (default) or us per sleep")
+    p_mx.add_argument("--vs-stock", action="store_true", help="each cell minus the pooled stock runs' same cell")
+    p_mx.set_defaults(func=cmd_matrix)
 
     args = parser.parse_args()
     try:
