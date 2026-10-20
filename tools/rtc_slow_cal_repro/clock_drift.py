@@ -225,7 +225,7 @@ def cmd_fit(args) -> None:
         segments = split_segments(f)
 
     print(
-        f"{'mode':12} {'start (UTC host)':>16} {'min':>6} {'lines':>5} {'ppm':>9} {'±SE':>6} {'rms ms':>6} {'cal kHz':>9} {'die C':>6} {'warm-up':>7} {'sleep%':>6} {'ovr':>4}"
+        f"{'mode':12} {'start (UTC host)':>16} {'min':>6} {'lines':>5} {'ppm':>9} {'±SE':>6} {'rms ms':>6} {'cal kHz':>9} {'die C min..max':>14} {'mean':>5} {'warm-up':>7} {'sleep%':>6} {'ovr':>4}"
     )
     per_mode: dict[str, list[tuple[float, float]]] = {}
     for seg in segments:
@@ -237,12 +237,14 @@ def cmd_fit(args) -> None:
         minutes = (pts[-1].host_s - pts[0].host_s) / 60
         mean_cal = sum(p.cal for p in pts) / len(pts)
         die_cold = mean_finite(p.die_cold for p in pts)
+        dies = [p.die_cold for p in pts if math.isfinite(p.die_cold)]
+        die_range = f"{min(dies):5.1f}..{max(dies):5.1f}" if dies else "-"
         warm_up = mean_finite(p.die_warm - p.die_cold for p in pts)
         start = pts[0].wall[5:16].replace("T", " ")
         share = 100 * sleep_share(pts)
         overruns = pts[-1].overruns - pts[0].overruns
         print(
-            f"{seg.mode:12} {start:>16} {minutes:6.1f} {len(pts):5} {ppm:+9.1f} {se:6.1f} {rms:6.2f} {cal_khz(mean_cal):9.3f} {die_cold:6.2f} {warm_up:+7.2f} {share:6.1f} {overruns:4}"
+            f"{seg.mode:12} {start:>16} {minutes:6.1f} {len(pts):5} {ppm:+9.1f} {se:6.1f} {rms:6.2f} {cal_khz(mean_cal):9.3f} {die_range:>14} {die_cold:5.1f} {warm_up:+7.2f} {share:6.1f} {overruns:4}"
         )
         per_mode.setdefault(seg.mode, []).append((ppm, minutes))
 
