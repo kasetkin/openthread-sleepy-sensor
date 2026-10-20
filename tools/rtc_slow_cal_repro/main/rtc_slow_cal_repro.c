@@ -4,20 +4,22 @@
  * as the die cools during the sleep, so the sleep is converted with a period that is too long and
  * esp_timer / the RTC time run fast.
  *
- * The app sleeps REPRO_WAKE_PERIOD_MS, then stays active for exactly REPRO_BUSY_MS counted from
+ * The app sleeps a random time, log-uniform in [REPRO_SLEEP_MIN_MS, REPRO_SLEEP_MAX_MS] from a fixed
+ * seed (or always REPRO_WAKE_PERIOD_MS), then stays active for exactly REPRO_BUSY_MS counted from
  * the wakeup: every REPRO_REPORT_EVERY wakes it first reads the die temperature and prints a
  * line, then busy-loops until the end of that window to warm the die. The logging is part of the
  * window, so it never changes the active time.
  *
  * Boot banner, once:
- *     REPRO idf=<version> mode=<stock|fix-idf-<MIN_SLP_MS>> wake_ms=.. busy_ms=.. report_every=..
+ *     REPRO idf=<version> mode=<stock|fix-idf-<MIN_SLP_MS>> sleep_ms=<min>..<max> seed=<hex>
+ *           busy_ms=.. report_every=..                 (sleep_ms=<period>, no seed, if fixed)
  * Report line, kept short (about 5 ms at 115200 baud):
  *     C n=.. t=.. c=.. d=.. r=.. s=.. k=.. o=..
  *       n  wakes since boot
  *       t  esp_timer_get_time(), us
  *       c  RTC_SLOW period used for the last light sleep, Q19 us (esp_clk_slowclk_cal_get())
  *       d  die temperature right after the wake, 0.1 C (left out if the sensor fails)
- *       r  requested sleep, ms
+ *       r  requested duration of the sleep before this wake, ms
  *       s  time spent in light sleep since the previous line, us
  *       k  light sleeps since the previous line
  *       o  windows so far where the work ran past REPRO_BUSY_MS (left out while 0)
@@ -28,7 +30,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <inttypes.h>
-#include <math.h>                           // NAN, lroundf
+#include <math.h>                           // NAN, lroundf, lround, pow
 
 #include "driver/temperature_sensor.h"      // read die temperature
 #include "esp_attr.h"                       // IRAM_ATTR for the light sleep exit callback
@@ -58,6 +60,31 @@
 // only moves once per conversion.
 #define DIE_TEMP_SAMPLES        16
 #define DIE_TEMP_SPACING_US     50
+
+#if CONFIG_REPRO_SLEEP_LOG_UNIFORM
+// xorshift32: the same sequence on every boot and with every ESP-IDF, unlike esp_random()
+static uint32_t s_rng_state = CONFIG_REPRO_SEED;
+
+static uint32_t next_random(void)
+{
+    s_rng_state ^= s_rng_state << 13;
+    s_rng_state ^= s_rng_state >> 17;
+    s_rng_state ^= s_rng_state << 5;
+    return s_rng_state;
+}
+#endif
+
+// Requested duration of the next sleep, ms.
+static uint32_t next_sleep_ms(void)
+{
+#if CONFIG_REPRO_SLEEP_LOG_UNIFORM
+    const double u = next_random() / 4294967296.0;     // [0, 1)
+    const double ratio = (double)CONFIG_REPRO_SLEEP_MAX_MS / CONFIG_REPRO_SLEEP_MIN_MS;
+    return (uint32_t)lround(CONFIG_REPRO_SLEEP_MIN_MS * pow(ratio, u));
+#else
+    return CONFIG_REPRO_WAKE_PERIOD_MS;
+#endif
+}
 
 // Light sleeps since the previous report line and the time spent in them. Written by the light
 // sleep exit callback, which runs in the idle task while the report task is blocked, so a write
@@ -159,16 +186,23 @@ void app_main(void)
     // The driver logs its measuring range on every install, and this installs on every reading.
     esp_log_level_set("temperature_sensor", ESP_LOG_WARN);
 
-    printf("REPRO idf=%s mode=%s wake_ms=%d busy_ms=%d report_every=%d\n",
+#if CONFIG_REPRO_SLEEP_LOG_UNIFORM
+    printf("REPRO idf=%s mode=%s sleep_ms=%d..%d seed=0x%x busy_ms=%d report_every=%d\n",
+           esp_get_idf_version(), MODE_NAME, CONFIG_REPRO_SLEEP_MIN_MS, CONFIG_REPRO_SLEEP_MAX_MS,
+           CONFIG_REPRO_SEED, CONFIG_REPRO_BUSY_MS, CONFIG_REPRO_REPORT_EVERY);
+#else
+    printf("REPRO idf=%s mode=%s sleep_ms=%d busy_ms=%d report_every=%d\n",
            esp_get_idf_version(), MODE_NAME, CONFIG_REPRO_WAKE_PERIOD_MS, CONFIG_REPRO_BUSY_MS,
            CONFIG_REPRO_REPORT_EVERY);
+#endif
 
     uint32_t overruns = 0;
     for (uint32_t n = 1;; n++) {
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_REPRO_WAKE_PERIOD_MS));
+        const uint32_t sleep_ms = next_sleep_ms();
+        vTaskDelay(pdMS_TO_TICKS(sleep_ms));
         const int64_t wake_us = esp_timer_get_time();
         if (n % CONFIG_REPRO_REPORT_EVERY == 0) {
-            report(n, CONFIG_REPRO_WAKE_PERIOD_MS, overruns);
+            report(n, sleep_ms, overruns);
         }
         if (!busy_until(wake_us + (int64_t)CONFIG_REPRO_BUSY_MS * 1000)) {
             overruns++;
