@@ -481,18 +481,22 @@ def cmd_matrix(args) -> None:
         print("no usable sleeps: matrix needs report lines with s= and k= (captures from 2026-10-20 on)")
         return
 
-    # Short sleeps can't show ppm: 25 us of timing noise over a few ms is thousands of ppm. In the
-    # default "mixed" unit, columns of sleeps up to 100 ms are shown as us of error per sleep.
-    def in_us(col: tuple[float, float, str]) -> bool:
-        return args.unit == "us" or (args.unit == "mixed" and col[1] <= MIXED_US_UP_TO_S)
+    # Short sleeps can't show ppm: 25 us of timing noise over a few ms is thousands of ppm. So
+    # "both" (default) prints an absolute matrix (us per sleep, all columns) and a ppm matrix of the
+    # sleeps over 100 ms only; "mixed" prints one matrix, us up to 100 ms and ppm above.
+    long_bins = [b for b in bins if b[0] >= MIXED_US_UP_TO_S]
+    if args.unit == "both":
+        layouts = [("us per sleep", bins, lambda col: per_sleep_us), ("ppm of sleep time", long_bins, lambda col: sleep_rate)]
+    elif args.unit == "mixed":
+        layouts = [("us per sleep [us] or ppm of sleep time [ppm]", bins, lambda col: per_sleep_us if col[1] <= MIXED_US_UP_TO_S else sleep_rate)]
+    elif args.unit == "us":
+        layouts = [("us per sleep", bins, lambda col: per_sleep_us)]
+    else:
+        layouts = [("ppm of sleep time", bins, lambda col: sleep_rate)]
 
-    def col_value(col: tuple[float, float, str]):
-        return per_sleep_us if in_us(col) else sleep_rate
+    def col_label(col: tuple[float, float, str], value) -> str:
+        return f"{col[2]} [{'us' if value is per_sleep_us else 'ppm'}]"
 
-    def col_label(col: tuple[float, float, str]) -> str:
-        return f"{col[2]} [{'us' if in_us(col) else 'ppm'}]"
-
-    unit = {"ppm": "ppm of sleep time", "us": "us per sleep", "mixed": "us per sleep [us] or ppm of sleep time [ppm], as in the column header"}[args.unit]
     stock = [x for name, sleeps, _, _ in runs if name.startswith("stock#") for x in sleeps]
     if args.vs_stock and not stock:
         print("--vs-stock needs a stock run in the file")
@@ -504,26 +508,29 @@ def cmd_matrix(args) -> None:
     for name, sleeps, die, threshold in runs:
         if args.vs_stock and name.startswith("stock#"):
             continue
-        what = f"{unit}, minus the pooled stock runs' same cell" if args.vs_stock else unit
         print(f"== {name}, threshold {threshold}, die {die}, {len(sleeps)} sleeps")
-        print(f"   rows: previous sleep [share timed by the post-wake reading]; columns: the timed sleep; cells: {what} ±SE (n)")
-        texts = []
-        for row in bins:
-            cells = []
-            for col in bins:
-                part = cell(sleeps, row, col)
-                value = col_value(col)
-                v, se = value(part)
-                if args.vs_stock and math.isfinite(v):
-                    ref, ref_se = value(cell(stock, row, col))
-                    v, se = v - ref, math.hypot(se, ref_se)
-                cells.append("-" if not math.isfinite(v) else f"{v:+.0f}±{se:.0f} ({len(part)})")
-            texts.append((f"{row[2]} [{share([x for x in sleeps if row[0] <= x.prev_s < row[1]], lambda x: x.post_wake)}%]", cells))
-        width = max(len(c) for _, cells in texts for c in cells + [col_label(b) for b in bins]) + 2
-        label_width = max(len(label) for label, _ in texts) + 2
-        print(f"   {'prev \\ timed':{label_width}}" + "".join(f"{col_label(b):>{width}}" for b in bins))
-        for label, cells in texts:
-            print(f"   {label:{label_width}}" + "".join(f"{c:>{width}}" for c in cells))
+        print("   rows: previous sleep [share timed by the post-wake reading]; columns: the timed sleep; cells: value ±SE (n)")
+        for unit, cols, value_of in layouts:
+            what = f"{unit}, minus the pooled stock runs' same cell" if args.vs_stock else unit
+            texts = []
+            for row in bins:
+                cells = []
+                for col in cols:
+                    part = cell(sleeps, row, col)
+                    value = value_of(col)
+                    v, se = value(part)
+                    if args.vs_stock and math.isfinite(v):
+                        ref, ref_se = value(cell(stock, row, col))
+                        v, se = v - ref, math.hypot(se, ref_se)
+                    cells.append("-" if not math.isfinite(v) else f"{v:+.0f}±{se:.0f} ({len(part)})")
+                texts.append((f"{row[2]} [{share([x for x in sleeps if row[0] <= x.prev_s < row[1]], lambda x: x.post_wake)}%]", cells))
+            labels = [col_label(c, value_of(c)) for c in cols]
+            width = max(len(c) for _, cells in texts for c in cells + labels) + 2
+            label_width = max(len(label) for label, _ in texts) + 2
+            print(f"   -- {what}")
+            print(f"   {'prev \\ timed':{label_width}}" + "".join(f"{lab:>{width}}" for lab in labels))
+            for label, cells in texts:
+                print(f"   {label:{label_width}}" + "".join(f"{c:>{width}}" for c in cells))
         print()
 
 
@@ -572,9 +579,9 @@ def main() -> None:
     p_mx.add_argument("--per-decade", type=int, default=1, help="bins per decade of sleep length (default 1)")
     p_mx.add_argument(
         "--unit",
-        choices=("mixed", "ppm", "us"),
-        default="mixed",
-        help="mixed (default): us per sleep for sleeps up to 100 ms, ppm of sleep time above; or ppm / us everywhere",
+        choices=("both", "mixed", "ppm", "us"),
+        default="both",
+        help="both (default): a us-per-sleep matrix and a ppm matrix of the sleeps over 100 ms; mixed: one matrix, us up to 100 ms and ppm above; or ppm / us everywhere",
     )
     p_mx.add_argument("--vs-stock", action="store_true", help="each cell minus the pooled stock runs' same cell")
     p_mx.set_defaults(func=cmd_matrix)
