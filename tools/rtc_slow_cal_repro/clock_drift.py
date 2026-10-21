@@ -282,6 +282,8 @@ class Sleep:
 # The firmware compares the pure RTC sleep time with the threshold, s= also holds the sleep entry and
 # exit, so a previous sleep this close to the threshold can't be assigned to either side.
 SOURCE_GUARD_US = 2000
+# In the matrix's default unit, columns of sleeps up to this long are shown in us per sleep.
+MIXED_US_UP_TO_S = 0.1
 # Sleeps on each side whose mean period is the local reference for one period (about +-40 s).
 RC_NEIGHBOURS = 30
 
@@ -479,8 +481,18 @@ def cmd_matrix(args) -> None:
         print("no usable sleeps: matrix needs report lines with s= and k= (captures from 2026-10-20 on)")
         return
 
-    value = sleep_rate if args.unit == "ppm" else per_sleep_us
-    unit = "ppm of sleep time" if args.unit == "ppm" else "us per sleep"
+    # Short sleeps can't show ppm: 25 us of timing noise over a few ms is thousands of ppm. In the
+    # default "mixed" unit, columns of sleeps up to 100 ms are shown as us of error per sleep.
+    def in_us(col: tuple[float, float, str]) -> bool:
+        return args.unit == "us" or (args.unit == "mixed" and col[1] <= MIXED_US_UP_TO_S)
+
+    def col_value(col: tuple[float, float, str]):
+        return per_sleep_us if in_us(col) else sleep_rate
+
+    def col_label(col: tuple[float, float, str]) -> str:
+        return f"{col[2]} [{'us' if in_us(col) else 'ppm'}]"
+
+    unit = {"ppm": "ppm of sleep time", "us": "us per sleep", "mixed": "us per sleep [us] or ppm of sleep time [ppm], as in the column header"}[args.unit]
     stock = [x for name, sleeps, _, _ in runs if name.startswith("stock#") for x in sleeps]
     if args.vs_stock and not stock:
         print("--vs-stock needs a stock run in the file")
@@ -500,15 +512,16 @@ def cmd_matrix(args) -> None:
             cells = []
             for col in bins:
                 part = cell(sleeps, row, col)
+                value = col_value(col)
                 v, se = value(part)
                 if args.vs_stock and math.isfinite(v):
                     ref, ref_se = value(cell(stock, row, col))
                     v, se = v - ref, math.hypot(se, ref_se)
                 cells.append("-" if not math.isfinite(v) else f"{v:+.0f}±{se:.0f} ({len(part)})")
             texts.append((f"{row[2]} [{share([x for x in sleeps if row[0] <= x.prev_s < row[1]], lambda x: x.post_wake)}%]", cells))
-        width = max(len(c) for _, cells in texts for c in cells + [b[2] for b in bins]) + 2
+        width = max(len(c) for _, cells in texts for c in cells + [col_label(b) for b in bins]) + 2
         label_width = max(len(label) for label, _ in texts) + 2
-        print(f"   {'prev \\ timed':{label_width}}" + "".join(f"{b[2]:>{width}}" for b in bins))
+        print(f"   {'prev \\ timed':{label_width}}" + "".join(f"{col_label(b):>{width}}" for b in bins))
         for label, cells in texts:
             print(f"   {label:{label_width}}" + "".join(f"{c:>{width}}" for c in cells))
         print()
@@ -557,7 +570,12 @@ def main() -> None:
     p_mx.add_argument("--skip", type=float, default=0, help="seconds to drop at the start of each segment")
     p_mx.add_argument("--length", type=float, default=None, help="use only the first LENGTH seconds of each segment")
     p_mx.add_argument("--per-decade", type=int, default=1, help="bins per decade of sleep length (default 1)")
-    p_mx.add_argument("--unit", choices=("ppm", "us"), default="ppm", help="ppm of sleep time (default) or us per sleep")
+    p_mx.add_argument(
+        "--unit",
+        choices=("mixed", "ppm", "us"),
+        default="mixed",
+        help="mixed (default): us per sleep for sleeps up to 100 ms, ppm of sleep time above; or ppm / us everywhere",
+    )
     p_mx.add_argument("--vs-stock", action="store_true", help="each cell minus the pooled stock runs' same cell")
     p_mx.set_defaults(func=cmd_matrix)
 
