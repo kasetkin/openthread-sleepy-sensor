@@ -466,17 +466,20 @@ def cmd_matrix(args) -> None:
     with open(args.file, encoding="utf-8") as f:
         segments = split_segments(f, args.baud)
     bins = log_bins(args.per_decade)
-    runs: list[tuple[str, list[Sleep], str, str]] = []
+    runs = []
     for seg in segments:
         pts = window(seg, args.skip, args.length)
         threshold_us = mode_threshold_us(seg.mode)
         sleeps = collect_sleeps(pts, threshold_us)
-        if len(sleeps) < 10:
+        if len(sleeps) < args.min_sleeps:
             continue
         dies = [p.die_cold for p in pts if math.isfinite(p.die_cold)]
         die = f"{min(dies):.1f}..{max(dies):.1f} C (mean {sum(dies) / len(dies):.1f})" if dies else "-"
         threshold = "none (entry reading)" if threshold_us is None else f"{threshold_us / 1000:g} ms"
-        runs.append((f"{seg.mode}#{len(runs) + 1}", sleeps, die, threshold))
+        runs.append((f"{seg.mode}#{len(runs) + 1}", sleeps, die, threshold, math.inf if threshold_us is None else threshold_us))
+    if args.order == "threshold":
+        runs.sort(key=lambda r: r[4])  # stable: repeats of one threshold stay in capture order
+    runs = [r[:4] for r in runs]
     if not runs:
         print("no usable sleeps: matrix needs report lines with s= and k= (captures from 2026-10-20 on)")
         return
@@ -584,6 +587,8 @@ def main() -> None:
         help="both (default): a us-per-sleep matrix and a ppm matrix of the sleeps over 100 ms; mixed: one matrix, us up to 100 ms and ppm above; or ppm / us everywhere",
     )
     p_mx.add_argument("--vs-stock", action="store_true", help="each cell minus the pooled stock runs' same cell")
+    p_mx.add_argument("--order", choices=("capture", "threshold"), default="capture", help="run order: as captured (default) or by threshold, stock last")
+    p_mx.add_argument("--min-sleeps", type=int, default=10, help="leave out runs with fewer usable sleeps (default 10)")
     p_mx.set_defaults(func=cmd_matrix)
 
     args = parser.parse_args()
