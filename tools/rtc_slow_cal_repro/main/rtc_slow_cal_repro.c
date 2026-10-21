@@ -5,16 +5,21 @@
  * esp_timer / the RTC time run fast.
  *
  * The app sleeps a random time, log-uniform in [REPRO_SLEEP_MIN_MS, REPRO_SLEEP_MAX_MS] from a fixed
- * seed (or always REPRO_WAKE_PERIOD_MS), then stays active for exactly REPRO_BUSY_MS counted from
- * the wakeup: every REPRO_REPORT_EVERY wakes it first reads the die temperature and prints a
- * line, then busy-loops until the end of that window to warm the die. The logging is part of the
- * window, so it never changes the active time.
+ * seed (or always REPRO_WAKE_PERIOD_MS), then stays active for a window counted from the wakeup,
+ * its length taken in turn from k_busy_ms below: every REPRO_REPORT_EVERY wakes it first reads the
+ * die temperature and prints a line, then busy-loops until the end of that window to warm the die.
+ * The logging is part of the window, so it never changes the active time.
+ *
+ * Besides ESP-IDF's own calibration, the app takes two RTC_SLOW readings of its own around every
+ * light sleep, the same way ESP-IDF would: one just before the sleep (the stock entry reading) and
+ * one right after it (the post-wake reading). Both are logged, so the clock error of any
+ * calibration policy can be computed offline from one run (clock_drift.py --replay).
  *
  * Boot banner, once:
  *     REPRO idf=<version> mode=<stock|fix-idf-<MIN_SLP_MS>> sleep_ms=<min>..<max> seed=<hex>
- *           busy_ms=.. report_every=..                 (sleep_ms=<period>, no seed, if fixed)
- * Report line, kept short (about 5 ms at 115200 baud):
- *     C n=.. t=.. c=.. d=.. r=.. s=.. k=.. o=..
+ *           busy_ms=<a,b,..> report_every=..           (sleep_ms=<period>, no seed, if fixed)
+ * Report line, kept short (about 7.6 ms at 115200 baud, within the shortest window):
+ *     C n=.. t=.. c=.. d=.. r=.. s=.. k=.. e=.. w=.. b=.. o=..
  *       n  wakes since boot
  *       t  esp_timer_get_time(), us
  *       c  RTC_SLOW period used for the last light sleep, Q19 us (esp_clk_slowclk_cal_get())
@@ -22,13 +27,17 @@
  *       r  requested duration of the sleep before this wake, ms
  *       s  time spent in light sleep since the previous line, us
  *       k  light sleeps since the previous line
- *       o  windows so far where the work ran past REPRO_BUSY_MS (left out while 0)
+ *       e  the app's RTC_SLOW reading just before the last light sleep, Q19 us
+ *       w  the app's RTC_SLOW reading right after the last light sleep, Q19 us
+ *       b  length of the active window that starts with this wake, ms
+ *       o  windows so far where the work ran past their length (left out while 0)
  *
  * clock_drift.py timestamps each line on arrival and fits esp_timer against the host clock.
  */
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>                         // strlen for the banner
 #include <inttypes.h>
 #include <math.h>                           // NAN, lroundf, lround, pow
 
@@ -43,6 +52,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"                      // get config options for the mode name
+#include "soc/rtc.h"                        // rtc_clk_cal() for the app's own readings
 
 
 #define STRINGIFY_(x) #x
@@ -60,6 +70,14 @@
 // only moves once per conversion.
 #define DIE_TEMP_SAMPLES        16
 #define DIE_TEMP_SPACING_US     50
+
+// Active window after each wake, ms, used in turn. {200} is the MIN_SLP_MS sweep of 2026-10-20.
+static const uint16_t k_busy_ms[] = {10, 10, 200, 200};
+#define BUSY_PATTERN_LEN        (sizeof(k_busy_ms) / sizeof(k_busy_ms[0]))
+
+// RC cycles per RTC_SLOW reading: the same as ESP-IDF's RTC_CLK_SRC_CAL_CYCLES in sleep_modes.c, so
+// the app's readings have the same noise as the ones ESP-IDF times the sleeps with.
+#define CAL_CYCLES              10
 
 #if CONFIG_REPRO_SLEEP_LOG_UNIFORM
 // xorshift32: the same sequence on every boot and with every ESP-IDF, unlike esp_random()
@@ -86,18 +104,31 @@ static uint32_t next_sleep_ms(void)
 #endif
 }
 
-// Light sleeps since the previous report line and the time spent in them. Written by the light
-// sleep exit callback, which runs in the idle task while the report task is blocked, so a write
-// never overlaps a read.
+// Light sleeps since the previous report line, the time spent in them, and the app's readings
+// around the last one. Written by the light sleep callbacks, which run in the idle task while the
+// report task is blocked, so a write never overlaps a read.
 static volatile int64_t s_slept_us = 0;
 static volatile uint32_t s_sleeps = 0;
+static volatile uint32_t s_entry_cal = 0;
+static volatile uint32_t s_wake_cal = 0;
+static uint32_t s_entry_cal_pending = 0;
 
+// Runs just before esp_light_sleep_start(), so right before ESP-IDF's own entry reading.
+static IRAM_ATTR esp_err_t on_light_sleep_enter(int64_t sleep_time_us, void *arg)
+{
+    s_entry_cal_pending = rtc_clk_cal(CLK_CAL_RTC_SLOW, CAL_CYCLES);
+    return ESP_OK;
+}
+
+// Runs right after esp_light_sleep_start() returns, so right after ESP-IDF's post-wake reading.
 static IRAM_ATTR esp_err_t on_light_sleep_exit(int64_t slept_us, void *arg)
 {
-    // The PM also calls this when it skips a sleep that would be too short, with 0.
+    // The PM also calls both callbacks when it skips a sleep that would be too short, with 0 here.
     if (slept_us > 0) {
         s_slept_us += slept_us;
         s_sleeps++;
+        s_entry_cal = s_entry_cal_pending;
+        s_wake_cal = rtc_clk_cal(CLK_CAL_RTC_SLOW, CAL_CYCLES);
     }
     return ESP_OK;
 }
@@ -132,11 +163,13 @@ static float die_temp_read(void)
     return result;
 }
 
-static void report(uint32_t n, uint32_t requested_ms, uint32_t overruns)
+static void report(uint32_t n, uint32_t requested_ms, uint32_t busy_ms, uint32_t overruns)
 {
     // Snapshot first: anything below may block, and the idle task may then sleep again.
     const int64_t slept_us = s_slept_us;
     const uint32_t sleeps = s_sleeps;
+    const uint32_t entry_cal = s_entry_cal;
+    const uint32_t wake_cal = s_wake_cal;
     s_slept_us = 0;
     s_sleeps = 0;
 
@@ -149,9 +182,10 @@ static void report(uint32_t n, uint32_t requested_ms, uint32_t overruns)
     if (overruns > 0) {
         snprintf(overrun_field, sizeof(overrun_field), " o=%" PRIu32, overruns);
     }
-    printf("C n=%" PRIu32 " t=%" PRId64 " c=%" PRIu32 "%s r=%" PRIu32 " s=%" PRId64 " k=%" PRIu32 "%s\n",
+    printf("C n=%" PRIu32 " t=%" PRId64 " c=%" PRIu32 "%s r=%" PRIu32 " s=%" PRId64 " k=%" PRIu32
+           " e=%" PRIu32 " w=%" PRIu32 " b=%" PRIu32 "%s\n",
            n, esp_timer_get_time(), esp_clk_slowclk_cal_get(), die_field, requested_ms, slept_us, sleeps,
-           overrun_field);
+           entry_cal, wake_cal, busy_ms, overrun_field);
     fflush(stdout);
 }
 
@@ -176,6 +210,7 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
     esp_pm_sleep_cbs_register_config_t sleep_cbs = {
+        .enter_cb = on_light_sleep_enter,
         .exit_cb = on_light_sleep_exit,
     };
     ESP_ERROR_CHECK(esp_pm_light_sleep_register_cbs(&sleep_cbs));
@@ -186,13 +221,18 @@ void app_main(void)
     // The driver logs its measuring range on every install, and this installs on every reading.
     esp_log_level_set("temperature_sensor", ESP_LOG_WARN);
 
+    char busy_list[64] = "";
+    for (size_t i = 0; i < BUSY_PATTERN_LEN; i++) {
+        const size_t used = strlen(busy_list);
+        snprintf(busy_list + used, sizeof(busy_list) - used, "%s%u", i ? "," : "", k_busy_ms[i]);
+    }
 #if CONFIG_REPRO_SLEEP_LOG_UNIFORM
-    printf("REPRO idf=%s mode=%s sleep_ms=%d..%d seed=0x%x busy_ms=%d report_every=%d\n",
+    printf("REPRO idf=%s mode=%s sleep_ms=%d..%d seed=0x%x busy_ms=%s report_every=%d\n",
            esp_get_idf_version(), MODE_NAME, CONFIG_REPRO_SLEEP_MIN_MS, CONFIG_REPRO_SLEEP_MAX_MS,
-           CONFIG_REPRO_SEED, CONFIG_REPRO_BUSY_MS, CONFIG_REPRO_REPORT_EVERY);
+           CONFIG_REPRO_SEED, busy_list, CONFIG_REPRO_REPORT_EVERY);
 #else
-    printf("REPRO idf=%s mode=%s sleep_ms=%d busy_ms=%d report_every=%d\n",
-           esp_get_idf_version(), MODE_NAME, CONFIG_REPRO_WAKE_PERIOD_MS, CONFIG_REPRO_BUSY_MS,
+    printf("REPRO idf=%s mode=%s sleep_ms=%d busy_ms=%s report_every=%d\n",
+           esp_get_idf_version(), MODE_NAME, CONFIG_REPRO_WAKE_PERIOD_MS, busy_list,
            CONFIG_REPRO_REPORT_EVERY);
 #endif
 
@@ -201,10 +241,11 @@ void app_main(void)
         const uint32_t sleep_ms = next_sleep_ms();
         vTaskDelay(pdMS_TO_TICKS(sleep_ms));
         const int64_t wake_us = esp_timer_get_time();
+        const uint32_t busy_ms = k_busy_ms[(n - 1) % BUSY_PATTERN_LEN];
         if (n % CONFIG_REPRO_REPORT_EVERY == 0) {
-            report(n, sleep_ms, overruns);
+            report(n, sleep_ms, busy_ms, overruns);
         }
-        if (!busy_until(wake_us + (int64_t)CONFIG_REPRO_BUSY_MS * 1000)) {
+        if (!busy_until(wake_us + (int64_t)busy_ms * 1000)) {
             overruns++;
         }
     }

@@ -11,6 +11,9 @@
     # 2. any time later (or on a copy while 1 runs): rate per segment and per mode
     clock_drift.py fit rtc_cal.log
 
+    # 3. captures with e=/w=: the same runs as if ESP-IDF had used another calibration policy
+    clock_drift.py fit rtc_cal.log --replay stock 0 100
+
 Capture on UART0 (an external USB-UART adapter), not USB-Serial-JTAG: the latter drops out in
 light sleep and can deliver buffered lines late.
 
@@ -19,13 +22,14 @@ steps it, so the host should be NTP-synced and must not suspend during a capture
 
 Captured line format:   <UTC ISO time> <host monotonic ns> <device line>
 Device boot banner:     REPRO idf=<version> mode=<stock|fix-idf-<MIN_SLP_MS>> wake_ms=.. busy_ms=.. ...
-Device report line:     C n=.. t=.. c=.. [d=..] r=.. s=.. k=.. [o=..]
+Device report line:     C n=.. t=.. c=.. [d=..] r=.. s=.. k=.. [e=.. w=.. b=..] [o=..]
                         (fields are described in main/rtc_slow_cal_repro.c; the mode comes from the banner)
 Older captures:         CLK n=<wakes> t_us=<esp_timer> mode=<mode> cal=<Q19 period>
                             [die_cold=<C after wake> die_warm=<C after the busy time>]
 """
 
 import argparse
+import dataclasses
 import datetime
 import itertools
 import math
@@ -53,6 +57,9 @@ class Clk:
     slept_us: int | None = None
     sleeps: int | None = None
     overruns: int = 0
+    entry_cal: int | None = None
+    wake_cal: int | None = None
+    busy_ms: int | None = None
 
 
 @dataclass
@@ -67,10 +74,15 @@ class Point:
     slept_us: int | None = None
     sleeps: int | None = None
     overruns: int = 0
+    entry_cal: int | None = None  # the app's reading just before the last sleep (e=)
+    wake_cal: int | None = None  # the app's reading right after the last sleep (w=)
+    busy_ms: int | None = None  # the active window that starts with this wake (b=)
 
     @classmethod
     def from_clk(cls, wall: str, host_s: float, clk: Clk) -> "Point":
-        return cls(wall, host_s, clk.dev_s, clk.n, clk.cal, clk.die_cold, clk.die_warm, clk.slept_us, clk.sleeps, clk.overruns)
+        return cls(
+            wall, host_s, clk.dev_s, clk.n, clk.cal, clk.die_cold, clk.die_warm, clk.slept_us, clk.sleeps, clk.overruns, clk.entry_cal, clk.wake_cal, clk.busy_ms
+        )
 
 
 @dataclass
@@ -88,7 +100,10 @@ def parse_clk(text: str) -> Clk | None:
         die = int(f["d"]) / 10 if "d" in f else math.nan  # left out if the sensor failed
         slept_us = int(f["s"]) if "s" in f else None
         sleeps = int(f["k"]) if "k" in f else None
-        return Clk(int(f["n"]), int(f["t"]) / 1e6, None, int(f["c"]), die, math.nan, slept_us, sleeps, int(f.get("o", 0)))
+        entry_cal = int(f["e"]) if "e" in f else None
+        wake_cal = int(f["w"]) if "w" in f else None
+        busy_ms = int(f["b"]) if "b" in f else None
+        return Clk(int(f["n"]), int(f["t"]) / 1e6, None, int(f["c"]), die, math.nan, slept_us, sleeps, int(f.get("o", 0)), entry_cal, wake_cal, busy_ms)
     m = CLK_RE.search(text)
     if m is None:
         return None
@@ -175,6 +190,36 @@ def split_segments(lines, baud: int = 115200) -> list[Segment]:
     return [s for s in segments if s.points]
 
 
+def replay(seg: Segment, policy: str) -> Segment:
+    """The segment as if ESP-IDF had timed every sleep with the period policy picks from the app's
+    own readings: "stock" = the entry reading, a number = CONFIG_..._MIN_SLP_MS (the post-wake
+    reading of the previous wake if the previous sleep was longer, else the entry reading).
+
+    ESP-IDF converts a sleep's RC ticks with c=, so with period P instead the sleep would have
+    counted s * P / c: each line's device time moves by the sum of s * (P / c - 1) up to it."""
+    threshold_us = None if policy == "stock" else float(policy) * 1000
+    out = Segment(mode="stock-replay" if threshold_us is None else f"fix-replay-{policy}")
+    shift_s = 0.0
+    prev = None  # the line of the last light sleep: a skipped sleep (k=0) changes nothing in ESP-IDF
+    for p in seg.points:
+        if p.sleeps == 1 and p.entry_cal:
+            post_wake = threshold_us is not None and prev is not None and prev.slept_us > threshold_us
+            period = prev.wake_cal if post_wake else p.entry_cal
+            shift_s += p.slept_us * (period / p.cal - 1) / 1e6
+            prev = p
+        elif p.sleeps:
+            prev = None  # two sleeps in one line (never seen so far): no reading for each of them
+        out.points.append(dataclasses.replace(p, dev_s=p.dev_s + shift_s))
+    return out
+
+
+def with_replays(segments: list[Segment], policies: list[str] | None) -> list[Segment]:
+    """The segments themselves, or with --replay, each one (that has e=/w=) under every policy."""
+    if not policies:
+        return segments
+    return [replay(seg, policy) for seg in segments if any(p.entry_cal for p in seg.points) for policy in policies]
+
+
 def sleep_share(points: list[Point]) -> float:
     """Share of the device time spent in light sleep, from the lines after the first (each line
     counts the sleeps since the line before it). NaN for captures without the s= field."""
@@ -235,6 +280,7 @@ def cmd_log(args) -> None:
 def cmd_fit(args) -> None:
     with open(args.file, encoding="utf-8") as f:
         segments = split_segments(f, args.baud)
+    segments = with_replays(segments, args.replay)
 
     print(
         f"{'mode':12} {'start (UTC host)':>16} {'min':>6} {'lines':>5} {'ppm':>9} {'±SE':>6} {'rms ms':>6} {'cal kHz':>9} {'die C min..max':>14} {'mean':>5} {'warm-up':>7} {'sleep%':>6} {'ovr':>4}"
@@ -276,6 +322,7 @@ class Sleep:
     host_s: float  # host time of that interval
     cal: int  # the period it was timed with (c= of the line after it)
     post_wake: bool | None  # period from the reading after the previous wake; None = too close to call
+    work: tuple[int | None, int | None]  # active windows before the previous sleep and before this one (b=)
     rc_local_ppm: float = math.nan  # RC frequency at its calibration against the neighbouring sleeps' (+ = faster = colder)
 
 
@@ -310,7 +357,7 @@ def collect_sleeps(pts: list[Point], threshold_us: float | None) -> list[Sleep]:
             post_wake = prev.slept_us > threshold_us
         host_s = cur.host_s - prev.host_s
         error_s = (cur.dev_s - prev.dev_s) - host_s
-        sleeps.append(Sleep(cur.slept_us / 1e6, prev.slept_us / 1e6, error_s, host_s, cur.cal, post_wake))
+        sleeps.append(Sleep(cur.slept_us / 1e6, prev.slept_us / 1e6, error_s, host_s, cur.cal, post_wake, (before.busy_ms, prev.busy_ms)))
     # The die (and the RC with it) drifts by many degrees within a run, far more than the effect of a
     # warm or cold reading, so each period is compared with the mean of its neighbours in time.
     for i, x in enumerate(sleeps):
@@ -465,12 +512,15 @@ def cmd_matrix(args) -> None:
     length of the sleep being timed, cell = that sleep's clock error."""
     with open(args.file, encoding="utf-8") as f:
         segments = split_segments(f, args.baud)
+    segments = with_replays(segments, args.replay)
     bins = log_bins(args.per_decade)
     runs = []
     for seg in segments:
         pts = window(seg, args.skip, args.length)
         threshold_us = mode_threshold_us(seg.mode)
         sleeps = collect_sleeps(pts, threshold_us)
+        if args.work:
+            sleeps = [x for x in sleeps if x.work == args.work]
         if len(sleeps) < args.min_sleeps:
             continue
         dies = [p.die_cold for p in pts if math.isfinite(p.die_cold)]
@@ -511,7 +561,8 @@ def cmd_matrix(args) -> None:
     for name, sleeps, die, threshold in runs:
         if args.vs_stock and name.startswith("stock#"):
             continue
-        print(f"== {name}, threshold {threshold}, die {die}, {len(sleeps)} sleeps")
+        work = f", work {args.work[0]} ms -> previous sleep -> {args.work[1]} ms -> sleep" if args.work else ""
+        print(f"== {name}, threshold {threshold}, die {die}, {len(sleeps)} sleeps{work}")
         print("   rows: previous sleep [share timed by the post-wake reading]; columns: the timed sleep; cells: value ±SE (n)")
         for unit, cols, value_of in layouts:
             what = f"{unit}, minus the pooled stock runs' same cell" if args.vs_stock else unit
@@ -543,6 +594,9 @@ def window(seg: Segment, skip: float, length: float | None) -> list[Point]:
     return [p for p in seg.points if skip <= p.host_s - t0 and (length is None or p.host_s - t0 <= length)]
 
 
+REPLAY_HELP = "instead of each run as measured, the run under each POLICY: stock, or a MIN_SLP_MS threshold in ms (needs e=/w= lines)"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -563,6 +617,7 @@ def main() -> None:
         default=None,
         help="use only the first LENGTH seconds of each segment (counted from its start, like --skip), so runs of different length cover the same sleeps",
     )
+    p_fit.add_argument("--replay", nargs="+", metavar="POLICY", help=REPLAY_HELP)
     p_fit.set_defaults(func=cmd_fit)
 
     p_bins = sub.add_parser("bins", help="clock error per sleep-length bin, by the sleep's own and the previous sleep's length")
@@ -589,6 +644,13 @@ def main() -> None:
     p_mx.add_argument("--vs-stock", action="store_true", help="each cell minus the pooled stock runs' same cell")
     p_mx.add_argument("--order", choices=("capture", "threshold"), default="capture", help="run order: as captured (default) or by threshold, stock last")
     p_mx.add_argument("--min-sleeps", type=int, default=10, help="leave out runs with fewer usable sleeps (default 10)")
+    p_mx.add_argument("--replay", nargs="+", metavar="POLICY", help=REPLAY_HELP)
+    p_mx.add_argument(
+        "--work",
+        type=lambda text: tuple(int(v) for v in text.split(",")),
+        metavar="A,B",
+        help="only sleeps with an active window of A ms before the previous sleep and B ms before this one",
+    )
     p_mx.set_defaults(func=cmd_matrix)
 
     args = parser.parse_args()

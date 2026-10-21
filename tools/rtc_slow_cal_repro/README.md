@@ -19,15 +19,21 @@ it measures the fix the same way.
 - Sleeps a random time, log-uniform between `REPRO_SLEEP_MIN_MS` and `REPRO_SLEEP_MAX_MS`
   (default 1 ms to 10 s, so each decade gets a quarter of the sleeps). The sequence comes from a
   fixed seed, so every run sees the same sleeps. Or sleeps a fixed `REPRO_WAKE_PERIOD_MS`.
-- After each wake it stays active for exactly `REPRO_BUSY_MS` (default 200 ms): it prints a report
-  line first, then busy-loops to the end of the window to warm the die, as a radio burst would.
+- After each wake it stays active for a fixed window, its length taken in turn from `k_busy_ms` in
+  `main/rtc_slow_cal_repro.c` (10, 10, 200, 200 ms; `{200}` is the MIN_SLP_MS sweep of
+  2026-10-20): it prints a report line first, then busy-loops to the end of the window to warm the
+  die, as a radio burst would.
+- Around every light sleep it takes two RTC_SLOW readings of its own, like ESP-IDF's (10 RC
+  cycles): one just before the sleep (the stock entry reading) and one right after it (the
+  post-wake reading). Both go into the report line, so `clock_drift.py --replay` can compute the
+  clock error of any calibration policy (stock or any `MIN_SLP_MS`) from one run.
 - The console UART is flushed before each light sleep (not suspended), so a line is never held
   back over the next sleep.
 
 Output over UART0, a boot banner and then one line per wake:
 
-    REPRO idf=<version> mode=<stock|fix-idf-<MIN_SLP_MS>> sleep_ms=1..10000 seed=0x19250 busy_ms=200 report_every=1
-    C n=1342 t=6989573048 c=3601859 d=260 r=5000 s=4998123 k=1
+    REPRO idf=<version> mode=<stock|fix-idf-<MIN_SLP_MS>> sleep_ms=1..10000 seed=0x19250 busy_ms=10,10,200,200 report_every=1
+    C n=1342 t=6989573048 c=3601859 d=260 r=5000 s=4998123 k=1 e=3601859 w=3600548 b=200
 
 The fields of the `C` line are described at the top of `main/rtc_slow_cal_repro.c`.
 
@@ -60,5 +66,4 @@ plus stock, flashes them, and runs the capture detached; see the comment at its 
 | `REPRO_SLEEP_MIN_MS` / `REPRO_SLEEP_MAX_MS` | 1 / 10000 | range of the random sleeps |
 | `REPRO_SEED` | 0x19250 | seed of the sleep sequence |
 | `REPRO_WAKE_PERIOD_MS` | 5000 | fixed sleep, if not random |
-| `REPRO_BUSY_MS` | 200 | active window after each wake, logging included |
 | `REPRO_REPORT_EVERY` | 1 | wakes per report line |

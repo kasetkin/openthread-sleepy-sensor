@@ -9,7 +9,8 @@
 #   ./sweep.sh status <log>        is the capture running, last lines, fit per segment (minutes 10-70)
 #   ./sweep.sh stop                stop the capture
 #
-# Values: "stock" (option off) or a MIN_SLP_MS value. Environment overrides: JTAG, UART, BUSY_MS.
+# Values: "stock" (option off) or a MIN_SLP_MS value. Environment overrides: JTAG, UART.
+# The active-window lengths are k_busy_ms in main/rtc_slow_cal_repro.c.
 # Each build has its own sdkconfig inside its build directory; the project's sdkconfig is not used.
 set -euo pipefail
 
@@ -28,7 +29,7 @@ idf_env() {
 }
 
 build_dir() {
-    echo "$HERE/build-sweep-$1${BUSY_MS:+-busy$BUSY_MS}"
+    echo "$HERE/build-sweep-$1"
 }
 
 cmd_build() {
@@ -43,16 +44,13 @@ cmd_build() {
         else
             printf 'CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP=y\nCONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP_MIN_SLP_MS=%s\n' "$v" > "$dir/sweep.defaults"
         fi
-        if [ -n "${BUSY_MS:-}" ]; then
-            echo "CONFIG_REPRO_BUSY_MS=$BUSY_MS" >> "$dir/sweep.defaults"
-        fi
         # A stale sdkconfig would ignore changed defaults.
         rm -f "$dir/sdkconfig"
         echo "== build $v -> $dir"
         (cd "$HERE" && idf.py -B "$dir" -D SDKCONFIG="$dir/sdkconfig" \
             -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;$dir/sweep.defaults" build > "$dir/sweep_build.log" 2>&1) \
             || { tail -20 "$dir/sweep_build.log"; exit 1; }
-        grep -E "CAL_AFTER_WAKEUP|FREERTOS_HZ |REPRO_BUSY_MS|REPRO_SEED" "$dir/config/sdkconfig.h" | sed 's/^/   /'
+        grep -E "CAL_AFTER_WAKEUP|FREERTOS_HZ |REPRO_SEED" "$dir/config/sdkconfig.h" | sed 's/^/   /'
     done
 }
 

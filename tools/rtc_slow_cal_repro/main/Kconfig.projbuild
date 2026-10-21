@@ -33,18 +33,6 @@ menu "RTC_SLOW calibration reproducer"
         default 5000
         range 100 60000
 
-    config REPRO_BUSY_MS
-        int "CPU busy time after each wake (ms)"
-        default 200
-        range 0 1000
-        help
-            Active window after every wake, counted from the wakeup. The report line and the
-            die temperature reading are done first, inside the window, then the CPU busy-loops
-            until its end to warm the die, the way a radio burst or a sensor read would. So the
-            logging never changes the active time. ESP-IDF calibrates RTC_SLOW at the next sleep
-            entry, at the end of this window. If the work ever runs past the window, the report
-            line counts it in its o= field.
-
     config REPRO_REPORT_EVERY
         int "Print a report line every N wakes"
         default 1
