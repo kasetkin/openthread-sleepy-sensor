@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sweep of CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP_MIN_SLP_MS against stock ESP-IDF.
+# Builds and runs the reproducer with CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP on and off.
 # Plan and campaign status: tickets_and_plans/plan_min_slp_sweep.html (local, not in git).
 #
 #   ./sweep.sh build [values...]   build build-sweep-<v> for each value (default: all)
@@ -9,13 +9,14 @@
 #   ./sweep.sh status <log>        is the capture running, last lines, fit per segment (minutes 10-70)
 #   ./sweep.sh stop                stop the capture
 #
-# Values: "stock" (option off) or a MIN_SLP_MS value. Environment overrides: JTAG, UART.
+# Values: "stock" (option off), "fix" (option on), or a MIN_SLP_MS value for an ESP-IDF revision
+# that still has that sub-option (removed in c67e414a1c). Environment overrides: JTAG, UART.
 # The active-window lengths are k_busy_ms in main/rtc_slow_cal_repro.c.
 # Each build has its own sdkconfig inside its build directory; the project's sdkconfig is not used.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ALL_VALUES="stock 0 10 50 100 200 500 1000"
+ALL_VALUES="stock fix"
 JTAG="${JTAG:-/dev/ttyACM0}"
 UART="${UART:-/dev/ttyUSB0}"
 
@@ -41,6 +42,8 @@ cmd_build() {
         mkdir -p "$dir"
         if [ "$v" = stock ]; then
             echo "# CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP is not set" > "$dir/sweep.defaults"
+        elif [ "$v" = fix ]; then
+            echo "CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP=y" > "$dir/sweep.defaults"
         else
             printf 'CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP=y\nCONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP_MIN_SLP_MS=%s\n' "$v" > "$dir/sweep.defaults"
         fi

@@ -16,7 +16,7 @@
  * calibration policy can be computed offline from one run (clock_drift.py --replay).
  *
  * Boot banner, once:
- *     REPRO idf=<version> mode=<stock|fix-idf-<MIN_SLP_MS>> sleep_ms=<min>..<max> seed=<hex>
+ *     REPRO idf=<version> mode=<stock|fix-idf|fix-idf-<MIN_SLP_MS>> sleep_ms=<min>..<max> seed=<hex>
  *           busy_ms=<a,b,..> report_every=..           (sleep_ms=<period>, no seed, if fixed)
  * Report line, kept short (about 7.6 ms at 115200 baud, within the shortest window):
  *     C n=.. t=.. c=.. d=.. r=.. s=.. k=.. e=.. w=.. b=.. o=..

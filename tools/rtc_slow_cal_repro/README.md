@@ -32,7 +32,7 @@ it measures the fix the same way.
 
 Output over UART0, a boot banner and then one line per wake:
 
-    REPRO idf=<version> mode=<stock|fix-idf-<MIN_SLP_MS>> sleep_ms=1..10000 seed=0x19250 busy_ms=10,10,200,200 report_every=1
+    REPRO idf=<version> mode=<stock|fix-idf|fix-idf-<MIN_SLP_MS>> sleep_ms=1..10000 seed=0x19250 busy_ms=10,10,200,200 report_every=1
     C n=1342 t=6989573048 c=3601859 d=260 r=5000 s=4998123 k=1 e=3601859 w=3600548 b=200
 
 The fields of the `C` line are described at the top of `main/rtc_slow_cal_repro.c`.
@@ -55,8 +55,9 @@ The capture host should be NTP-synced and must not suspend: the reference is its
 `clock_drift.py` needs only Python 3.10+ and pyserial (PEP 723 header, so `uv run clock_drift.py`
 works too).
 
-`sweep.sh` builds one firmware per `CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP_MIN_SLP_MS` value
-plus stock, flashes them, and runs the capture detached; see the comment at its top.
+`sweep.sh` builds the firmware with `CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP` on (`fix`) and
+off (`stock`), flashes them, and runs the capture detached; see the comment at its top. Numeric values
+build one firmware per `..._MIN_SLP_MS` value, for an ESP-IDF revision that still has that sub-option.
 
 ## Options (`idf.py menuconfig` → RTC_SLOW calibration reproducer)
 
