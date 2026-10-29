@@ -1,0 +1,41 @@
+menu "RTC_SLOW calibration reproducer"
+
+    config REPRO_SLEEP_LOG_UNIFORM
+        bool "Random sleep durations, log-uniform between a minimum and a maximum"
+        default y
+        help
+            Each sleep is drawn as MIN * (MAX / MIN)^u with u uniform in [0, 1), so every
+            decade (e.g. 1-10 ms, 10-100 ms, ...) gets the same share of the sleeps. The
+            sequence comes from a fixed seed, so every run sees the same sleeps.
+            If disabled, every sleep is REPRO_WAKE_PERIOD_MS.
+
+    config REPRO_SLEEP_MIN_MS
+        int "Shortest random sleep (ms)"
+        depends on REPRO_SLEEP_LOG_UNIFORM
+        default 1
+        range 1 1000
+
+    config REPRO_SLEEP_MAX_MS
+        int "Longest random sleep (ms)"
+        depends on REPRO_SLEEP_LOG_UNIFORM
+        default 10000
+        range 2 60000
+
+    config REPRO_SEED
+        hex "Seed of the random sleep sequence"
+        depends on REPRO_SLEEP_LOG_UNIFORM
+        default 0x19250
+        range 0x1 0xffffffff
+
+    config REPRO_WAKE_PERIOD_MS
+        int "Light-sleep period between wakes (ms)"
+        depends on !REPRO_SLEEP_LOG_UNIFORM
+        default 5000
+        range 100 60000
+
+    config REPRO_REPORT_EVERY
+        int "Print a report line every N wakes"
+        default 1
+        range 1 1000
+
+endmenu

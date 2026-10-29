@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIN_SLP Sweep Results</title>
+<style>
+:root {
+  --bg: #F5F7F6;
+  --surface: #FFFFFF;
+  --ink: #18201E;
+  --muted: #56625E;
+  --faint: #8A9591;
+  --line: #D9E0DD;
+  --accent: #0E7C74;
+  --accent-soft: #DCEFEC;
+  --decide: #9A5B00;
+  --decide-soft: #FBEBD2;
+  --code-bg: #EBF0EE;
+  --bar: #0E7C74;
+  --bar-base: #7A8A85;
+  --sans: "IBM Plex Sans", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --cond: "IBM Plex Sans Condensed", "Arial Narrow", "IBM Plex Sans", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111615;
+    --surface: #182120;
+    --ink: #E3EAE7;
+    --muted: #A1ADA9;
+    --faint: #6F7C78;
+    --line: #2A3533;
+    --accent: #4CC2B6;
+    --accent-soft: #173432;
+    --decide: #E6B25C;
+    --decide-soft: #372A15;
+    --code-bg: #1F2A28;
+    --bar: #4CC2B6;
+    --bar-base: #93A39E;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111615;
+  --surface: #182120;
+  --ink: #E3EAE7;
+  --muted: #A1ADA9;
+  --faint: #6F7C78;
+  --line: #2A3533;
+  --accent: #4CC2B6;
+  --accent-soft: #173432;
+  --decide: #E6B25C;
+  --decide-soft: #372A15;
+  --code-bg: #1F2A28;
+  --bar: #4CC2B6;
+  --bar-base: #93A39E;
+}
+body { background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 15.5px; line-height: 1.6; padding-inline: 16px; padding-block: 40px 72px; margin: 0; }
+.page { max-width: 860px; margin-inline: auto; display: grid; gap: 40px; }
+section { display: grid; gap: 14px; }
+h1, h2, h3 { font-family: var(--cond); margin: 0; line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.1rem; font-weight: 700; }
+h2 { font-size: 1.45rem; font-weight: 600; padding-top: 18px; border-top: 1px solid var(--line); }
+h3 { font-size: 1.05rem; font-weight: 600; }
+p, ul, ol { margin: 0; max-width: 72ch; }
+ul, ol { padding-left: 1.3em; display: grid; gap: 6px; }
+a { color: var(--accent); }
+code { font-family: var(--mono); font-size: 0.86em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+.lede { font-size: 1.05rem; color: var(--muted); max-width: 68ch; }
+.eyebrow { font-family: var(--mono); font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.note { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 12px 14px; border-radius: 0 6px 6px 0; font-size: 0.93rem; max-width: 76ch; }
+.note.warn { border-color: var(--decide); background: var(--decide-soft); }
+.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+th, td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+tr:last-child td { border-bottom: 0; }
+th { font-family: var(--cond); font-weight: 600; font-size: 0.85rem; color: var(--muted); background: var(--bg); }
+td.n { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+td.e { background: var(--decide-soft); }
+figure { margin: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; display: grid; gap: 10px; }
+figcaption { font-size: 0.88rem; color: var(--muted); }
+.row { display: grid; grid-template-columns: 110px 1fr 64px; gap: 10px; align-items: center; }
+.row .lbl { font-size: 0.88rem; }
+.track { position: relative; height: 16px; background: repeating-linear-gradient(to right, var(--line) 0 1px, transparent 1px 9.09%); border-radius: 3px; }
+.bar { position: absolute; left: 0; top: 2px; height: 12px; border-radius: 2px; background: var(--bar); }
+.bar.base { background: var(--bar-base); }
+.val { font-family: var(--mono); font-size: 0.84rem; text-align: right; font-variant-numeric: tabular-nums; }
+.charts { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 700px) { .charts { grid-template-columns: 1fr; } }
+pre { margin: 0; background: var(--code-bg); border-radius: 6px; padding: 10px 12px; overflow-x: auto; font-family: var(--mono); font-size: 0.8rem; line-height: 1.5; }
+</style>
+</head>
+<body>
+<main class="page">
+
+<header>
+  <div class="eyebrow">ESP32-C6 · RTC_SLOW calibration · espressif/esp-idf#19250</div>
+  <h1>MIN_SLP_MS threshold sweep: results</h1>
+  <p class="lede">13 runs (2026-10-20 10:52 to 2026-10-21 14:24 UTC) of <code>CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP_MIN_SLP_MS</code> against stock ESP-IDF. The clock error grows with the threshold at every step. A threshold of 0 (calibrate after every wake) is best in every view. It halves stock's error: +462 against +1015 ppm unheated, +418 against +868 ppm heated. A follow-up run with varied work windows (10, 10, 200, 200 ms; section 6) replayed every policy on the same 10 h of sleeps: still monotonic with 0 best (+346 against stock +755), including the case built to favour a threshold.</p>
+</header>
+
+<section>
+  <h2>1. Setup</h2>
+  <ul>
+    <li><strong>Board:</strong> Seeed XIAO ESP32-C6. RTC_SLOW = internal RC (tempco about −1540 ppm/°C). CPU 160 MHz, FreeRTOS 1 kHz tick, automatic light sleep (tickless idle, <code>IDLE_TIME_BEFORE_SLEEP=2</code>).</li>
+    <li><strong>ESP-IDF:</strong> master with the PR branch <code>fix/rtc-slow-cal-after-wakeup</code> @ <code>5f666735c6</code> (the MIN_SLP_MS sub-option, not pushed). "stock" = <code>CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_AFTER_WAKEUP</code> off.</li>
+    <li><strong>Reproducer:</strong> <code>tools/rtc_slow_cal_repro</code> (branch <code>feat/rtc-cal-repro</code>, sweep built from <code>36d5659</code>). Sleeps are random and log-uniform from 1 ms to 10 s, with a fixed seed of 0x19250, so every run sees the same sleep sequence. After each wake there is a fixed 200 ms active window: report line and die temperature first, then a busy loop to the end.</li>
+    <li><strong>Reference:</strong> the host's <code>CLOCK_MONOTONIC</code> stamps each UART line (USB-UART on GPIO16), minus the line's wire time. Positive ppm = the device clock runs fast.</li>
+    <li><strong>Runs:</strong> 70 min each, one firmware per threshold. Only minutes 10–70 are analysed (<code>clock_drift.py fit --skip 600 --length 4200</code>), so every run covers the same 2,380 or so sleeps of the sequence.</li>
+    <li><strong>Pass 1</strong> (runs 1–8) was heated on purpose: the user put the chip on a hot surface for part of each run (die up to 40–43 °C) to simulate real temperature drift. <strong>Pass 2</strong> (runs 9–13) was not heated: die 24.6–27.0 °C.</li>
+    <li><strong>Log:</strong> <code>logs/2026-10-20__min_slp_sweep_busy200__uart.log</code> (all 13 runs; each one starts with a <code>REPRO … mode=</code> banner).</li>
+  </ul>
+</section>
+
+<section>
+  <h2>2. Clock error per threshold</h2>
+  <div class="charts">
+    <figure>
+      <div class="row"><span class="lbl">0</span><div class="track"><div class="bar" style="width:42.0%"></div></div><span class="val">+462</span></div>
+      <div class="row"><span class="lbl">50</span><div class="track"><div class="bar" style="width:49.9%"></div></div><span class="val">+549</span></div>
+      <div class="row"><span class="lbl">100</span><div class="track"><div class="bar" style="width:56.8%"></div></div><span class="val">+625</span></div>
+      <div class="row"><span class="lbl">1000</span><div class="track"><div class="bar" style="width:67.3%"></div></div><span class="val">+740</span></div>
+      <div class="row"><span class="lbl">stock</span><div class="track"><div class="bar base" style="width:92.3%"></div></div><span class="val">+1015</span></div>
+      <figcaption>Pass 2, unheated (die 24.6–27.0 °C). ppm, scale 0–1100. Threshold in ms.</figcaption>
+    </figure>
+    <figure>
+      <div class="row"><span class="lbl">0</span><div class="track"><div class="bar" style="width:38.0%"></div></div><span class="val">+418</span></div>
+      <div class="row"><span class="lbl">10</span><div class="track"><div class="bar" style="width:43.8%"></div></div><span class="val">+482</span></div>
+      <div class="row"><span class="lbl">100</span><div class="track"><div class="bar" style="width:51.0%"></div></div><span class="val">+561</span></div>
+      <div class="row"><span class="lbl">200</span><div class="track"><div class="bar" style="width:56.1%"></div></div><span class="val">+617</span></div>
+      <div class="row"><span class="lbl">50</span><div class="track"><div class="bar" style="width:56.4%"></div></div><span class="val">+620</span></div>
+      <div class="row"><span class="lbl">500</span><div class="track"><div class="bar" style="width:61.4%"></div></div><span class="val">+675</span></div>
+      <div class="row"><span class="lbl">1000</span><div class="track"><div class="bar" style="width:66.1%"></div></div><span class="val">+727</span></div>
+      <div class="row"><span class="lbl">stock</span><div class="track"><div class="bar base" style="width:78.9%"></div></div><span class="val">+868</span></div>
+      <figcaption>Pass 1, heated (different heating dose per run). Sorted by ppm: 50 and 100 swap here, see below.</figcaption>
+    </figure>
+  </div>
+
+  <h3>All runs</h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Run</th><th>Pass</th><th>Threshold</th><th>Booted (UTC)</th><th>ppm, min 10–70</th><th>Die °C (min–max, mean)</th></tr></thead>
+    <tbody>
+      <tr><td class="n">1</td><td>1</td><td>stock</td><td>10-20 10:52</td><td class="n">+867.5 ±0.6</td><td>24.9–41.0 (35.6)</td></tr>
+      <tr><td class="n">2</td><td>1</td><td>200</td><td>10-20 12:30</td><td class="n">+616.7 ±0.4</td><td>25.0–40.0 (30.8)</td></tr>
+      <tr><td class="n">3</td><td>1</td><td>0</td><td>10-20 14:02</td><td class="n">+418.2 ±0.6</td><td>25.0–40.1 (28.3)</td></tr>
+      <tr><td class="n">4</td><td>1</td><td>1000</td><td>10-20 15:40</td><td class="n">+727.1 ±0.9</td><td>24.3–40.2 (29.0)</td></tr>
+      <tr><td class="n">5</td><td>1</td><td>50</td><td>10-20 17:18</td><td class="n">+620.3 ±0.3</td><td>22.0–27.0 (23.5)</td></tr>
+      <tr><td class="n">6</td><td>1</td><td>500</td><td>10-21 02:48</td><td class="n">+674.5 ±0.4</td><td>24.0–27.0 (25.0)</td></tr>
+      <tr><td class="n">7</td><td>1</td><td>10</td><td>10-21 05:22</td><td class="n">+481.5 ±0.3</td><td>25.0–42.0 (29.1)</td></tr>
+      <tr><td class="n">8</td><td>1</td><td>100</td><td>10-21 06:50</td><td class="n">+560.7 ±1.0</td><td>25.0–43.0 (34.2)</td></tr>
+      <tr><td class="n">9</td><td>2</td><td>stock</td><td>10-21 08:19</td><td class="n">+1015.3 ±0.3</td><td>24.6–27.0 (25.7)</td></tr>
+      <tr><td class="n">10</td><td>2</td><td>100</td><td>10-21 09:33</td><td class="n">+625.3 ±0.4</td><td>24.9–27.0 (25.9)</td></tr>
+      <tr><td class="n">11</td><td>2</td><td>0</td><td>10-21 10:46</td><td class="n">+461.8 ±0.3</td><td>25.0–27.0 (25.9)</td></tr>
+      <tr><td class="n">12</td><td>2</td><td>50</td><td>10-21 11:58</td><td class="n">+549.4 ±0.4</td><td>25.0–27.0 (26.0)</td></tr>
+      <tr><td class="n">13</td><td>2</td><td>1000</td><td>10-21 13:14</td><td class="n">+740.2 ±0.3</td><td>25.0–27.0 (25.9)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The ± is the fit's statistical error. Repeatability between runs is far wider: pass 2 came within ±71 ppm of the prediction made from pass 1's cold phase (die ≤ 28 °C), with an RMS of about 46 ppm.</p>
+
+  <div class="tablewrap"><table>
+    <thead><tr><th>Threshold</th><th>0</th><th>10</th><th>50</th><th>100</th><th>200</th><th>500</th><th>1000</th><th>stock</th></tr></thead>
+    <tbody>
+      <tr><td>Pass 1, cold phase ≤ 28 °C (prediction for pass 2)</td><td class="n">+416</td><td class="n">+471</td><td class="n">+620</td><td class="n">+752*</td><td class="n">+668</td><td class="n">+680</td><td class="n">+774</td><td class="n">+1018</td></tr>
+      <tr><td>Pass 2, measured</td><td class="n">+462</td><td></td><td class="n">+549</td><td class="n">+625</td><td></td><td></td><td class="n">+740</td><td class="n">+1015</td></tr>
+      <tr><td>Measured − prediction</td><td class="n">+46</td><td></td><td class="n">−71</td><td class="n">−127*</td><td></td><td></td><td class="n">−34</td><td class="n">−3</td></tr>
+    </tbody>
+  </table></div>
+  <p>* Weak prediction: run 8 had only 254 lines below 28 °C. The cold-phase split is monotonic (0 &lt; 10 &lt; 50 &lt; 200 &lt; 500 &lt; 1000 &lt; stock), so pass 1's 50/100 inversion is the heating dose: run 5 (50) was never heated, while run 8 (100) was hot most of the time.</p>
+</section>
+
+<section>
+  <h2>3. Matrices: previous sleep × timed sleep</h2>
+  <p><code>clock_drift.py matrix --skip 600 --length 4200 --order threshold</code>. Each cell is the clock error of the sleeps in that bin, as ppm of sleep time, ±SE (n ≈ 130–190). Rows are the length of the <em>previous</em> sleep, which decides the calibration a sleep gets. <span style="background:var(--decide-soft);padding:0 4px">Shaded</span> = calibrated at entry (stock, or previous sleep below the threshold); unshaded = calibrated after the previous wake. The 1–10 s column holds about 90 % of the sleep time, so it alone sets the overall ppm.</p>
+
+  <h3>Pass 2 (unheated), long sleeps 1–10 s</h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Previous sleep</th><th>T = 0</th><th>T = 50</th><th>T = 100</th><th>T = 1000</th><th>stock</th></tr></thead>
+    <tbody>
+      <tr><td>1–10 ms</td><td class="n">+924 ±66</td><td class="n e">+1120 ±66</td><td class="n e">+1176 ±81</td><td class="n e">+1154 ±77</td><td class="n e">+1366 ±55</td></tr>
+      <tr><td>10–100 ms</td><td class="n">+914 ±50</td><td class="n">+1164 ±53 (28 % post-wake)</td><td class="n e">+1410 ±50</td><td class="n e">+1306 ±47</td><td class="n e">+1424 ±51</td></tr>
+      <tr><td>0.1–1 s</td><td class="n">+483 ±54</td><td class="n">+451 ±51</td><td class="n">+499 ±48</td><td class="n e">+1160 ±55</td><td class="n e">+1224 ±47</td></tr>
+      <tr><td>1–10 s</td><td class="n">+195 ±49</td><td class="n">+173 ±39</td><td class="n">+186 ±46</td><td class="n">+224 ±53</td><td class="n e">+950 ±52</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Pass 2 (unheated), sleeps 0.1–1 s</h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Previous sleep</th><th>T = 0</th><th>T = 50</th><th>T = 100</th><th>T = 1000</th><th>stock</th></tr></thead>
+    <tbody>
+      <tr><td>1–10 ms</td><td class="n">+220 ±73</td><td class="n e">+526 ±136</td><td class="n e">+322 ±75</td><td class="n e">+373 ±157</td><td class="n e">+463 ±72</td></tr>
+      <tr><td>10–100 ms</td><td class="n">+82 ±59</td><td class="n">+345 ±109</td><td class="n e">+533 ±73</td><td class="n e">+462 ±150</td><td class="n e">+583 ±62</td></tr>
+      <tr><td>0.1–1 s</td><td class="n">+38 ±121</td><td class="n">−229 ±115</td><td class="n">−60 ±73</td><td class="n e">+513 ±101</td><td class="n e">+550 ±65</td></tr>
+      <tr><td>1–10 s</td><td class="n">−266 ±88</td><td class="n">−335 ±85</td><td class="n">−165 ±73</td><td class="n">−176 ±145</td><td class="n e">+460 ±68</td></tr>
+    </tbody>
+  </table></div>
+  <p>Sleeps under 100 ms: within ±tens of µs per sleep in every build and every row (µs matrix). The threshold has no visible effect on them.</p>
+
+  <h3>Pass 1 (heated), long sleeps 1–10 s</h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Previous sleep</th><th>T = 0</th><th>T = 10</th><th>T = 50</th><th>T = 100</th><th>T = 200</th><th>T = 500</th><th>T = 1000</th><th>stock</th></tr></thead>
+    <tbody>
+      <tr><td>1–10 ms</td><td class="n">+833</td><td class="n e">+1108</td><td class="n e">+1245</td><td class="n e">+1118</td><td class="n e">+1142</td><td class="n e">+1118</td><td class="n e">+1171</td><td class="n e">+1217</td></tr>
+      <tr><td>10–100 ms</td><td class="n">+936</td><td class="n">+874</td><td class="n">+1289 (28 %)</td><td class="n e">+1281</td><td class="n e">+1348</td><td class="n e">+1415</td><td class="n e">+1310</td><td class="n e">+1200</td></tr>
+      <tr><td>0.1–1 s</td><td class="n">+393</td><td class="n">+448</td><td class="n">+483</td><td class="n">+474</td><td class="n">+613 (70 %)</td><td class="n">+839 (32 %)</td><td class="n e">+1188</td><td class="n e">+1027</td></tr>
+      <tr><td>1–10 s</td><td class="n">+123</td><td class="n">+118</td><td class="n">+228</td><td class="n">+162</td><td class="n">+164</td><td class="n">+86</td><td class="n">+104</td><td class="n e">+912</td></tr>
+    </tbody>
+  </table></div>
+  <p>SE ±41…78 per cell. A percentage = the share of that row calibrated after wake (the row straddles the threshold).</p>
+</section>
+
+<section>
+  <h2>4. What the data shows</h2>
+  <ol>
+    <li><strong>The threshold only swaps rows between two populations of readings.</strong> Across all 13 runs, the fix builds' cells reproduce at about the SE level, heated or not. In the 1–10 s column: entry after 1–10 ms, +1150 (sd 42, 9 runs); entry after 10–100 ms, +1345 (sd 56, 6 runs); post-wake after 0.1–1 s, +462 (sd 35, 7 runs); post-wake after 1–10 s, +160 (sd 46, 11 runs). So the matrix for any threshold is the post-wake rows above T plus the entry rows below T. That rule predicted runs 4–8 and pass 2 within about ±70 ppm.</li>
+    <li><strong>Every entry cell is worse than the post-wake cell in the same row</strong>, by +230…+790 ppm for long sleeps (the gap grows with the previous sleep, because a longer previous sleep makes the post-wake reading colder). So raising the threshold can only add error, which is why the result is monotonic with 0 as the optimum.</li>
+    <li><strong>Mechanism:</strong> the die heats locally during each active window. The error of a sleep ≈ mean RC frequency during the sleep − RC frequency at the calibration. The entry reading comes at the end of the window, the hottest point. The post-wake reading comes at the end of the previous sleep, after cooling. The heat fades over 0.1 s to a few seconds (+920 after a sleep under 100 ms, +462 after 0.1–1 s, +160 after 1–10 s). At constant ambient (pass 2), the entry-vs-post-wake difference after a short sleep is about +230…+430 ppm, i.e. 0.15–0.3 °C. The whole swing of about 1400 ppm is about 0.9 °C. Both are below the 1 °C resolution of the die sensor, which reads 25–27 °C throughout.</li>
+    <li><strong>The premise of MIN_SLP_MS is backwards.</strong> Its help text says that after a short sleep the chip has not cooled yet, so it should calibrate at entry. But the entry reading is even warmer: the work after the wake only adds heat.</li>
+    <li><strong>Over-correction is small and threshold-independent.</strong> A cold reading (after a 1–10 s sleep) applied to a 0.1–1 s sleep that starts hot gives −165…−335 ppm. Stock's same cell is +460, so post-wake is still the smaller error. That row is post-wake for every T &lt; 1 s, and it adds only −2…−5 ppm overall.</li>
+    <li><strong>Heating changes stock, not the fix.</strong> Stock moved from +868 (heated) to +1015 (unheated); the fix builds moved −71…+64 with no common direction.</li>
+  </ol>
+  <div class="note warn"><strong>Unexplained:</strong> stock's entry cells don't match the fix builds' entry cells, even though the entry code path is the same with the option on or off (<code>sleep_modes.c</code> 801–813, the same <code>rtc_clk_cal</code> + <code>esp_clk_slowclk_cal_set</code>). Run 9 (unheated) sits +216 / +79 / +50 ppm above the pooled fix entry cells; run 1 (heated) sits +67 / −145 / −147 off. There is one stock run per condition, so this may be a run-level offset (run 9 came right after heated run 8). It changes no conclusion: even 200 ppm lower, stock is the worst.</div>
+</section>
+
+<section>
+  <h2>5. Conclusion for the PR</h2>
+  <ul>
+    <li>No accuracy reason for <code>MIN_SLP_MS</code> &gt; 0 showed up in any condition. The only effect of the threshold is moving one calibration (10 RC cycles, about 70–80 µs, estimated and not measured) out of the wake path for sleeps shorter than T. There is one calibration per sleep either way, so it saves no energy.</li>
+    <li>Options: (a) remove the sub-option and always calibrate after a wake with <code>rtc_time_diff &gt; 0</code> (recommended); (b) keep it with default 0 and a help text that presents it as a wake-latency trade-off that costs accuracy. <strong>Decision pending.</strong></li>
+  </ul>
+  <h3>Remaining error at T = 0, and a possible follow-up (outside #19250)</h3>
+  <p>About 75 % of T = 0's +462 ppm comes from long sleeps after a sleep under 100 ms (+918 average, 311 of 653 long sleeps, about 37 % of wall time): the post-wake reading after a short sleep is still warm. One idea is to reuse, after a sleep under about 100 ms, the last post-wake reading taken after a long sleep. Estimate: +462 → about +240 ppm. Calculated from the cells, not measured.</p>
+</section>
+
+<section>
+  <h2>6. Follow-up: varied work windows and offline replay</h2>
+  <p>In the sweep every active window was 200 ms. The case that might favour a threshold never occurred: a long window, a short sleep, then a <em>short</em> window before a long sleep. There the post-wake reading (taken at the start of the short window) is still warm from the long one, so the entry reading might not be much worse. This run tests that case.</p>
+
+  <h3>Setup</h3>
+  <ul>
+    <li><strong>Firmware:</strong> <code>feat/rtc-cal-repro</code> @ <code>8f9a406</code>, same ESP-IDF as the sweep. The work windows cycle through <code>k_busy_ms[] = {10, 10, 200, 200}</code> (in <code>main/rtc_slow_cal_repro.c</code>), independently of the seeded sleep sequence, so every pair of windows meets every sleep bin.</li>
+    <li><strong>The app takes both readings itself</strong>, each <code>rtc_clk_cal(CLK_CAL_RTC_SLOW, 10)</code> like ESP-IDF: <code>e</code> in a PM enter callback (just before <code>esp_light_sleep_start()</code>, kept only if the sleep really happened) and <code>w</code> in the exit callback (right after the wake). The report line gains <code>e=</code>, <code>w=</code> and <code>b=</code> (the window that follows).</li>
+    <li><strong>Offline replay</strong> (<code>clock_drift.py fit|matrix --replay stock 0 10 50 100 1000</code>): one run gives every policy on the <em>same</em> sleeps. For each sleep, the period the policy would have used is <code>w</code> of the previous wake if the previous sleep was longer than T, else <code>e</code>; the device time is corrected by <code>s · (P′/c − 1)</code>, where <code>c</code> is the period ESP-IDF actually used.</li>
+    <li><strong>Runs</strong>, unheated, log <code>logs/2026-10-22__busy_pattern_replay__uart.log</code>:
+      <ul>
+        <li><strong>Run 1</strong>, T = 0: 2026-10-21 19:09:40 to 2026-10-22 05:29, 617.5 min, 31,508 lines, all lines analysed (<code>--skip 0</code>). Die 21.3–29.1 °C (mean 23.2); the room cooled overnight.</li>
+        <li><strong>Run 2</strong>, stock: from 2026-10-22 05:30:20, minutes 10–77 analysed (66.7 min, 3,247 lines). Die 24.0–26.0 °C (mean 24.7).</li>
+        <li>A first T = 0 run (2026-10-21 16:17–18:12, <code>logs/2026-10-21__busy_pattern_replay__uart.log</code>) ended with a host reboot and is not used here. Its 103 min gave the same picture (measured +363, replay 0 +356, 100 +516, stock +740).</li>
+      </ul></li>
+  </ul>
+
+  <h3>The replay matches the board</h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Check</th><th>Measured</th><th>Replayed</th><th>Difference</th></tr></thead>
+    <tbody>
+      <tr><td>Run 1 (T = 0) against replay T = 0: validates <code>w</code></td><td class="n">+349.0</td><td class="n">+345.5</td><td class="n">−3.5</td></tr>
+      <tr><td>Run 2 (stock) against replay stock: validates <code>e</code></td><td class="n">+755.6</td><td class="n">+752.4</td><td class="n">−3.2</td></tr>
+      <tr><td>Run 2 measured against run 1 replayed as stock</td><td class="n">+755.6</td><td class="n">+755.4</td><td class="n">−0.2</td></tr>
+    </tbody>
+  </table></div>
+  <p>ppm. Per line in run 2, ESP-IDF's entry reading minus the app's is −5.1 ±7.7 ppm on average, with an sd of 450 ppm (two separate 10-cycle readings taken back to back). That is noise, not a bias.</p>
+
+  <h3>Clock error per policy, run 1's sleeps</h3>
+  <figure>
+    <div class="row"><span class="lbl">0</span><div class="track"><div class="bar" style="width:31.4%"></div></div><span class="val">+346</span></div>
+    <div class="row"><span class="lbl">10</span><div class="track"><div class="bar" style="width:35.9%"></div></div><span class="val">+395</span></div>
+    <div class="row"><span class="lbl">50</span><div class="track"><div class="bar" style="width:42.2%"></div></div><span class="val">+464</span></div>
+    <div class="row"><span class="lbl">100</span><div class="track"><div class="bar" style="width:45.1%"></div></div><span class="val">+496</span></div>
+    <div class="row"><span class="lbl">1000</span><div class="track"><div class="bar" style="width:55.8%"></div></div><span class="val">+614</span></div>
+    <div class="row"><span class="lbl">stock</span><div class="track"><div class="bar base" style="width:68.7%"></div></div><span class="val">+755</span></div>
+    <figcaption>Replayed on run 1 (617.5 min, die 21.3–29.1 °C). ppm, same 0–1100 scale as section 2. Threshold in ms.</figcaption>
+  </figure>
+  <p>Monotonic again, with T = 0 best. Every value is lower than the sweep's, because the mean window is 105 ms instead of 200, so the die heats less per wake.</p>
+
+  <h3>Threshold 100 against threshold 0, per pair of windows</h3>
+  <p>Long sleeps (1–10 s) whose previous sleep was under 100 ms: the only sleeps where T = 0 and T = 100 use different readings. "200 → 10" means a 200 ms window, the short sleep, then a 10 ms window before the long sleep. The difference is taken per sleep (<code>(e − w)/c</code>), so the host timing noise cancels.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Windows</th><th>Sleeps</th><th>T = 100 − T = 0, ppm</th><th>Predicted before the run</th></tr></thead>
+    <tbody>
+      <tr><td>200 → 200 (the sweep's case)</td><td class="n">794</td><td class="n">+457 ±22</td><td class="n">+250…+500</td></tr>
+      <tr><td>10 → 200</td><td class="n">781</td><td class="n">+666 ±24</td><td class="n">+400…+700</td></tr>
+      <tr><td><strong>200 → 10</strong> (the case under test)</td><td class="n">783</td><td class="n"><strong>+132 ±21</strong></td><td class="n">+15…+100</td></tr>
+      <tr><td>10 → 10</td><td class="n">755</td><td class="n">+104 ±21</td><td class="n">+5…+50</td></tr>
+    </tbody>
+  </table></div>
+  <p>Sleeps of 0.1–1 s after a short sleep give the same picture: +483, +644, +115 and +113 (±20…23). The prediction would have been falsified by a clearly negative 200 → 10 value; it is +6.3 SE positive.</p>
+
+  <h3>Absolute error at T = 0 and T = 100, long sleeps 1–10 s</h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Previous sleep</th><th>200 → 200, T = 0</th><th>200 → 200, T = 100</th><th>200 → 10, T = 0</th><th>200 → 10, T = 100</th></tr></thead>
+    <tbody>
+      <tr><td>1–10 ms</td><td class="n">+836 ±47</td><td class="n e">+1169 ±43</td><td class="n">+930 ±43</td><td class="n e">+1013 ±45</td></tr>
+      <tr><td>10–100 ms</td><td class="n">+628 ±34</td><td class="n e">+1175 ±33</td><td class="n">+856 ±38</td><td class="n e">+1031 ±35</td></tr>
+      <tr><td>0.1–1 s</td><td class="n">+390 ±38</td><td class="n">+390 ±38</td><td class="n">+509 ±36</td><td class="n">+509 ±36</td></tr>
+      <tr><td>1–10 s</td><td class="n">+98 ±34</td><td class="n">+98 ±34</td><td class="n">+205 ±35</td><td class="n">+205 ±35</td></tr>
+    </tbody>
+  </table></div>
+  <p>ppm of sleep time, ±SE, n ≈ 280–520 per cell. <span style="background:var(--decide-soft);padding:0 4px">Shaded</span> = entry reading.</p>
+
+  <h3>What it shows</h3>
+  <ol>
+    <li><strong>The warm post-wake reading is real.</strong> At T = 0, a long sleep after 200 → short sleep → 10 is worse than after 200 → short sleep → 200 (+930 against +836, +856 against +628). The reading comes from the start of the 10 ms window and still carries the 200 ms window's heat, but the sleep that follows starts cooler than after another 200 ms of work.</li>
+    <li><strong>The entry reading is warmer still</strong>, so a threshold does not help there either: T = 100 adds +132 ±21 ppm in that case. The 10 ms window alone adds about +100 ppm between <code>w</code> and <code>e</code>, whatever came before (200 → 10 ≈ 10 → 10), more than the +5…+50 predicted.</li>
+    <li><strong>No work pattern makes T &gt; 0 better.</strong> The threshold loses in all four, by 4.9 SE or more. The remaining T = 0 error after short sleeps needs a <em>colder</em> reading (the follow-up idea in section 5), not an earlier one.</li>
+  </ol>
+  <div class="note warn"><strong>Host-timing artifact, absolute cells only:</strong> when a 10 ms window is followed by a 1–10 ms sleep, the next line reaches the host late (median +3 ms, worst 10 % beyond +25 ms; all other cases within about ±0.5 ms). The 87-character line needs 7.6 ms on the wire and is probably not fully sent before that short sleep. This inflates the absolute cells of every row whose window before the previous sleep was 10 ms (pairs 10 → 200 and 10 → 10, previous sleep 1–10 ms: about +1800 ppm even in long sleeps), so those cells are not shown. It affects only those lines' stamps: the paired differences above and the 10-hour fits are unaffected (replay and measured agree within 3.5 ppm).</div>
+</section>
+
+<section>
+  <h2>7. How to reproduce the numbers</h2>
+<pre>cd tools/rtc_slow_cal_repro
+L=../../logs/2026-10-20__min_slp_sweep_busy200__uart.log
+uv run --script clock_drift.py fit    $L --skip 600 --length 4200
+# matrices per pass: cut the log at 2026-10-21T08:15 (pass 1 before, pass 2 after)
+awk '$1 &lt; "2026-10-21T08:15"'  $L &gt; pass1.log
+awk '$1 &gt;= "2026-10-21T08:15"' $L &gt; pass2.log
+uv run --script clock_drift.py matrix pass2.log --skip 600 --length 4200 --order threshold
+
+# section 6: run 1 (T = 0) is everything before the stock banner at 2026-10-22T05:30
+L=../../logs/2026-10-22__busy_pattern_replay__uart.log
+awk '$1 &lt; "2026-10-22T05:29"' $L &gt; run1.log
+uv run --script clock_drift.py fit    run1.log --skip 0 --replay stock 0 10 50 100 1000
+uv run --script clock_drift.py matrix run1.log --skip 0 --unit ppm --order threshold --replay 0 100 --work 200,10   # also 200,200 10,200 10,10
+uv run --script clock_drift.py fit    $L --skip 600 --replay stock   # run 2 (stock) segment: measured vs replay</pre>
+  <p>The paired T = 100 − T = 0 values are the mean of <code>(e(i) − w(i−1)) / c(i)</code> over the selected sleeps (both lines <code>k=1</code>), computed outside the script. The duration-weighted means equal the matrix cell differences within a few ppm. Plan and run notes: <code>tickets_and_plans/plan_busy_pattern_replay.html</code> (local).</p>
+  <p>The full campaign log (switch times, per-run notes, predictions written before each run) is in <code>tickets_and_plans/plan_min_slp_sweep.html</code> (local).</p>
+</section>
+
+</main>
+</body>
+</html>
