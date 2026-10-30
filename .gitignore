@@ -4,6 +4,7 @@ build/
 secrets.yaml
 /managed_components/
 /logs/
+/esp-idf/
 /tools/__pycache__/
 /tickets_and_plans/
 /private_git_key/
